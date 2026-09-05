@@ -1898,8 +1898,8 @@ fn transactions_and_wal_checkpoints_larger_than_pending_memory_commit_or_rollbac
 }
 
 #[test]
-fn ordinary_sqlite_databases_are_not_implicitly_adopted() -> Result<(), Box<dyn std::error::Error>>
-{
+fn ordinary_sqlite_databases_pass_through_without_adoption()
+-> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
     for page_size in [512_u32, 8192, 65_536] {
@@ -1914,14 +1914,29 @@ fn ordinary_sqlite_databases_are_not_implicitly_adopted() -> Result<(), Box<dyn 
             ))?;
             assert_eq!(native.integer("PRAGMA page_size")?, i64::from(page_size));
         }
-        let Err(error) = Connection::open(&path) else {
-            panic!("native database was implicitly adopted");
-        };
-        assert!(
-            error.contains("not a database"),
-            "unexpected error: {error}"
+        let passthrough = Connection::open(&path)?;
+        assert_eq!(
+            passthrough.integer("PRAGMA page_size")?,
+            i64::from(page_size)
         );
-        assert!(!append_suffix(&path, "-zsqlite").exists());
+        assert_eq!(passthrough.integer("SELECT count(*) FROM messages")?, 1);
+        passthrough.execute("INSERT INTO messages VALUES(2, printf('%.*c', 12000, 'b'));")?;
+        assert_integrity(&passthrough)?;
+        drop(passthrough);
+
+        let native = Connection::open_native(&path)?;
+        assert_eq!(native.integer("SELECT count(*) FROM messages")?, 2);
+        assert_integrity(&native)?;
+        drop(native);
+
+        for suffix in [
+            "-zsqlite",
+            "-zsqlite-lock",
+            "-zsqlite-publish",
+            "-zsqlite-delete",
+        ] {
+            assert!(!append_suffix(&path, suffix).exists());
+        }
     }
     Ok(())
 }

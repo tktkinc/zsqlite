@@ -191,6 +191,7 @@ unsafe extern "C" fn x_open(
             let create = flags & ffi::SQLITE_OPEN_CREATE != 0;
             match get_store(&path, create, !out_read_only) {
                 Ok((opened, _newly_opened)) => store = Some(opened),
+                Err(crate::StoreError::NotZsqlite) => {}
                 Err(error) => {
                     unsafe { close_parent(parent_file) };
                     return sqlite_result(&error);

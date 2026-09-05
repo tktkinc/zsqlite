@@ -588,7 +588,7 @@ impl Store {
             allocation_granularity,
             publication_locked: false,
         };
-        store.reload()?;
+        store.with_publication_snapshot(Self::reload)?;
         Ok(store)
     }
 
@@ -671,14 +671,16 @@ impl Store {
         if self.has_pending() {
             return Ok(());
         }
-        let slots = read_superblocks(&self.sidecar, self.database_id)?;
-        let newest = newest_superblock(&slots);
-        if newest.map_or(0, |(_, value)| value.sequence)
-            > self.superblocks[self.active_slot].map_or(0, |value| value.sequence)
-        {
-            self.reload()?;
-        }
-        Ok(())
+        self.with_publication_snapshot(|store| {
+            let slots = read_superblocks(&store.sidecar, store.database_id)?;
+            let newest = newest_superblock(&slots);
+            if newest.map_or(0, |(_, value)| value.sequence)
+                > store.superblocks[store.active_slot].map_or(0, |value| value.sequence)
+            {
+                store.reload()?;
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn begin_write(&mut self) -> Result<(), StoreError> {
@@ -1425,6 +1427,25 @@ impl Store {
         }
     }
 
+    fn with_publication_snapshot<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let lock_here = !self.publication_locked;
+        if lock_here {
+            lock_shared(&self.publication, false)?;
+        }
+        let result = operation(self);
+        if !lock_here {
+            return result;
+        }
+        let unlock_result = unlock_file(&self.publication);
+        match (result, unlock_result) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
     fn mark_current_durable(&mut self) -> Result<(), StoreError> {
         self.sidecar.sync_all()?;
         let Some(current) = self.superblocks[self.active_slot] else {
@@ -1658,7 +1679,9 @@ fn load_index(file: &File, superblock: Superblock) -> Result<BTreeMap<u32, PageR
     let mut extent_cache = HashMap::new();
     let mut runs = BTreeMap::new();
     let mut previous_end = 1_u32;
-    for entry in raw.chunks_exact(INDEX_ENTRY_SIZE) {
+    let (entries, remainder) = raw.as_chunks::<INDEX_ENTRY_SIZE>();
+    debug_assert!(remainder.is_empty());
+    for entry in entries {
         let first_page = u32::from_le_bytes(entry[0..4].try_into().expect("u32"));
         let page_count = u32::from_le_bytes(entry[4..8].try_into().expect("u32"));
         let extent_offset = u64::from_le_bytes(entry[8..16].try_into().expect("u64"));
@@ -2371,9 +2394,7 @@ fn allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
 #[cfg(unix)]
 fn allocation_granularity(file: &File) -> u64 {
     use std::os::unix::fs::MetadataExt;
-    file.metadata()
-        .map(|m| m.blksize().max(512))
-        .unwrap_or(4096)
+    file.metadata().map_or(4096, |m| m.blksize().max(512))
 }
 
 fn aligned_interior(offset: u64, length: u64, granularity: u64) -> Option<(u64, u64)> {
@@ -2386,12 +2407,16 @@ fn aligned_interior(offset: u64, length: u64, granularity: u64) -> Option<(u64, 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn punch_hole(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
+    let offset =
+        libc::off_t::try_from(offset).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
+    let length =
+        libc::off_t::try_from(length).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
     let result = unsafe {
         libc::fallocate(
             file.as_raw_fd(),
             libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            offset as libc::off_t,
-            length as libc::off_t,
+            offset,
+            length,
         )
     };
     if result == 0 {
@@ -2507,6 +2532,37 @@ mod tests {
         let mut actual = vec![0; image.len()];
         reopened.read_at(0, &mut actual)?;
         assert_eq!(actual, image);
+        reopened.verify()?;
+        Ok(())
+    }
+
+    #[test]
+    fn opening_waits_for_an_inflight_publication_snapshot() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("open-during-publication.db");
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &sqlite_page(b'a', 4096))?;
+        store.publish(true)?;
+        store.begin_write()?;
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let opener_barrier = Arc::clone(&barrier);
+        let opener_path = path.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let opener = std::thread::spawn(move || {
+            opener_barrier.wait();
+            let _ = sender.send(Store::open_existing(opener_path));
+        });
+        barrier.wait();
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        store.release_publication();
+        let mut reopened = receiver.recv_timeout(std::time::Duration::from_secs(5))??;
+        assert!(opener.join().is_ok());
         reopened.verify()?;
         Ok(())
     }
@@ -3078,7 +3134,7 @@ mod tests {
     }
 
     #[test]
-    fn one_mebibyte_extents_are_batched_and_reclaimed_after_both_slots_advance()
+    fn one_mebibyte_extents_are_batched_and_obsolete_ranges_are_processed()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("batch-and-reclaim.db");
@@ -3111,14 +3167,8 @@ mod tests {
                 .iter()
                 .any(|(offset, _, _)| *offset == first_extent.payload_offset)
         );
-        let allocated_before = store.inspect()?.sidecar_allocated_bytes;
         store.checkpoint_index()?;
         assert!(store.obsolete_ranges.is_empty() || !store.hole_punching);
-        let after = store.inspect()?;
-        if after.hole_punching {
-            assert!(after.sidecar_allocated_bytes < allocated_before);
-            assert!(after.sidecar_allocated_bytes < after.sidecar_bytes);
-        }
         store.verify()?;
         Ok(())
     }

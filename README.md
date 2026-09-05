@@ -1,6 +1,6 @@
 # zsqlite
 
-`zsqlite` is an experimental SQLite VFS that stores main-database pages in
+`zsqlite` is a SQLite VFS that stores main-database pages in
 Zstandard-compressed extents. SQL, schemas, rollback journals, WAL files, and
 shared-memory files remain standard SQLite structures.
 
@@ -58,8 +58,11 @@ An embedding application should register the library once, then use
 V3 anchor with stock SQLite, without this VFS, correctly fails as “not a
 database”.
 
-V3 does not implicitly adopt ordinary SQLite files. Use the offline conversion
-command described below.
+Existing ordinary SQLite files pass through to the parent VFS unchanged and do
+not gain zsqlite sidecars. New databases created through the `zsqlite` VFS use
+the compressed V3 format. Use the offline conversion command described below
+to compress an existing database. A recognized V3 anchor with missing or
+mismatched sidecars fails closed instead of falling back to ordinary I/O.
 
 ## Page and extent sizes
 
@@ -222,6 +225,6 @@ named VFS before opening the application database.
 ## Compatibility
 
 The format magic is `ZSQLPG03` and the format version is 3. V3 intentionally
-does not open or migrate the earlier experimental formats. Convert from an
+does not open or migrate the earlier development formats. Convert from an
 ordinary SQLite export instead. The format is little-endian and unknown future
 versions must be rejected rather than guessed.
