@@ -1,0 +1,45 @@
+[package]
+name = "zsqlite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+description = "A transparent Zstandard-compressed page VFS for SQLite"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "zsqlite"
+path = "src/bin/zsqlite.rs"
+
+[dependencies]
+blake3 = "1.8.2"
+crc32fast = "1.5.0"
+getrandom = "0.4.2"
+libsqlite3-sys = "0.38.2"
+thiserror = "2.0.16"
+zstd = { version = "0.13.3", default-features = false }
+
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
+libc = "0.2.189"
+
+[features]
+default = ["loadable"]
+loadable = ["libsqlite3-sys/loadable_extension"]
+static = ["libsqlite3-sys/bundled"]
+
+[dev-dependencies]
+tempfile = "3.21.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
