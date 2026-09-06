@@ -3,11 +3,12 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 pub mod format;
+mod seekable;
 mod store;
 
 mod vfs;
 
-pub use store::{Inspect, StoreError};
+pub use store::{CompressionConfig, Inspect, StoreError};
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -39,7 +40,16 @@ pub fn verify(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
 /// This fails with [`StoreError::Busy`] if any `SQLite` process has the database
 /// open. Callers must checkpoint WAL and close every connection first.
 pub fn compact(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
-    let mut store = store::Store::open_existing(path)?;
+    compact_with_config(path, CompressionConfig::default())
+}
+
+/// Compacts an existing database using the requested sizes for newly written
+/// extents and independently decompressible seek chunks.
+pub fn compact_with_config(
+    path: impl AsRef<Path>,
+    config: CompressionConfig,
+) -> Result<Inspect, StoreError> {
+    let mut store = store::Store::open_with_config(path, false, config)?;
     store.compact()?;
     store.checkpoint_index()?;
     store.inspect()
@@ -50,6 +60,16 @@ pub fn compact(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
 pub fn convert_to_zsqlite(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
+) -> Result<Inspect, StoreError> {
+    convert_to_zsqlite_with_config(source, destination, CompressionConfig::default())
+}
+
+/// Converts a closed ordinary `SQLite` database with explicitly configured
+/// extent and seek-chunk sizes.
+pub fn convert_to_zsqlite_with_config(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    config: CompressionConfig,
 ) -> Result<Inspect, StoreError> {
     let source = absolute_path(source.as_ref())?;
     let destination = absolute_path(destination.as_ref())?;
@@ -68,8 +88,9 @@ pub fn convert_to_zsqlite(
 
     let staging = unused_staging_path(&destination, "convert")?;
     let mut staging_cleanup = CleanupPaths::new(bundle_paths(&staging).to_vec());
-    let mut converted = store::Store::open(&staging, true)?;
-    let chunk_size = usize::try_from(format::MAX_EXTENT_BYTES).map_err(|_| StoreError::Range)?;
+    config.validate_page_size(page_size)?;
+    let mut converted = store::Store::open_with_config(&staging, true, config)?;
+    let chunk_size = usize::try_from(config.extent_bytes()).map_err(|_| StoreError::Range)?;
     let mut buffer = vec![0_u8; chunk_size];
     let mut offset = 0_u64;
     while offset < length {

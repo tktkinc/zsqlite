@@ -5,6 +5,7 @@ use crate::format::{
     Header, INDEX_HEADER_SIZE, IndexHeader, MAX_EXTENT_BYTES, MAX_INDEX_BYTES, SECTOR_SIZE,
     SUPERBLOCK_A_OFFSET, SUPERBLOCK_B_OFFSET, Superblock, digest, valid_page_size,
 };
+use crate::seekable;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -16,9 +17,11 @@ const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const MIN_SAVINGS: usize = 64;
 const ZSTD_LEVEL: i32 = 3;
 const INDEX_ENTRY_SIZE: usize = 24;
-const EXTENT_CACHE_CAPACITY: usize = 8;
+const DEFAULT_EXTENT_BYTES: u32 = MAX_EXTENT_BYTES;
+const DEFAULT_SEEK_CHUNK_BYTES: u32 = 64 * 1024;
+const EXTENT_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const PENDING_CHUNK_CAPACITY: usize = 8;
-const PENDING_EXTENT_CACHE_CAPACITY: usize = 2;
+const PENDING_EXTENT_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_GENERATIONS: usize = 1_000_000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +66,69 @@ pub enum StoreError {
     InvalidStandardDatabase,
     #[error("unsupported filesystem or platform operation")]
     Unsupported,
+    #[error("invalid compression configuration: {0}")]
+    InvalidConfiguration(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompressionConfig {
+    extent_bytes: u32,
+    seek_chunk_bytes: u32,
+}
+
+impl CompressionConfig {
+    pub fn new(extent_bytes: u32, seek_chunk_bytes: u32) -> Result<Self, StoreError> {
+        if !(512..=MAX_EXTENT_BYTES).contains(&extent_bytes) || !extent_bytes.is_power_of_two() {
+            return Err(StoreError::InvalidConfiguration(
+                "extent size must be a power of two between 512 bytes and 1 MiB",
+            ));
+        }
+        if !(512..=extent_bytes).contains(&seek_chunk_bytes)
+            || !seek_chunk_bytes.is_power_of_two()
+            || !extent_bytes.is_multiple_of(seek_chunk_bytes)
+        {
+            return Err(StoreError::InvalidConfiguration(
+                "seek chunk size must be a power-of-two divisor of the extent size",
+            ));
+        }
+        Ok(Self {
+            extent_bytes,
+            seek_chunk_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn extent_bytes(self) -> u32 {
+        self.extent_bytes
+    }
+
+    #[must_use]
+    pub const fn seek_chunk_bytes(self) -> u32 {
+        self.seek_chunk_bytes
+    }
+
+    pub fn validate_page_size(self, page_size: u32) -> Result<(), StoreError> {
+        if !valid_page_size(page_size)
+            || self.extent_bytes < page_size
+            || self.seek_chunk_bytes < page_size
+            || !self.extent_bytes.is_multiple_of(page_size)
+            || !self.seek_chunk_bytes.is_multiple_of(page_size)
+        {
+            return Err(StoreError::InvalidConfiguration(
+                "extent and seek chunk sizes must contain whole SQLite pages",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            extent_bytes: DEFAULT_EXTENT_BYTES,
+            seek_chunk_bytes: DEFAULT_SEEK_CHUNK_BYTES,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -70,6 +136,83 @@ struct ExtentLocation {
     header: ExtentHeader,
     record_offset: u64,
     payload_offset: u64,
+    seekable: Option<seekable::Layout>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CacheKey {
+    record_offset: u64,
+    frame: u32,
+}
+
+const WHOLE_EXTENT_CACHE_FRAME: u32 = u32::MAX;
+
+#[derive(Debug)]
+struct ExtentCache {
+    capacity: usize,
+    bytes: usize,
+    entries: VecDeque<(CacheKey, Arc<Vec<u8>>)>,
+}
+
+impl ExtentCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            bytes: 0,
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: CacheKey) -> Option<Arc<Vec<u8>>> {
+        let position = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| *candidate == key)?;
+        let entry = self
+            .entries
+            .remove(position)
+            .expect("cache position exists");
+        let value = Arc::clone(&entry.1);
+        self.entries.push_front(entry);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: CacheKey, value: Arc<Vec<u8>>) {
+        self.remove(key);
+        self.bytes = self.bytes.saturating_add(value.len());
+        self.entries.push_front((key, value));
+        while self.bytes > self.capacity && self.entries.len() > 1 {
+            if let Some((_, removed)) = self.entries.pop_back() {
+                self.bytes = self.bytes.saturating_sub(removed.len());
+            }
+        }
+    }
+
+    fn remove(&mut self, key: CacheKey) {
+        if let Some(position) = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| *candidate == key)
+            && let Some((_, removed)) = self.entries.remove(position)
+        {
+            self.bytes = self.bytes.saturating_sub(removed.len());
+        }
+    }
+
+    fn remove_record(&mut self, record_offset: u64) {
+        self.entries.retain(|(key, value)| {
+            let keep = key.record_offset != record_offset;
+            if !keep {
+                self.bytes = self.bytes.saturating_sub(value.len());
+            }
+            keep
+        });
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
 }
 
 type AppendedExtents = (Vec<Arc<ExtentLocation>>, u64, [u8; blake3::OUT_LEN]);
@@ -97,11 +240,12 @@ struct PendingLayer {
     file: File,
     generation: u64,
     page_size: u32,
+    config: CompressionConfig,
     next_offset: u64,
     chunks: BTreeMap<u32, PendingChunk>,
     chunk_lru: VecDeque<u32>,
     runs: BTreeMap<u32, PageRun>,
-    extent_cache: VecDeque<(u64, Arc<Vec<u8>>)>,
+    extent_cache: ExtentCache,
 }
 
 impl PageRun {
@@ -147,16 +291,23 @@ impl BootstrapLayer {
 }
 
 impl PendingLayer {
-    fn new(sidecar_path: &Path, generation: u64, page_size: u32) -> Result<Self, StoreError> {
+    fn new(
+        sidecar_path: &Path,
+        generation: u64,
+        page_size: u32,
+        config: CompressionConfig,
+    ) -> Result<Self, StoreError> {
+        config.validate_page_size(page_size)?;
         Ok(Self {
             file: create_unlinked_temporary(sidecar_path)?,
             generation,
             page_size,
+            config,
             next_offset: 0,
             chunks: BTreeMap::new(),
             chunk_lru: VecDeque::new(),
             runs: BTreeMap::new(),
-            extent_cache: VecDeque::new(),
+            extent_cache: ExtentCache::new(PENDING_EXTENT_CACHE_BYTES),
         })
     }
 
@@ -165,7 +316,7 @@ impl PendingLayer {
     }
 
     fn contains_page(&self, page: u32) -> Result<bool, StoreError> {
-        let chunk = pending_chunk_first(page, self.page_size)?;
+        let chunk = pending_chunk_first(page, self.page_size, self.config.extent_bytes)?;
         if self
             .chunks
             .get(&chunk)
@@ -181,7 +332,7 @@ impl PendingLayer {
     }
 
     fn read_page(&mut self, page: u32) -> Result<Option<Vec<u8>>, StoreError> {
-        let chunk = pending_chunk_first(page, self.page_size)?;
+        let chunk = pending_chunk_first(page, self.page_size, self.config.extent_bytes)?;
         if let Some(value) = self
             .chunks
             .get(&chunk)
@@ -197,19 +348,18 @@ impl PendingLayer {
         let Some(run) = run.filter(|run| run.contains(page)) else {
             return Ok(None);
         };
-        let extent = self.read_extent(&run.extent)?;
         let within = run
             .extent_page
             .checked_add(page - run.first_page)
             .ok_or(StoreError::Range)?;
-        let start = within as usize * self.page_size as usize;
-        let end = start
-            .checked_add(self.page_size as usize)
-            .ok_or(StoreError::Range)?;
-        extent
-            .get(start..end)
-            .map(|value| Some(value.to_vec()))
-            .ok_or(StoreError::Corrupt(run.extent.record_offset))
+        read_extent_page(
+            &self.file,
+            &mut self.extent_cache,
+            &run.extent,
+            within,
+            self.page_size,
+        )
+        .map(Some)
     }
 
     fn stage_page(&mut self, page: u32, data: Vec<u8>) -> Result<(), StoreError> {
@@ -220,7 +370,7 @@ impl PendingLayer {
                 expected: self.page_size as usize,
             });
         }
-        let first = pending_chunk_first(page, self.page_size)?;
+        let first = pending_chunk_first(page, self.page_size, self.config.extent_bytes)?;
         if !self.chunks.contains_key(&first) {
             while self.chunks.len() >= PENDING_CHUNK_CAPACITY {
                 let oldest = self.chunk_lru.pop_front().ok_or(StoreError::Range)?;
@@ -231,7 +381,9 @@ impl PendingLayer {
         self.touch_chunk(first);
         let chunk = self.chunks.get_mut(&first).ok_or(StoreError::Range)?;
         chunk.pages.insert(page, data);
-        if chunk.pages.len() == max_pages_per_extent(self.page_size)? as usize {
+        if chunk.pages.len()
+            == max_pages_per_extent(self.page_size, self.config.extent_bytes)? as usize
+        {
             self.flush_chunk(first)?;
         }
         Ok(())
@@ -264,7 +416,7 @@ impl PendingLayer {
             return Ok(());
         }
         let mut raw = Vec::new();
-        raw.try_reserve_exact(MAX_EXTENT_BYTES as usize)
+        raw.try_reserve_exact(self.config.extent_bytes as usize)
             .map_err(|_| StoreError::Range)?;
         let mut run_first = 0_u32;
         let mut previous = 0_u32;
@@ -301,6 +453,8 @@ impl PendingLayer {
             first_page,
             page_count,
             raw,
+            self.page_size,
+            self.config.seek_chunk_bytes,
         )?;
         self.next_offset = next;
         replace_run(
@@ -315,36 +469,7 @@ impl PendingLayer {
     }
 
     fn read_extent(&mut self, location: &Arc<ExtentLocation>) -> Result<Arc<Vec<u8>>, StoreError> {
-        if let Some(position) = self
-            .extent_cache
-            .iter()
-            .position(|(offset, _)| *offset == location.record_offset)
-        {
-            let entry = self
-                .extent_cache
-                .remove(position)
-                .expect("pending cache position exists");
-            let value = Arc::clone(&entry.1);
-            self.extent_cache.push_front(entry);
-            return Ok(value);
-        }
-        let mut payload = allocate_zeroed(location.header.stored_len as usize)?;
-        read_exact_at(&self.file, location.payload_offset, &mut payload)?;
-        let raw = match location.header.codec {
-            Codec::Raw => payload,
-            Codec::Zstd => zstd::bulk::decompress(&payload, location.header.raw_len as usize)
-                .map_err(|error| StoreError::Zstd(error.to_string()))?,
-        };
-        if raw.len() != location.header.raw_len as usize
-            || digest(&raw) != location.header.raw_digest
-        {
-            return Err(StoreError::PageChecksum(location.header.first_page));
-        }
-        let value = Arc::new(raw);
-        self.extent_cache
-            .push_front((location.record_offset, Arc::clone(&value)));
-        self.extent_cache.truncate(PENDING_EXTENT_CACHE_CAPACITY);
-        Ok(value)
+        read_whole_extent(&self.file, &mut self.extent_cache, location, self.page_size)
     }
 
     fn touch_chunk(&mut self, first: u32) {
@@ -392,6 +517,7 @@ pub(crate) struct Store {
     lifecycle: File,
     publication: File,
     database_id: DatabaseId,
+    config: CompressionConfig,
     page_size: u32,
     logical_size: u64,
     committed_size: u64,
@@ -408,7 +534,7 @@ pub(crate) struct Store {
     active_slot: usize,
     indexed_generation: u64,
     obsolete_ranges: Vec<(u64, u64, u64)>,
-    extent_cache: VecDeque<(u64, Arc<Vec<u8>>)>,
+    extent_cache: ExtentCache,
     hole_punching: bool,
     allocation_granularity: u64,
     publication_locked: bool,
@@ -416,19 +542,40 @@ pub(crate) struct Store {
 
 impl Store {
     pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::open_mode(path.as_ref(), false, true)
+        Self::open_mode(path.as_ref(), false, true, CompressionConfig::default())
     }
 
     pub(crate) fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::open_mode(path.as_ref(), false, false)
+        Self::open_mode(path.as_ref(), false, false, CompressionConfig::default())
     }
 
+    pub(crate) fn open_existing_read_only_with_config(
+        path: impl AsRef<Path>,
+        config: CompressionConfig,
+    ) -> Result<Self, StoreError> {
+        Self::open_mode(path.as_ref(), false, false, config)
+    }
+
+    #[cfg(test)]
     pub(crate) fn open(path: impl AsRef<Path>, create: bool) -> Result<Self, StoreError> {
-        Self::open_mode(path.as_ref(), create, true)
+        Self::open_mode(path.as_ref(), create, true, CompressionConfig::default())
+    }
+
+    pub(crate) fn open_with_config(
+        path: impl AsRef<Path>,
+        create: bool,
+        config: CompressionConfig,
+    ) -> Result<Self, StoreError> {
+        Self::open_mode(path.as_ref(), create, true, config)
     }
 
     #[allow(clippy::too_many_lines)]
-    fn open_mode(path: &Path, create: bool, writable: bool) -> Result<Self, StoreError> {
+    fn open_mode(
+        path: &Path,
+        create: bool,
+        writable: bool,
+        config: CompressionConfig,
+    ) -> Result<Self, StoreError> {
         let path = absolute_path(path)?;
         if deletion_path(&path).exists() {
             return Err(StoreError::Busy);
@@ -563,6 +710,7 @@ impl Store {
             lifecycle,
             publication,
             database_id,
+            config,
             page_size: 0,
             logical_size: 0,
             committed_size: 0,
@@ -579,7 +727,7 @@ impl Store {
             active_slot: 0,
             indexed_generation: 0,
             obsolete_ranges: Vec::new(),
-            extent_cache: VecDeque::new(),
+            extent_cache: ExtentCache::new(EXTENT_CACHE_BYTES),
             hole_punching: cfg!(any(
                 target_os = "linux",
                 target_os = "android",
@@ -590,6 +738,16 @@ impl Store {
         };
         store.with_publication_snapshot(Self::reload)?;
         Ok(store)
+    }
+
+    pub(crate) fn ensure_config(&self, config: CompressionConfig) -> Result<(), StoreError> {
+        if self.config == config {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidConfiguration(
+                "connections sharing a database must use the same compression sizes",
+            ))
+        }
     }
 
     pub(crate) fn delete_bundle(path: impl AsRef<Path>) -> Result<(), StoreError> {
@@ -786,11 +944,12 @@ impl Store {
             }
             self.page_size = page_size;
             let bootstrap = self.bootstrap.take().ok_or(StoreError::Range)?;
-            let mut buffer = allocate_zeroed(MAX_EXTENT_BYTES as usize)?;
+            self.config.validate_page_size(page_size)?;
+            let mut buffer = allocate_zeroed(self.config.extent_bytes as usize)?;
             let mut staged_offset = 0_u64;
             while staged_offset < self.logical_size {
                 let amount = usize::try_from(
-                    (self.logical_size - staged_offset).min(u64::from(MAX_EXTENT_BYTES)),
+                    (self.logical_size - staged_offset).min(u64::from(self.config.extent_bytes)),
                 )
                 .map_err(|_| StoreError::Range)?;
                 bootstrap.read_at(staged_offset, &mut buffer[..amount])?;
@@ -834,6 +993,7 @@ impl Store {
                 &self.sidecar_path,
                 generation,
                 self.page_size,
+                self.config,
             )?);
         }
         self.pending
@@ -1141,7 +1301,8 @@ impl Store {
         let mut cursor = HEADER_SIZE as u64;
         let mut extents = Vec::new();
         let mut hasher = blake3::Hasher::new();
-        let max = max_pages_per_extent(self.page_size)?;
+        self.config.validate_page_size(self.page_size)?;
+        let max = max_pages_per_extent(self.page_size, self.config.extent_bytes)?;
         let mut first = 1;
         while first <= pages {
             let count = max.min(pages - first + 1);
@@ -1151,7 +1312,16 @@ impl Store {
             for page in first..first + count {
                 raw.extend_from_slice(&self.read_page(page)?);
             }
-            let (extent, next, encoded) = write_extent(&temporary, cursor, 1, first, count, &raw)?;
+            let (extent, next, encoded) = write_extent(
+                &temporary,
+                cursor,
+                1,
+                first,
+                count,
+                &raw,
+                self.page_size,
+                self.config.seek_chunk_bytes,
+            )?;
             hasher.update(&encoded);
             cursor = next;
             extents.push(extent);
@@ -1297,52 +1467,17 @@ impl Store {
         let Some(run) = run.filter(|run| run.contains(page)) else {
             return Ok(vec![0; self.page_size as usize]);
         };
-        let extent = self.read_extent(&run.extent)?;
         let within = run
             .extent_page
             .checked_add(page - run.first_page)
             .ok_or(StoreError::Range)?;
-        let start = within as usize * self.page_size as usize;
-        let end = start
-            .checked_add(self.page_size as usize)
-            .ok_or(StoreError::Range)?;
-        extent
-            .get(start..end)
-            .map(<[u8]>::to_vec)
-            .ok_or(StoreError::Corrupt(run.extent.record_offset))
-    }
-
-    fn read_extent(&mut self, location: &Arc<ExtentLocation>) -> Result<Arc<Vec<u8>>, StoreError> {
-        if let Some(position) = self
-            .extent_cache
-            .iter()
-            .position(|(offset, _)| *offset == location.record_offset)
-        {
-            let entry = self
-                .extent_cache
-                .remove(position)
-                .expect("cache position exists");
-            let value = Arc::clone(&entry.1);
-            self.extent_cache.push_front(entry);
-            return Ok(value);
-        }
-        let mut payload = allocate_zeroed(location.header.stored_len as usize)?;
-        read_exact_at(&self.sidecar, location.payload_offset, &mut payload)?;
-        let raw = match location.header.codec {
-            Codec::Raw => payload,
-            Codec::Zstd => zstd::bulk::decompress(&payload, location.header.raw_len as usize)
-                .map_err(|error| StoreError::Zstd(error.to_string()))?,
-        };
-        if raw.len() != location.header.raw_len as usize
-            || digest(&raw) != location.header.raw_digest
-        {
-            return Err(StoreError::PageChecksum(location.header.first_page));
-        }
-        let value = Arc::new(raw);
-        self.extent_cache
-            .push_front((location.record_offset, Arc::clone(&value)));
-        self.extent_cache.truncate(EXTENT_CACHE_CAPACITY);
-        Ok(value)
+        read_extent_page(
+            &self.sidecar,
+            &mut self.extent_cache,
+            &run.extent,
+            within,
+            self.page_size,
+        )
     }
 
     fn install_generation(
@@ -1375,7 +1510,7 @@ impl Store {
                     u64::from(extent.header.stored_len),
                     self.generation,
                 ));
-                self.extent_cache.retain(|(cached, _)| *cached != offset);
+                self.extent_cache.remove_record(offset);
             }
         }
         Ok(())
@@ -1555,7 +1690,7 @@ fn read_generation(
     read_exact_at(file, commit_offset, &mut encoded_commit)?;
     let commit = Commit::decode(&encoded_commit).map_err(|_| StoreError::Corrupt(commit_offset))?;
     let minimum_generation_bytes = u64::from(commit.extent_count)
-        .checked_mul(SECTOR_SIZE as u64)
+        .checked_mul(EXTENT_HEADER_SIZE as u64 + 1)
         .and_then(|bytes| commit.generation_start.checked_add(bytes))
         .ok_or(StoreError::Range)?;
     if minimum_generation_bytes > commit_offset || commit.generation_start > commit_offset {
@@ -1615,6 +1750,7 @@ fn read_generation(
             header,
             record_offset: cursor,
             payload_offset,
+            seekable: load_seekable_layout(file, cursor, payload_offset, header, commit.page_size)?,
         }));
         cursor = next;
     }
@@ -1672,6 +1808,7 @@ fn load_index(file: &File, superblock: Superblock) -> Result<BTreeMap<u32, PageR
         Codec::Raw => payload,
         Codec::Zstd => zstd::bulk::decompress(&payload, raw_len)
             .map_err(|error| StoreError::Zstd(error.to_string()))?,
+        Codec::ZstdSeekable => return Err(StoreError::Corrupt(superblock.index_offset)),
     };
     if raw.len() != raw_len || digest(&raw) != header.raw_digest {
         return Err(StoreError::Corrupt(superblock.index_offset));
@@ -1704,7 +1841,11 @@ fn load_index(file: &File, superblock: Superblock) -> Result<BTreeMap<u32, PageR
         let extent = if let Some(extent) = extent_cache.get(&extent_offset) {
             Arc::clone(extent)
         } else {
-            let extent = Arc::new(read_extent_location(file, extent_offset)?);
+            let extent = Arc::new(read_extent_location(
+                file,
+                extent_offset,
+                superblock.page_size,
+            )?);
             extent_cache.insert(extent_offset, Arc::clone(&extent));
             extent
         };
@@ -1740,7 +1881,11 @@ fn load_index(file: &File, superblock: Superblock) -> Result<BTreeMap<u32, PageR
     Ok(runs)
 }
 
-fn read_extent_location(file: &File, offset: u64) -> Result<ExtentLocation, StoreError> {
+fn read_extent_location(
+    file: &File,
+    offset: u64,
+    page_size: u32,
+) -> Result<ExtentLocation, StoreError> {
     let mut encoded = [0; EXTENT_HEADER_SIZE];
     read_exact_at(file, offset, &mut encoded)?;
     let header = ExtentHeader::decode(&encoded).map_err(|_| StoreError::Corrupt(offset))?;
@@ -1758,7 +1903,189 @@ fn read_extent_location(file: &File, offset: u64) -> Result<ExtentLocation, Stor
         header,
         record_offset: offset,
         payload_offset,
+        seekable: load_seekable_layout(file, offset, payload_offset, header, page_size)?,
     })
+}
+
+fn load_seekable_layout(
+    file: &File,
+    record_offset: u64,
+    payload_offset: u64,
+    header: ExtentHeader,
+    page_size: u32,
+) -> Result<Option<seekable::Layout>, StoreError> {
+    if header.codec != Codec::ZstdSeekable {
+        return Ok(None);
+    }
+    let footer_offset = payload_offset
+        .checked_add(u64::from(header.stored_len))
+        .and_then(|end| end.checked_sub(seekable::SEEK_FOOTER_SIZE as u64))
+        .ok_or(StoreError::Corrupt(record_offset))?;
+    let mut footer = [0_u8; seekable::SEEK_FOOTER_SIZE];
+    read_exact_at(file, footer_offset, &mut footer)?;
+    let tail_size =
+        seekable::tail_size_from_footer(&footer).map_err(|_| StoreError::Corrupt(record_offset))?;
+    if tail_size > header.stored_len as usize {
+        return Err(StoreError::Corrupt(record_offset));
+    }
+    let mut tail = allocate_zeroed(tail_size)?;
+    let tail_offset = payload_offset
+        .checked_add(u64::from(header.stored_len) - tail_size as u64)
+        .ok_or(StoreError::Range)?;
+    read_exact_at(file, tail_offset, &mut tail)?;
+    seekable::decode_layout(
+        &tail,
+        header.stored_len,
+        header.raw_len,
+        page_size,
+        header.raw_digest,
+    )
+    .map(Some)
+    .map_err(|_| StoreError::Corrupt(record_offset))
+}
+
+fn read_extent_page(
+    file: &File,
+    cache: &mut ExtentCache,
+    location: &ExtentLocation,
+    extent_page: u32,
+    page_size: u32,
+) -> Result<Vec<u8>, StoreError> {
+    let raw_offset = extent_page
+        .checked_mul(page_size)
+        .ok_or(StoreError::Range)?;
+    let raw_end = raw_offset.checked_add(page_size).ok_or(StoreError::Range)?;
+    if raw_end > location.header.raw_len {
+        return Err(StoreError::Corrupt(location.record_offset));
+    }
+    if location.header.codec != Codec::ZstdSeekable {
+        let extent = read_whole_extent(file, cache, location, page_size)?;
+        return extent
+            .get(raw_offset as usize..raw_end as usize)
+            .map(<[u8]>::to_vec)
+            .ok_or(StoreError::Corrupt(location.record_offset));
+    }
+
+    let layout = location
+        .seekable
+        .as_ref()
+        .ok_or(StoreError::Corrupt(location.record_offset))?;
+    let frame_index = layout
+        .frames
+        .partition_point(|frame| frame.raw_offset <= raw_offset)
+        .checked_sub(1)
+        .ok_or(StoreError::Corrupt(location.record_offset))?;
+    let frame = layout
+        .frames
+        .get(frame_index)
+        .ok_or(StoreError::Corrupt(location.record_offset))?;
+    let frame_end = frame
+        .raw_offset
+        .checked_add(frame.raw_size)
+        .ok_or(StoreError::Range)?;
+    if raw_offset < frame.raw_offset || raw_end > frame_end {
+        return Err(StoreError::Corrupt(location.record_offset));
+    }
+    let raw = read_seekable_frame(file, cache, location, frame_index, frame, page_size)?;
+    let start = usize::try_from(raw_offset - frame.raw_offset).map_err(|_| StoreError::Range)?;
+    let end = start
+        .checked_add(page_size as usize)
+        .ok_or(StoreError::Range)?;
+    raw.get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or(StoreError::Corrupt(location.record_offset))
+}
+
+fn read_whole_extent(
+    file: &File,
+    cache: &mut ExtentCache,
+    location: &ExtentLocation,
+    page_size: u32,
+) -> Result<Arc<Vec<u8>>, StoreError> {
+    let cache_key = CacheKey {
+        record_offset: location.record_offset,
+        frame: WHOLE_EXTENT_CACHE_FRAME,
+    };
+    if let Some(value) = cache.get(cache_key) {
+        return Ok(value);
+    }
+
+    let raw = match location.header.codec {
+        Codec::Raw | Codec::Zstd => {
+            let mut payload = allocate_zeroed(location.header.stored_len as usize)?;
+            read_exact_at(file, location.payload_offset, &mut payload)?;
+            match location.header.codec {
+                Codec::Raw => payload,
+                Codec::Zstd => zstd::bulk::decompress(&payload, location.header.raw_len as usize)
+                    .map_err(|error| StoreError::Zstd(error.to_string()))?,
+                Codec::ZstdSeekable => unreachable!("matched legacy codec"),
+            }
+        }
+        Codec::ZstdSeekable => {
+            let layout = location
+                .seekable
+                .as_ref()
+                .ok_or(StoreError::Corrupt(location.record_offset))?;
+            let mut output = allocate_zeroed(location.header.raw_len as usize)?;
+            for (frame_index, frame) in layout.frames.iter().enumerate() {
+                let frame_raw =
+                    read_seekable_frame(file, cache, location, frame_index, frame, page_size)?;
+                let start = frame.raw_offset as usize;
+                let end = start
+                    .checked_add(frame.raw_size as usize)
+                    .ok_or(StoreError::Range)?;
+                output
+                    .get_mut(start..end)
+                    .ok_or(StoreError::Corrupt(location.record_offset))?
+                    .copy_from_slice(&frame_raw);
+            }
+            output
+        }
+    };
+    if raw.len() != location.header.raw_len as usize
+        || (location.header.codec != Codec::ZstdSeekable
+            && digest(&raw) != location.header.raw_digest)
+    {
+        return Err(StoreError::PageChecksum(location.header.first_page));
+    }
+    let value = Arc::new(raw);
+    cache.insert(cache_key, Arc::clone(&value));
+    Ok(value)
+}
+
+fn read_seekable_frame(
+    file: &File,
+    cache: &mut ExtentCache,
+    location: &ExtentLocation,
+    frame_index: usize,
+    frame: &seekable::Frame,
+    page_size: u32,
+) -> Result<Arc<Vec<u8>>, StoreError> {
+    let frame_number = u32::try_from(frame_index).map_err(|_| StoreError::Range)?;
+    let cache_key = CacheKey {
+        record_offset: location.record_offset,
+        frame: frame_number,
+    };
+    if let Some(value) = cache.get(cache_key) {
+        return Ok(value);
+    }
+    let mut compressed = allocate_zeroed(frame.compressed_size as usize)?;
+    let compressed_offset = location
+        .payload_offset
+        .checked_add(u64::from(frame.compressed_offset))
+        .ok_or(StoreError::Range)?;
+    read_exact_at(file, compressed_offset, &mut compressed)?;
+    let raw = zstd::bulk::decompress(&compressed, frame.raw_size as usize).map_err(|_| {
+        StoreError::PageChecksum(location.header.first_page + frame.raw_offset / page_size)
+    })?;
+    if raw.len() != frame.raw_size as usize || digest(&raw) != frame.raw_digest {
+        return Err(StoreError::PageChecksum(
+            location.header.first_page + frame.raw_offset / page_size,
+        ));
+    }
+    let value = Arc::new(raw);
+    cache.insert(cache_key, Arc::clone(&value));
+    Ok(value)
 }
 
 fn replace_run(runs: &mut BTreeMap<u32, PageRun>, replacement: PageRun) -> Result<(), StoreError> {
@@ -1817,17 +2144,17 @@ fn truncate_runs(runs: &mut BTreeMap<u32, PageRun>, max_page: u32) -> Result<(),
     Ok(())
 }
 
-fn max_pages_per_extent(page_size: u32) -> Result<u32, StoreError> {
+fn max_pages_per_extent(page_size: u32, extent_bytes: u32) -> Result<u32, StoreError> {
     valid_page_size(page_size)
-        .then_some((MAX_EXTENT_BYTES / page_size).max(1))
+        .then_some((extent_bytes / page_size).max(1))
         .ok_or(StoreError::InvalidPageSize(page_size))
 }
 
-fn pending_chunk_first(page: u32, page_size: u32) -> Result<u32, StoreError> {
+fn pending_chunk_first(page: u32, page_size: u32, extent_bytes: u32) -> Result<u32, StoreError> {
     if page == 0 {
         return Err(StoreError::Range);
     }
-    let pages = max_pages_per_extent(page_size)?;
+    let pages = max_pages_per_extent(page_size, extent_bytes)?;
     ((page - 1) / pages)
         .checked_mul(pages)
         .and_then(|value| value.checked_add(1))
@@ -1877,6 +2204,7 @@ fn append_pending_extents(
                 header: run.extent.header,
                 record_offset: cursor,
                 payload_offset,
+                seekable: run.extent.seekable.clone(),
             }));
             cursor = cursor
                 .checked_add(allocation_len)
@@ -1907,6 +2235,8 @@ fn append_pending_extents(
             run.first_page,
             run.page_count,
             fragment,
+            page_size,
+            pending.config.seek_chunk_bytes,
         )?;
         generation_hasher.update(&encoded);
         extents.push(extent);
@@ -1942,6 +2272,7 @@ fn copy_exact_between(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_extent(
     file: &File,
     offset: u64,
@@ -1949,26 +2280,44 @@ fn write_extent(
     first_page: u32,
     page_count: u32,
     raw: &[u8],
+    page_size: u32,
+    seek_chunk_bytes: u32,
 ) -> Result<(Arc<ExtentLocation>, u64, [u8; EXTENT_HEADER_SIZE]), StoreError> {
-    let (codec, payload) = encode_bytes(raw)?;
-    let allocation_len = align_up(
-        EXTENT_HEADER_SIZE as u64 + payload.len() as u64,
-        SECTOR_SIZE as u64,
+    if raw.len()
+        != usize::try_from(page_count)
+            .map_err(|_| StoreError::Range)?
+            .checked_mul(page_size as usize)
+            .ok_or(StoreError::Range)?
+        || !seek_chunk_bytes.is_multiple_of(page_size)
+    {
+        return Err(StoreError::InvalidConfiguration(
+            "extent writes must contain whole seek chunks and SQLite pages",
+        ));
+    }
+    let seekable = seekable::encode(raw, seek_chunk_bytes as usize, ZSTD_LEVEL).map_err(
+        |error| match error {
+            seekable::SeekableError::Zstd(message) => StoreError::Zstd(message),
+            seekable::SeekableError::Range => StoreError::Range,
+            seekable::SeekableError::Invalid => StoreError::Corrupt(offset),
+        },
     )?;
+    let allocation_len = (EXTENT_HEADER_SIZE as u64)
+        .checked_add(seekable.payload.len() as u64)
+        .ok_or(StoreError::Range)?;
     let header = ExtentHeader {
         generation,
         first_page,
         page_count,
-        codec,
+        codec: Codec::ZstdSeekable,
         raw_len: u32::try_from(raw.len()).map_err(|_| StoreError::Range)?,
-        stored_len: u32::try_from(payload.len()).map_err(|_| StoreError::Range)?,
+        stored_len: u32::try_from(seekable.payload.len()).map_err(|_| StoreError::Range)?,
         allocation_len: u32::try_from(allocation_len).map_err(|_| StoreError::Range)?,
-        raw_digest: digest(raw),
+        raw_digest: seekable.metadata_digest,
     };
     let encoded = header.encode();
     write_all_at(file, offset, &encoded)?;
     let payload_offset = offset + EXTENT_HEADER_SIZE as u64;
-    write_all_at(file, payload_offset, &payload)?;
+    write_all_at(file, payload_offset, &seekable.payload)?;
     let next = offset + allocation_len;
     file.set_len(next)?;
     Ok((
@@ -1976,6 +2325,7 @@ fn write_extent(
             header,
             record_offset: offset,
             payload_offset,
+            seekable: Some(seekable.layout),
         }),
         next,
         encoded,
@@ -2652,7 +3002,7 @@ mod tests {
         let path = directory.path().join("bounded-pending.db");
         let mut store = Store::open(&path, true)?;
         let page_size = 4096_u32;
-        let pages_per_chunk = max_pages_per_extent(page_size)?;
+        let pages_per_chunk = max_pages_per_extent(page_size, DEFAULT_EXTENT_BYTES)?;
         let chunk_count = u32::try_from(PENDING_CHUNK_CAPACITY)? + 4;
 
         // Touch incomplete, widely separated chunks so the ninth chunk must
@@ -2667,7 +3017,9 @@ mod tests {
             }
             store.write_at(u64::from(page_no - 1) * u64::from(page_size), &page)?;
             let pending = store.pending.as_ref().expect("pending layer");
-            assert!(pending.buffered_bytes() <= PENDING_CHUNK_CAPACITY * MAX_EXTENT_BYTES as usize);
+            assert!(
+                pending.buffered_bytes() <= PENDING_CHUNK_CAPACITY * DEFAULT_EXTENT_BYTES as usize
+            );
         }
         let pending = store.pending.as_ref().expect("pending layer");
         assert_eq!(pending.chunks.len(), PENDING_CHUNK_CAPACITY);
@@ -2700,7 +3052,7 @@ mod tests {
         let path = directory.path().join("late-page-one.db");
         let page_size = 4096_u32;
         let logical_size =
-            (u64::try_from(PENDING_CHUNK_CAPACITY)? + 4) * u64::from(MAX_EXTENT_BYTES);
+            (u64::try_from(PENDING_CHUNK_CAPACITY)? + 4) * u64::from(DEFAULT_EXTENT_BYTES);
         let tail_length = usize::try_from(logical_size - u64::from(page_size))?;
         let tail = vec![0x6d; tail_length];
         let mut store = Store::open(&path, true)?;
@@ -2726,7 +3078,7 @@ mod tests {
         assert!(store.bootstrap.is_none());
         let pending = store.pending.as_ref().expect("compressed pending layer");
         assert!(pending.next_offset > 0);
-        assert!(pending.buffered_bytes() <= PENDING_CHUNK_CAPACITY * MAX_EXTENT_BYTES as usize);
+        assert!(pending.buffered_bytes() <= PENDING_CHUNK_CAPACITY * DEFAULT_EXTENT_BYTES as usize);
         store.publish(true)?;
         drop(store);
 
@@ -2744,8 +3096,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("rewrite-spilled.db");
         let page_size = 4096_u32;
-        let pages = max_pages_per_extent(page_size)?;
-        let mut expected = Vec::with_capacity(MAX_EXTENT_BYTES as usize);
+        let pages = max_pages_per_extent(page_size, DEFAULT_EXTENT_BYTES)?;
+        let mut expected = Vec::with_capacity(DEFAULT_EXTENT_BYTES as usize);
         for page in 1..=pages {
             let mut value = vec![(page % 251) as u8; page_size as usize];
             if page == 1 {
@@ -2765,8 +3117,8 @@ mod tests {
         );
 
         // Overwrite one complete page and a range crossing the following page
-        // boundary after the original 1 MiB extent has already been spilled.
-        let replacement_page = 100_u32;
+        // boundary after the configured extent has already been spilled.
+        let replacement_page = pages / 2;
         let replacement_offset = u64::from(replacement_page - 1) * u64::from(page_size);
         let replacement = vec![0xd7; page_size as usize];
         store.write_at(replacement_offset, &replacement)?;
@@ -2805,7 +3157,7 @@ mod tests {
         store.publish(true)?;
         let generation = store.generation;
 
-        let pages_per_chunk = max_pages_per_extent(page_size)?;
+        let pages_per_chunk = max_pages_per_extent(page_size, DEFAULT_EXTENT_BYTES)?;
         for chunk in 0..=u32::try_from(PENDING_CHUNK_CAPACITY)? {
             let page_no = chunk * pages_per_chunk + 1;
             let page = vec![b'z'; page_size as usize];
@@ -2850,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_payload_corruption_is_detected_on_read_without_modifying_evidence()
+    fn incompressible_seekable_frame_corruption_is_detected_without_modifying_evidence()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("corrupt-raw-payload.db");
@@ -2859,7 +3211,7 @@ mod tests {
         store.write_at(0, &page)?;
         store.publish(true)?;
         let extent = Arc::clone(&store.runs[&1].extent);
-        assert_eq!(extent.header.codec, Codec::Raw);
+        assert_eq!(extent.header.codec, Codec::ZstdSeekable);
         let sidecar_path = sidecar_path(&path);
         let original_length = store.sidecar.metadata()?.len();
         drop(store);
@@ -2868,7 +3220,9 @@ mod tests {
             .read(true)
             .write(true)
             .open(&sidecar_path)?;
-        let damaged_offset = extent.payload_offset + u64::from(extent.header.stored_len / 2);
+        let frame = &extent.seekable.as_ref().expect("seek layout").frames[0];
+        let damaged_offset =
+            extent.payload_offset + u64::from(frame.compressed_offset + frame.compressed_size / 2);
         let mut byte = [0_u8; 1];
         read_exact_at(&sidecar, damaged_offset, &mut byte)?;
         byte[0] ^= 0x80;
@@ -2887,7 +3241,40 @@ mod tests {
     }
 
     #[test]
-    fn zstd_payload_corruption_is_detected_on_read_without_modifying_evidence()
+    fn legacy_raw_and_zstd_extents_remain_readable() -> Result<(), Box<dyn std::error::Error>> {
+        for codec in [Codec::Raw, Codec::Zstd] {
+            let file = tempfile::tempfile()?;
+            let raw = sqlite_page(b'l', 4096);
+            let payload = match codec {
+                Codec::Raw => raw.clone(),
+                Codec::Zstd => zstd::bulk::compress(&raw, ZSTD_LEVEL)?,
+                Codec::ZstdSeekable => unreachable!(),
+            };
+            let header = ExtentHeader {
+                generation: 1,
+                first_page: 1,
+                page_count: 1,
+                codec,
+                raw_len: u32::try_from(raw.len())?,
+                stored_len: u32::try_from(payload.len())?,
+                allocation_len: u32::try_from(SECTOR_SIZE)? * 2,
+                raw_digest: digest(&raw),
+            };
+            write_all_at(&file, 0, &header.encode())?;
+            write_all_at(&file, EXTENT_HEADER_SIZE as u64, &payload)?;
+            file.set_len(u64::from(header.allocation_len))?;
+            let location = read_extent_location(&file, 0, 4096)?;
+            let mut cache = ExtentCache::new(8192);
+            assert_eq!(
+                read_extent_page(&file, &mut cache, &location, 0, 4096)?,
+                raw
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compressible_seekable_frame_corruption_is_detected_without_modifying_evidence()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("corrupt-zstd-payload.db");
@@ -2896,7 +3283,7 @@ mod tests {
         store.write_at(0, &page)?;
         store.publish(true)?;
         let extent = Arc::clone(&store.runs[&1].extent);
-        assert_eq!(extent.header.codec, Codec::Zstd);
+        assert_eq!(extent.header.codec, Codec::ZstdSeekable);
         let sidecar_path = sidecar_path(&path);
         let original_length = store.sidecar.metadata()?.len();
         drop(store);
@@ -2907,8 +3294,9 @@ mod tests {
             .open(&sidecar_path)?;
         // Damage multiple payload bytes while leaving the authenticated
         // extent header and every generation record intact.
-        let damaged_offset = extent.payload_offset + u64::from(extent.header.stored_len / 2);
-        let damage_len = usize::try_from(extent.header.stored_len.min(8))?;
+        let frame = &extent.seekable.as_ref().expect("seek layout").frames[0];
+        let damaged_offset = extent.payload_offset + u64::from(frame.compressed_offset);
+        let damage_len = usize::try_from(frame.compressed_size.min(8))?;
         let damage = vec![0xa5; damage_len];
         write_all_at(&sidecar, damaged_offset, &damage)?;
         drop(sidecar);
@@ -2917,10 +3305,49 @@ mod tests {
         let mut output = vec![0_u8; page.len()];
         assert!(matches!(
             reopened.read_at(0, &mut output),
-            Err(StoreError::Zstd(_) | StoreError::PageChecksum(1))
+            Err(StoreError::PageChecksum(1))
         ));
         drop(reopened);
         assert_eq!(std::fs::metadata(&sidecar_path)?.len(), original_length);
+        Ok(())
+    }
+
+    #[test]
+    fn point_read_decodes_only_the_requested_seek_frame() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("selective-frame-read.db");
+        let mut image = sqlite_page(b'a', 4096);
+        image.extend_from_slice(&vec![b'b'; 31 * 4096]);
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &image)?;
+        store.publish(true)?;
+        let extent = Arc::clone(&store.runs[&1].extent);
+        let second = &extent.seekable.as_ref().expect("seek layout").frames[1];
+        assert_eq!(second.raw_offset, DEFAULT_SEEK_CHUNK_BYTES);
+        drop(store);
+
+        let sidecar_path = sidecar_path(&path);
+        let sidecar = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(sidecar_path)?;
+        write_all_at(
+            &sidecar,
+            extent.payload_offset + u64::from(second.compressed_offset),
+            b"BAD!",
+        )?;
+        drop(sidecar);
+
+        let mut reopened = Store::open_existing_read_only(&path)?;
+        let mut first = vec![0; 4096];
+        reopened.read_at(0, &mut first)?;
+        assert_eq!(first, image[..4096]);
+        let mut seventeenth = vec![0; 4096];
+        assert!(matches!(
+            reopened.read_at(u64::from(DEFAULT_SEEK_CHUNK_BYTES), &mut seventeenth),
+            Err(StoreError::PageChecksum(17))
+        ));
         Ok(())
     }
 
@@ -3134,13 +3561,14 @@ mod tests {
     }
 
     #[test]
-    fn one_mebibyte_extents_are_batched_and_obsolete_ranges_are_processed()
+    fn configured_extents_are_batched_and_obsolete_ranges_are_processed()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("batch-and-reclaim.db");
-        let mut store = Store::open(&path, true)?;
+        let config = CompressionConfig::new(64 * 1024, 16 * 1024)?;
+        let mut store = Store::open_with_config(&path, true, config)?;
         let mut state = 0x9247_f31a_75d2_b689_u64;
-        let mut image = vec![0_u8; MAX_EXTENT_BYTES as usize];
+        let mut image = vec![0_u8; config.extent_bytes() as usize];
         for chunk in image.chunks_mut(8) {
             state ^= state << 13;
             state ^= state >> 7;
@@ -3153,7 +3581,10 @@ mod tests {
         store.publish(true)?;
         assert_eq!(store.live_counts.len(), 1);
         assert_eq!(store.runs.len(), 1);
-        assert_eq!(store.runs[&1].page_count, 256);
+        assert_eq!(
+            store.runs[&1].page_count,
+            config.extent_bytes() / store.page_size
+        );
         let first_extent = Arc::clone(&store.runs[&1].extent);
 
         for byte in &mut image[100..] {

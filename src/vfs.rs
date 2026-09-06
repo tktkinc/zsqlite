@@ -1,7 +1,7 @@
 //! Thin `SQLite` ABI shim. Main-database I/O is redirected to [`Store`]; every
 //! other operation is forwarded to the host VFS selected during registration.
 
-use crate::store::Store;
+use crate::store::{CompressionConfig, Store};
 use libsqlite3_sys as ffi;
 use std::collections::HashMap;
 use std::ffi::{CStr, OsStr, c_char, c_int, c_void};
@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::os::unix::ffi::OsStrExt;
 
 const VFS_NAME: &[u8] = b"zsqlite\0";
+const EXTENT_SIZE_PARAMETER: &[u8] = b"zsqlite_extent_size\0";
+const SEEK_SIZE_PARAMETER: &[u8] = b"zsqlite_seek_size\0";
 const WAL_CHECKPOINT_LOCK: c_int = 1;
 
 #[repr(C)]
@@ -63,6 +65,7 @@ fn sqlite_result(error: &crate::StoreError) -> c_int {
         crate::StoreError::UnknownPageSize | crate::StoreError::InvalidPageSize(_) => {
             ffi::SQLITE_NOTADB
         }
+        crate::StoreError::InvalidConfiguration(_) => ffi::SQLITE_CANTOPEN,
         crate::StoreError::Io(error) if error.raw_os_error() == Some(libc::ENOSPC) => {
             ffi::SQLITE_FULL
         }
@@ -86,26 +89,55 @@ fn get_store(
     path: &Path,
     create: bool,
     writable: bool,
+    config: CompressionConfig,
 ) -> Result<(Arc<Mutex<Store>>, bool), crate::StoreError> {
     let key = canonical_key(path);
     let mut stores = registry().lock().map_err(|_| crate::StoreError::Range)?;
     if let Some(store) = stores.get(&key).and_then(Weak::upgrade) {
+        let mut opened = store.lock().map_err(|_| crate::StoreError::Range)?;
+        opened.ensure_config(config)?;
         if writable {
-            store
-                .lock()
-                .map_err(|_| crate::StoreError::Range)?
-                .upgrade_writable()?;
+            opened.upgrade_writable()?;
         }
+        drop(opened);
         return Ok((store, false));
     }
     let opened = if writable {
-        Store::open(&key, create)?
+        Store::open_with_config(&key, create, config)?
     } else {
-        Store::open_existing_read_only(&key)?
+        Store::open_existing_read_only_with_config(&key, config)?
     };
     let store = Arc::new(Mutex::new(opened));
     stores.insert(key, Arc::downgrade(&store));
     Ok((store, true))
+}
+
+fn compression_config(name: *const c_char) -> Result<CompressionConfig, crate::StoreError> {
+    let defaults = CompressionConfig::default();
+    let extent = unsafe {
+        ffi::sqlite3_uri_int64(
+            name,
+            EXTENT_SIZE_PARAMETER.as_ptr().cast(),
+            i64::from(defaults.extent_bytes()),
+        )
+    };
+    let seek = unsafe {
+        ffi::sqlite3_uri_int64(
+            name,
+            SEEK_SIZE_PARAMETER.as_ptr().cast(),
+            i64::from(defaults.seek_chunk_bytes()),
+        )
+    };
+    CompressionConfig::new(
+        u32::try_from(extent).map_err(|_| {
+            crate::StoreError::InvalidConfiguration("extent size is outside the supported range")
+        })?,
+        u32::try_from(seek).map_err(|_| {
+            crate::StoreError::InvalidConfiguration(
+                "seek chunk size is outside the supported range",
+            )
+        })?,
+    )
 }
 
 unsafe fn app_data(vfs: *mut ffi::sqlite3_vfs) -> Option<&'static AppData> {
@@ -189,7 +221,14 @@ unsafe extern "C" fn x_open(
             }
             let path = path_from_name(name);
             let create = flags & ffi::SQLITE_OPEN_CREATE != 0;
-            match get_store(&path, create, !out_read_only) {
+            let config = match compression_config(name) {
+                Ok(config) => config,
+                Err(error) => {
+                    unsafe { close_parent(parent_file) };
+                    return sqlite_result(&error);
+                }
+            };
+            match get_store(&path, create, !out_read_only, config) {
                 Ok((opened, _newly_opened)) => store = Some(opened),
                 Err(crate::StoreError::NotZsqlite) => {}
                 Err(error) => {

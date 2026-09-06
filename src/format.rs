@@ -30,6 +30,7 @@ pub type Digest = [u8; 32];
 pub enum Codec {
     Raw = 0,
     Zstd = 1,
+    ZstdSeekable = 2,
 }
 
 impl TryFrom<u8> for Codec {
@@ -39,6 +40,7 @@ impl TryFrom<u8> for Codec {
         match value {
             0 => Ok(Self::Raw),
             1 => Ok(Self::Zstd),
+            2 => Ok(Self::ZstdSeekable),
             _ => Err(FormatError::UnknownCodec(value)),
         }
     }
@@ -238,6 +240,15 @@ impl ExtentHeader {
             raw_digest: input[40..72].try_into().expect("fixed digest"),
         };
         let minimum = (EXTENT_HEADER_SIZE as u64).checked_add(u64::from(value.stored_len));
+        let allocation_valid = minimum.is_some_and(|minimum| {
+            u64::from(value.allocation_len) >= minimum
+                && u64::from(value.allocation_len) <= MAX_RECORD_BYTES
+                && if value.codec == Codec::ZstdSeekable {
+                    u64::from(value.allocation_len) == minimum
+                } else {
+                    value.allocation_len.is_multiple_of(SECTOR_SIZE_U32)
+                }
+        });
         if input[5..8].iter().any(|byte| *byte != 0)
             || input[36..40].iter().any(|byte| *byte != 0)
             || input[72..EXTENT_HEADER_SIZE - 4]
@@ -251,11 +262,7 @@ impl ExtentHeader {
             || value.stored_len == 0
             || value.raw_digest == [0; 32]
             || (value.codec == Codec::Raw && value.raw_len != value.stored_len)
-            || minimum.is_none_or(|minimum| {
-                u64::from(value.allocation_len) < minimum
-                    || u64::from(value.allocation_len) > MAX_RECORD_BYTES
-                    || !value.allocation_len.is_multiple_of(SECTOR_SIZE_U32)
-            })
+            || !allocation_valid
         {
             return Err(FormatError::InvalidExtent);
         }
@@ -364,6 +371,7 @@ impl IndexHeader {
             || value.raw_len > MAX_INDEX_BYTES
             || value.stored_len > MAX_INDEX_BYTES
             || value.raw_digest == [0; 32]
+            || !matches!(value.codec, Codec::Raw | Codec::Zstd)
             || (value.codec == Codec::Raw && value.raw_len != value.stored_len)
         {
             return Err(FormatError::InvalidIndex);
@@ -497,6 +505,16 @@ mod tests {
             raw_digest: digest(b"extent"),
         };
         assert_eq!(ExtentHeader::decode(&extent.encode()), Ok(extent));
+        let seekable_extent = ExtentHeader {
+            codec: Codec::ZstdSeekable,
+            stored_len: 777,
+            allocation_len: u32::try_from(EXTENT_HEADER_SIZE).expect("header fits") + 777,
+            ..extent
+        };
+        assert_eq!(
+            ExtentHeader::decode(&seekable_extent.encode()),
+            Ok(seekable_extent)
+        );
         let commit = Commit {
             generation: 3,
             previous_commit: 14000,

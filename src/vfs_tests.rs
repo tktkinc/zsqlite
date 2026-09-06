@@ -42,9 +42,34 @@ impl Connection {
         Self::open_with_vfs_and_flags(path, ZSQLITE_VFS, ffi::SQLITE_OPEN_READONLY)
     }
 
+    fn open_with_compression(
+        path: &Path,
+        extent_size: u32,
+        seek_size: u32,
+    ) -> Result<Self, String> {
+        let filename = CString::new(format!(
+            "file:{}?zsqlite_extent_size={extent_size}&zsqlite_seek_size={seek_size}",
+            path.display()
+        ))
+        .map_err(|error| error.to_string())?;
+        Self::open_filename_with_vfs_and_flags(
+            &filename,
+            ZSQLITE_VFS,
+            ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_URI,
+        )
+    }
+
     fn open_with_vfs_and_flags(path: &Path, vfs: &CStr, flags: c_int) -> Result<Self, String> {
         #[cfg(unix)]
         let path = CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        Self::open_filename_with_vfs_and_flags(&path, vfs, flags)
+    }
+
+    fn open_filename_with_vfs_and_flags(
+        path: &CStr,
+        vfs: &CStr,
+        flags: c_int,
+    ) -> Result<Self, String> {
         let mut database = null_mut();
         let rc =
             unsafe { ffi::sqlite3_open_v2(path.as_ptr(), &raw mut database, flags, vfs.as_ptr()) };
@@ -277,6 +302,55 @@ fn all_authenticated_storage_corruption_maps_to_sqlite_ioerr_data() {
             "wrong SQLite result for {error}"
         );
     }
+}
+
+#[test]
+fn uri_configures_extent_and_seek_frame_sizes() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    register()?;
+    let path = directory.path().join("configured.db");
+    {
+        let connection = Connection::open_with_compression(&path, 64 * 1024, 16 * 1024)?;
+        connection.execute(
+            "PRAGMA page_size=4096;
+             PRAGMA journal_mode=DELETE;
+             CREATE TABLE payload(value BLOB NOT NULL);
+             INSERT INTO payload VALUES(zeroblob(524288));",
+        )?;
+        assert_integrity(&connection)?;
+    }
+
+    crate::compact_with_config(&path, crate::CompressionConfig::new(64 * 1024, 16 * 1024)?)?;
+    let bytes = std::fs::read(append_suffix(&path, "-zsqlite"))?;
+    let encoded: &[u8; crate::format::EXTENT_HEADER_SIZE] = bytes
+        .get(
+            crate::format::HEADER_SIZE
+                ..crate::format::HEADER_SIZE + crate::format::EXTENT_HEADER_SIZE,
+        )
+        .and_then(|value| value.try_into().ok())
+        .ok_or("missing first extent header")?;
+    let header = crate::format::ExtentHeader::decode(encoded)?;
+    assert_eq!(header.raw_len, 64 * 1024);
+    assert_eq!(header.codec, crate::format::Codec::ZstdSeekable);
+    let payload_start = crate::format::HEADER_SIZE + crate::format::EXTENT_HEADER_SIZE;
+    let payload_end = payload_start + header.stored_len as usize;
+    let footer: &[u8; crate::seekable::SEEK_FOOTER_SIZE] = bytes
+        .get(payload_end - crate::seekable::SEEK_FOOTER_SIZE..payload_end)
+        .and_then(|value| value.try_into().ok())
+        .ok_or("missing seek footer")?;
+    let tail_size = crate::seekable::tail_size_from_footer(footer)?;
+    let layout = crate::seekable::decode_layout(
+        &bytes[payload_end - tail_size..payload_end],
+        header.stored_len,
+        header.raw_len,
+        4096,
+        header.raw_digest,
+    )?;
+    assert_eq!(layout.frames.len(), 4);
+
+    let reopened = Connection::open(&path)?;
+    assert_integrity(&reopened)?;
+    Ok(())
 }
 
 #[test]
