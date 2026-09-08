@@ -20,7 +20,7 @@ def main() -> None:
         raise FileNotFoundError(extension)
 
     with tempfile.TemporaryDirectory(prefix="zsqlite-loadable-") as directory:
-        database = Path(directory) / "host.db"
+        database = Path(directory) / "host.zsqlite"
         bootstrap = sqlite3.connect(":memory:")
         bootstrap.enable_load_extension(True)
         bootstrap.execute(
@@ -53,11 +53,13 @@ def main() -> None:
         connection.close()
 
         anchor = database.read_bytes()
-        assert len(anchor) == 4096 and anchor.startswith(b"ZSQLAN03")
-        sidecar = Path(f"{database}-zsqlite")
-        assert sidecar.is_file() and sidecar.stat().st_size > 12_288
-        assert Path(f"{database}-zsqlite-lock").is_file()
-        assert Path(f"{database}-zsqlite-publish").is_file()
+        assert len(anchor) == 12_288 and anchor.startswith(b"ZSQLSG05")
+        sidecar = Path(f"{database}.d")
+        assert sidecar.is_dir()
+        assert any((sidecar / "roots").glob("*.zroot"))
+        assert any((sidecar / "active").glob("*.zactive"))
+        assert (sidecar / "locks" / "lifecycle.lock").is_file()
+        assert (sidecar / "locks" / "publication.lock").is_file()
 
         reopened = sqlite3.connect(uri, uri=True)
         assert reopened.execute("PRAGMA page_size").fetchone() == (8192,)
@@ -69,6 +71,8 @@ def main() -> None:
 
         if args.cli is not None:
             subprocess.run([args.cli, "verify", database], check=True)
+            subprocess.run([args.cli, "flush", database], check=True)
+            assert any((sidecar / "segments").glob("*.zseg"))
             result = subprocess.run(
                 [args.cli, "inspect", database],
                 check=True,
@@ -76,7 +80,7 @@ def main() -> None:
                 stdout=subprocess.PIPE,
             )
             assert "page_size: 8192" in result.stdout
-            assert "format: V3 native" in result.stdout
+            assert "format: V5 ltx-style-segments" in result.stdout
 
             exported = Path(directory) / "exported.db"
             subprocess.run([args.cli, "export", database, exported], check=True)

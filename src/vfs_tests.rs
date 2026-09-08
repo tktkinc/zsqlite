@@ -42,23 +42,6 @@ impl Connection {
         Self::open_with_vfs_and_flags(path, ZSQLITE_VFS, ffi::SQLITE_OPEN_READONLY)
     }
 
-    fn open_with_compression(
-        path: &Path,
-        extent_size: u32,
-        seek_size: u32,
-    ) -> Result<Self, String> {
-        let filename = CString::new(format!(
-            "file:{}?zsqlite_extent_size={extent_size}&zsqlite_seek_size={seek_size}",
-            path.display()
-        ))
-        .map_err(|error| error.to_string())?;
-        Self::open_filename_with_vfs_and_flags(
-            &filename,
-            ZSQLITE_VFS,
-            ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_URI,
-        )
-    }
-
     fn open_with_vfs_and_flags(path: &Path, vfs: &CStr, flags: c_int) -> Result<Self, String> {
         #[cfg(unix)]
         let path = CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
@@ -305,59 +288,10 @@ fn all_authenticated_storage_corruption_maps_to_sqlite_ioerr_data() {
 }
 
 #[test]
-fn uri_configures_extent_and_seek_frame_sizes() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::tempdir()?;
-    register()?;
-    let path = directory.path().join("configured.db");
-    {
-        let connection = Connection::open_with_compression(&path, 64 * 1024, 16 * 1024)?;
-        connection.execute(
-            "PRAGMA page_size=4096;
-             PRAGMA journal_mode=DELETE;
-             CREATE TABLE payload(value BLOB NOT NULL);
-             INSERT INTO payload VALUES(zeroblob(524288));",
-        )?;
-        assert_integrity(&connection)?;
-    }
-
-    crate::compact_with_config(&path, crate::CompressionConfig::new(64 * 1024, 16 * 1024)?)?;
-    let bytes = std::fs::read(append_suffix(&path, "-zsqlite"))?;
-    let encoded: &[u8; crate::format::EXTENT_HEADER_SIZE] = bytes
-        .get(
-            crate::format::HEADER_SIZE
-                ..crate::format::HEADER_SIZE + crate::format::EXTENT_HEADER_SIZE,
-        )
-        .and_then(|value| value.try_into().ok())
-        .ok_or("missing first extent header")?;
-    let header = crate::format::ExtentHeader::decode(encoded)?;
-    assert_eq!(header.raw_len, 64 * 1024);
-    assert_eq!(header.codec, crate::format::Codec::ZstdSeekable);
-    let payload_start = crate::format::HEADER_SIZE + crate::format::EXTENT_HEADER_SIZE;
-    let payload_end = payload_start + header.stored_len as usize;
-    let footer: &[u8; crate::seekable::SEEK_FOOTER_SIZE] = bytes
-        .get(payload_end - crate::seekable::SEEK_FOOTER_SIZE..payload_end)
-        .and_then(|value| value.try_into().ok())
-        .ok_or("missing seek footer")?;
-    let tail_size = crate::seekable::tail_size_from_footer(footer)?;
-    let layout = crate::seekable::decode_layout(
-        &bytes[payload_end - tail_size..payload_end],
-        header.stored_len,
-        header.raw_len,
-        4096,
-        header.raw_digest,
-    )?;
-    assert_eq!(layout.frames.len(), 4);
-
-    let reopened = Connection::open(&path)?;
-    assert_integrity(&reopened)?;
-    Ok(())
-}
-
-#[test]
 fn wal_database_round_trip_through_vfs() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     register()?;
-    let path = directory.path().join("transcripts.db");
+    let path = directory.path().join("transcripts.zsqlite");
     {
         let writer = Connection::open(&path)?;
         assert_eq!(writer.text("PRAGMA journal_mode=WAL")?, "wal");
@@ -383,7 +317,7 @@ fn wal_database_round_trip_through_vfs() -> Result<(), Box<dyn std::error::Error
     let mut store = Store::open_existing(&path)?;
     store.verify()?;
     let info = store.inspect()?;
-    assert!(info.sidecar_bytes < info.logical_size);
+    assert_eq!(info.indexed_pages, info.page_count as usize);
     drop(store);
 
     let reopened = Connection::open(&path)?;
@@ -396,6 +330,30 @@ fn wal_database_round_trip_through_vfs() -> Result<(), Box<dyn std::error::Error
     assert!(read_only.execute("DELETE FROM transcript").is_err());
     drop(read_only);
 
+    Ok(())
+}
+
+#[test]
+fn sidecar_flush_does_not_checkpoint_sqlite_wal() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    register()?;
+    let path = directory.path().join("no-implicit-checkpoint.zsqlite");
+    let connection = Connection::open(&path)?;
+    connection.execute(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA wal_autocheckpoint=0;
+         CREATE TABLE messages(id INTEGER PRIMARY KEY, body TEXT);
+         INSERT INTO messages VALUES(1, printf('%.*c', 20000, 'w'));",
+    )?;
+    let wal = wal_path(&path);
+    let before = std::fs::metadata(&wal)?.len();
+    assert!(before > 32);
+    crate::flush(&path)?;
+    assert_eq!(std::fs::metadata(&wal)?.len(), before);
+    assert_eq!(connection.integer("SELECT count(*) FROM messages")?, 1);
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let flushed = crate::flush(&path)?;
+    assert_eq!(flushed.indexed_pages, flushed.page_count as usize);
     Ok(())
 }
 
@@ -428,7 +386,7 @@ fn vfs_delete_removes_anchor_and_sidecar_for_unusual_path() -> Result<(), Box<dy
 {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("spaces-and-ünicode.db");
+    let path = directory.path().join("spaces-and-ünicode.zsqlite");
     {
         let connection = Connection::open(&path)?;
         connection.execute(
@@ -437,7 +395,7 @@ fn vfs_delete_removes_anchor_and_sidecar_for_unusual_path() -> Result<(), Box<dy
              INSERT INTO messages VALUES(1, 'delete me');",
         )?;
     }
-    let sidecar = append_suffix(&path, "-zsqlite");
+    let sidecar = append_suffix(&path, ".d");
     assert!(path.exists());
     assert!(sidecar.exists());
 
@@ -459,9 +417,6 @@ fn vfs_delete_removes_anchor_and_sidecar_for_unusual_path() -> Result<(), Box<dy
     );
     assert!(!path.exists());
     assert!(!sidecar.exists());
-    assert!(!append_suffix(&path, "-zsqlite-publish").exists());
-    assert!(!append_suffix(&path, "-zsqlite-delete").exists());
-    assert!(!append_suffix(&path, "-zsqlite-lock").exists());
     let recreated = Connection::open(&path)?;
     recreated.execute("CREATE TABLE replacement(id INTEGER PRIMARY KEY)")?;
     assert_integrity(&recreated)?;
@@ -469,11 +424,11 @@ fn vfs_delete_removes_anchor_and_sidecar_for_unusual_path() -> Result<(), Box<dy
 }
 
 #[test]
-fn hard_linked_anchor_or_sidecar_is_rejected_without_modification()
+fn hard_linked_working_file_is_rejected_without_modification()
 -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("hard-link.db");
+    let path = directory.path().join("hard-link.zsqlite");
     {
         let connection = Connection::open(&path)?;
         connection.execute(
@@ -482,22 +437,13 @@ fn hard_linked_anchor_or_sidecar_is_rejected_without_modification()
              INSERT INTO messages VALUES(1, 'preserve me');",
         )?;
     }
-    let sidecar = append_suffix(&path, "-zsqlite");
     let anchor_alias = directory.path().join("anchor-alias");
     std::fs::hard_link(&path, &anchor_alias)?;
     assert!(matches!(
         Store::open_existing(&path),
-        Err(crate::StoreError::Unsupported)
+        Err(crate::StoreError::Busy)
     ));
     std::fs::remove_file(anchor_alias)?;
-
-    let sidecar_alias = directory.path().join("sidecar-alias");
-    std::fs::hard_link(&sidecar, &sidecar_alias)?;
-    assert!(matches!(
-        Store::open_existing(&path),
-        Err(crate::StoreError::Unsupported)
-    ));
-    std::fs::remove_file(sidecar_alias)?;
 
     let reopened = Connection::open(&path)?;
     assert_eq!(
@@ -513,7 +459,7 @@ fn every_sqlite_page_size_round_trips() -> Result<(), Box<dyn std::error::Error>
     register()?;
     let directory = tempfile::tempdir()?;
     for page_size in [512_u32, 1024, 2048, 4096, 8192, 16_384, 32_768, 65_536] {
-        let path = directory.path().join(format!("pages-{page_size}.db"));
+        let path = directory.path().join(format!("pages-{page_size}.zsqlite"));
         {
             let connection = Connection::open(&path)?;
             connection.execute(&format!(
@@ -565,7 +511,7 @@ fn rollback_journal_savepoints_vacuum_and_incremental_vacuum()
 -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("rollback.db");
+    let path = directory.path().join("rollback.zsqlite");
     {
         let connection = Connection::open(&path)?;
         connection.execute(
@@ -615,10 +561,10 @@ fn rollback_journal_savepoints_vacuum_and_incremental_vacuum()
 fn attach_and_backup_cross_the_vfs_boundary() -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let source_path = directory.path().join("source.db");
-    let attached_path = directory.path().join("attached.db");
+    let source_path = directory.path().join("source.zsqlite");
+    let attached_path = directory.path().join("attached.zsqlite");
     let native_backup_path = directory.path().join("native-backup.db");
-    let restored_path = directory.path().join("restored.db");
+    let restored_path = directory.path().join("restored.zsqlite");
 
     {
         let source = Connection::open(&source_path)?;
@@ -669,7 +615,9 @@ fn online_backup_into_empty_zsqlite_accepts_every_page_size()
     let directory = tempfile::tempdir()?;
     for page_size in [512, 1024, 2048, 4096, 8192, 16_384, 32_768, 65_536] {
         let source_path = directory.path().join(format!("source-{page_size}.db"));
-        let destination_path = directory.path().join(format!("destination-{page_size}.db"));
+        let destination_path = directory
+            .path()
+            .join(format!("destination-{page_size}.zsqlite"));
         let source = Connection::open_native(&source_path)?;
         source.execute(&format!(
             "PRAGMA page_size={page_size};
@@ -706,7 +654,7 @@ fn online_backup_tracks_a_wal_commit_between_batches() -> Result<(), Box<dyn std
     register()?;
     let directory = tempfile::tempdir()?;
     let source_path = directory.path().join("live-source.db");
-    let destination_path = directory.path().join("online-destination.db");
+    let destination_path = directory.path().join("online-destination.zsqlite");
     let source = Connection::open_native(&source_path)?;
     source.execute(
         "PRAGMA page_size=1024;
@@ -835,7 +783,7 @@ fn sql_path(path: &Path) -> String {
 fn deterministic_random_workload_matches_native_sqlite() -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let compressed_path = directory.path().join("random-zsqlite.db");
+    let compressed_path = directory.path().join("random-zsqlite.zsqlite");
     let native_path = directory.path().join("random-native.db");
     let mut compressed = Connection::open(&compressed_path)?;
     let mut native = Connection::open_native(&native_path)?;
@@ -942,7 +890,7 @@ fn concurrent_wal_readers_and_writers_preserve_all_commits()
 -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("concurrent.db");
+    let path = directory.path().join("concurrent.zsqlite");
     {
         let connection = Connection::open(&path)?;
         connection.execute(
@@ -1016,7 +964,7 @@ fn concurrent_wal_readers_and_writers_preserve_all_commits()
 fn wal_reader_keeps_a_stable_snapshot_during_commit() -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("snapshot.db");
+    let path = directory.path().join("snapshot.zsqlite");
     let writer = Connection::open(&path)?;
     writer.execute(
         "PRAGMA journal_mode=WAL;
@@ -1043,7 +991,7 @@ fn wal_writer_lock_contention_and_rollback_have_exact_visibility()
 -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("wal-locks.db");
+    let path = directory.path().join("wal-locks.zsqlite");
     let holder = Connection::open(&path)?;
     holder.execute(
         "PRAGMA journal_mode=WAL;
@@ -1086,7 +1034,7 @@ fn rollback_journal_lock_promotion_and_exclusive_locking_are_correct()
 -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("rollback-locks.db");
+    let path = directory.path().join("rollback-locks.zsqlite");
     let reader = Connection::open(&path)?;
     reader.execute(
         "PRAGMA journal_mode=DELETE;
@@ -1124,7 +1072,7 @@ fn readers_never_observe_a_partially_applied_transaction() -> Result<(), Box<dyn
 {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("atomic-visibility.db");
+    let path = directory.path().join("atomic-visibility.zsqlite");
     let observer = Connection::open(&path)?;
     observer.execute(
         "PRAGMA journal_mode=WAL;
@@ -1179,7 +1127,7 @@ fn rollback_journal_parallel_transactions_serialize_without_lost_commits()
     const ROWS_PER_TRANSACTION: usize = 3;
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("rollback-parallel.db");
+    let path = directory.path().join("rollback-parallel.zsqlite");
     {
         let connection = Connection::open(&path)?;
         connection.execute(
@@ -1258,7 +1206,7 @@ fn wal_checkpoints_race_with_parallel_transactions_without_losing_data()
     const ROWS_PER_TRANSACTION: usize = 4;
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("checkpoint-race.db");
+    let path = directory.path().join("checkpoint-race.zsqlite");
     {
         let connection = Connection::open(&path)?;
         connection.execute(
@@ -1356,6 +1304,7 @@ fn wal_checkpoints_race_with_parallel_transactions_without_losing_data()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn auto_vacuum_pointer_maps_survive_parallel_wal_checkpoints()
 -> Result<(), Box<dyn std::error::Error>> {
     const WRITERS: usize = 4;
@@ -1363,7 +1312,7 @@ fn auto_vacuum_pointer_maps_survive_parallel_wal_checkpoints()
     const ROWS_PER_TRANSACTION: usize = 8;
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("auto-vacuum-checkpoint-race.db");
+    let path = directory.path().join("auto-vacuum-checkpoint-race.zsqlite");
     {
         let connection = Connection::open(&path)?;
         connection.execute(
@@ -1390,8 +1339,12 @@ fn auto_vacuum_pointer_maps_survive_parallel_wal_checkpoints()
         while checkpointer_running.load(Ordering::Acquire)
             || checkpointer_count.load(Ordering::Relaxed) < 20
         {
-            let _ = connection.integer("SELECT count(*) FROM events")?;
-            let result = connection.rows("PRAGMA wal_checkpoint(PASSIVE)")?;
+            let _ = connection
+                .integer("SELECT count(*) FROM events")
+                .map_err(|error| format!("checkpointer read: {error}"))?;
+            let result = connection
+                .rows("PRAGMA wal_checkpoint(PASSIVE)")
+                .map_err(|error| format!("checkpointer checkpoint: {error}"))?;
             if result.len() != 1
                 || result[0].len() != 3
                 || !result[0]
@@ -1416,7 +1369,9 @@ fn auto_vacuum_pointer_maps_survive_parallel_wal_checkpoints()
             connection.execute("PRAGMA synchronous=NORMAL")?;
             barrier.wait();
             for transaction_no in 0..TRANSACTIONS {
-                connection.execute("BEGIN IMMEDIATE")?;
+                connection.execute("BEGIN IMMEDIATE").map_err(|error| {
+                    format!("writer {writer} transaction {transaction_no} begin: {error}")
+                })?;
                 for member in 0..ROWS_PER_TRANSACTION {
                     let id = writer * 1_000_000 + transaction_no * ROWS_PER_TRANSACTION + member;
                     connection.execute(&format!(
@@ -1425,9 +1380,13 @@ fn auto_vacuum_pointer_maps_survive_parallel_wal_checkpoints()
                            printf('{{\"writer\":{writer},\"transaction\":{transaction_no},\"member\":{member},\"text\":\"%.*c\"}}', {}, 'p')
                          )",
                         3500 + (transaction_no + member) % 113
-                    ))?;
+                    )).map_err(|error| {
+                        format!("writer {writer} transaction {transaction_no} member {member}: {error}")
+                    })?;
                 }
-                connection.execute("COMMIT")?;
+                connection.execute("COMMIT").map_err(|error| {
+                    format!("writer {writer} transaction {transaction_no} commit: {error}")
+                })?;
             }
             Ok(())
         }));
@@ -1466,7 +1425,7 @@ fn concurrent_open_write_close_churn_preserves_registry_and_index_state()
     const ITERATIONS: usize = 30;
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("open-close-churn.db");
+    let path = directory.path().join("open-close-churn.zsqlite");
     {
         let connection = Connection::open(&path)?;
         connection.execute(
@@ -1518,7 +1477,7 @@ fn concurrent_open_write_close_churn_preserves_registry_and_index_state()
     let mut store = Store::open_existing(&path)?;
     store.verify()?;
     let info = store.inspect()?;
-    assert_eq!(info.index_generation, info.generation);
+    assert!(info.head_txid > 0);
     Ok(())
 }
 
@@ -1531,7 +1490,7 @@ fn transaction_semantics_matrix_across_journals_and_page_sizes()
         for synchronous in ["OFF", "NORMAL", "FULL", "EXTRA"] {
             for page_size in [512_u32, 4096, 65_536] {
                 let path = directory.path().join(format!(
-                    "transactions-{journal_mode}-{synchronous}-{page_size}.db"
+                    "transactions-{journal_mode}-{synchronous}-{page_size}.zsqlite"
                 ));
                 {
                     let connection = Connection::open(&path)?;
@@ -1597,7 +1556,7 @@ fn synchronous_off_publishes_clean_commits_and_rollbacks() -> Result<(), Box<dyn
         for page_size in [512_u32, 4096, 65_536] {
             let path = directory
                 .path()
-                .join(format!("sync-off-{journal_mode}-{page_size}.db"));
+                .join(format!("sync-off-{journal_mode}-{page_size}.zsqlite"));
             {
                 let connection = Connection::open(&path)?;
                 connection.execute(&format!(
@@ -1649,7 +1608,7 @@ fn independent_processes_serialize_stale_writers_without_lost_commits()
     for journal_mode in ["DELETE", "WAL"] {
         let path = directory
             .path()
-            .join(format!("multiprocess-{journal_mode}.db"));
+            .join(format!("multiprocess-{journal_mode}.zsqlite"));
         {
             let connection = Connection::open(&path)?;
             connection.execute(&format!(
@@ -1718,6 +1677,9 @@ fn independent_processes_serialize_stale_writers_without_lost_commits()
         }
         let rolled_back = (0..TRANSACTIONS).filter(|value| value % 7 == 0).count();
         let expected = WORKERS * (TRANSACTIONS - rolled_back);
+        if !child_failures.is_empty() {
+            return Err(child_failures.join("\n").into());
+        }
         assert_eq!(
             connection.integer("SELECT count(*) FROM events")?,
             i64::try_from(expected)?
@@ -1790,7 +1752,7 @@ fn simultaneous_process_creation_produces_one_consistent_identity()
     const WORKERS: usize = 6;
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("simultaneous-create.db");
+    let path = directory.path().join("simultaneous-create.zsqlite");
     let start = directory.path().join("create-start");
     let mut children = Vec::new();
     for worker in 0..WORKERS {
@@ -1878,7 +1840,7 @@ fn multi_megabyte_text_and_blob_survive_checkpoint_and_reopen()
 -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("large-values.db");
+    let path = directory.path().join("large-values.zsqlite");
     let expected = {
         let connection = Connection::open(&path)?;
         connection.execute(
@@ -1912,7 +1874,7 @@ fn transactions_and_wal_checkpoints_larger_than_pending_memory_commit_or_rollbac
     for journal_mode in ["DELETE", "WAL"] {
         let path = directory
             .path()
-            .join(format!("bounded-layer-{journal_mode}.db"));
+            .join(format!("bounded-layer-{journal_mode}.zsqlite"));
         let committed_bytes;
         {
             let connection = Connection::open(&path)?;
@@ -2003,14 +1965,7 @@ fn ordinary_sqlite_databases_pass_through_without_adoption()
         assert_integrity(&native)?;
         drop(native);
 
-        for suffix in [
-            "-zsqlite",
-            "-zsqlite-lock",
-            "-zsqlite-publish",
-            "-zsqlite-delete",
-        ] {
-            assert!(!append_suffix(&path, suffix).exists());
-        }
+        assert!(!append_suffix(&path, ".d").exists());
     }
     Ok(())
 }
@@ -2022,7 +1977,9 @@ fn offline_conversion_and_export_are_byte_and_sql_compatible()
     let directory = tempfile::tempdir()?;
     for page_size in [512_u32, 4096, 65_536] {
         let native_path = directory.path().join(format!("source-{page_size}.db"));
-        let compressed_path = directory.path().join(format!("compressed-{page_size}.db"));
+        let compressed_path = directory
+            .path()
+            .join(format!("compressed-{page_size}.zsqlite"));
         let exported_path = directory.path().join(format!("exported-{page_size}.db"));
         {
             let native = Connection::open_native(&native_path)?;
@@ -2068,7 +2025,7 @@ fn compaction_preserves_the_exact_exported_sqlite_image() -> Result<(), Box<dyn 
 {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("compact-export.db");
+    let path = directory.path().join("compact-export.zsqlite");
     let before_path = directory.path().join("before-compact.db");
     let after_path = directory.path().join("after-compact.db");
     {
@@ -2102,7 +2059,7 @@ fn compaction_preserves_the_exact_exported_sqlite_image() -> Result<(), Box<dyn 
     let before = std::fs::read(&before_path)?;
     assert_eq!(before_length, before.len() as u64);
     let compacted = crate::compact(&path)?;
-    assert_eq!(compacted.generation, 1);
+    assert!(compacted.catalog_generation > 0);
     let after_length = crate::export_to_sqlite(&path, &after_path)?;
     let after = std::fs::read(&after_path)?;
     assert_eq!(after_length, after.len() as u64);
@@ -2125,7 +2082,7 @@ fn maintenance_is_exclusive_and_read_only_first_does_not_poison_writers()
 -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("maintenance.db");
+    let path = directory.path().join("maintenance.zsqlite");
     {
         let connection = Connection::open(&path)?;
         connection.execute(
@@ -2139,20 +2096,15 @@ fn maintenance_is_exclusive_and_read_only_first_does_not_poison_writers()
     let writer = Connection::open(&path)?;
     writer.execute("INSERT INTO messages VALUES(2, 'second')")?;
     assert_eq!(read_only.integer("SELECT count(*) FROM messages")?, 2);
-    assert!(matches!(
-        crate::compact(&path),
-        Err(crate::StoreError::Busy)
-    ));
-    assert!(matches!(crate::verify(&path), Err(crate::StoreError::Busy)));
-    assert!(matches!(
-        crate::export_to_sqlite(&path, directory.path().join("busy-export.db")),
-        Err(crate::StoreError::Busy)
-    ));
+    let online = crate::compact(&path)?;
+    assert_eq!(online.indexed_pages, online.page_count as usize);
+    crate::verify(&path)?;
+    crate::export_to_sqlite(&path, directory.path().join("online-export.db"))?;
     drop(writer);
     drop(read_only);
 
     let compacted = crate::compact(&path)?;
-    assert_eq!(compacted.index_generation, compacted.generation);
+    assert_eq!(compacted.indexed_pages, compacted.page_count as usize);
     let verified = crate::verify(&path)?;
     assert_eq!(verified.page_count, compacted.page_count);
     let reopened = Connection::open(&path)?;
@@ -2166,7 +2118,7 @@ fn changing_page_size_after_creation_fails_without_damaging_database()
 -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("reject-page-change.db");
+    let path = directory.path().join("reject-page-change.zsqlite");
     let connection = Connection::open(&path)?;
     connection.execute(
         "PRAGMA page_size=4096;
@@ -2207,7 +2159,9 @@ fn subprocess_kill_and_rollback_journal_recovery_remain_consistent()
 fn run_subprocess_crash_recovery(journal_mode: &str) -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join(format!("crash-{journal_mode}.db"));
+    let path = directory
+        .path()
+        .join(format!("crash-{journal_mode}.zsqlite"));
 
     for cycle in 0..6 {
         let ready = directory.path().join(format!("ready-{cycle}"));

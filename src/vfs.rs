@@ -1,7 +1,7 @@
 //! Thin `SQLite` ABI shim. Main-database I/O is redirected to [`Store`]; every
 //! other operation is forwarded to the host VFS selected during registration.
 
-use crate::store::{CompressionConfig, Store};
+use crate::store::Store;
 use libsqlite3_sys as ffi;
 use std::collections::HashMap;
 use std::ffi::{CStr, OsStr, c_char, c_int, c_void};
@@ -15,8 +15,6 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::os::unix::ffi::OsStrExt;
 
 const VFS_NAME: &[u8] = b"zsqlite\0";
-const EXTENT_SIZE_PARAMETER: &[u8] = b"zsqlite_extent_size\0";
-const SEEK_SIZE_PARAMETER: &[u8] = b"zsqlite_seek_size\0";
 const WAL_CHECKPOINT_LOCK: c_int = 1;
 
 #[repr(C)]
@@ -89,55 +87,52 @@ fn get_store(
     path: &Path,
     create: bool,
     writable: bool,
-    config: CompressionConfig,
 ) -> Result<(Arc<Mutex<Store>>, bool), crate::StoreError> {
     let key = canonical_key(path);
     let mut stores = registry().lock().map_err(|_| crate::StoreError::Range)?;
     if let Some(store) = stores.get(&key).and_then(Weak::upgrade) {
         let mut opened = store.lock().map_err(|_| crate::StoreError::Range)?;
-        opened.ensure_config(config)?;
-        if writable {
-            opened.upgrade_writable()?;
-        }
+        let start_worker = writable && opened.upgrade_writable()?;
         drop(opened);
+        if start_worker {
+            spawn_maintenance_worker(Arc::downgrade(&store));
+        }
         return Ok((store, false));
     }
     let opened = if writable {
-        Store::open_with_config(&key, create, config)?
+        Store::open(&key, create)?
     } else {
-        Store::open_existing_read_only_with_config(&key, config)?
+        Store::open_existing_read_only(&key)?
     };
     let store = Arc::new(Mutex::new(opened));
     stores.insert(key, Arc::downgrade(&store));
+    if writable {
+        spawn_maintenance_worker(Arc::downgrade(&store));
+    }
     Ok((store, true))
 }
 
-fn compression_config(name: *const c_char) -> Result<CompressionConfig, crate::StoreError> {
-    let defaults = CompressionConfig::default();
-    let extent = unsafe {
-        ffi::sqlite3_uri_int64(
-            name,
-            EXTENT_SIZE_PARAMETER.as_ptr().cast(),
-            i64::from(defaults.extent_bytes()),
-        )
-    };
-    let seek = unsafe {
-        ffi::sqlite3_uri_int64(
-            name,
-            SEEK_SIZE_PARAMETER.as_ptr().cast(),
-            i64::from(defaults.seek_chunk_bytes()),
-        )
-    };
-    CompressionConfig::new(
-        u32::try_from(extent).map_err(|_| {
-            crate::StoreError::InvalidConfiguration("extent size is outside the supported range")
-        })?,
-        u32::try_from(seek).map_err(|_| {
-            crate::StoreError::InvalidConfiguration(
-                "seek chunk size is outside the supported range",
-            )
-        })?,
-    )
+fn spawn_maintenance_worker(store: Weak<Mutex<Store>>) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let Some(store) = store.upgrade() else {
+                break;
+            };
+            let separate_flush = store
+                .try_lock()
+                .ok()
+                .and_then(|opened| opened.background_flush_due().then(|| opened.path()));
+            if let Some(path) = separate_flush {
+                drop(store);
+                if let Ok(mut maintenance) = Store::open_existing(&path) {
+                    let _ = maintenance.try_background_maintenance();
+                }
+            } else if let Ok(mut opened) = store.try_lock() {
+                let _ = opened.try_background_maintenance();
+            }
+        }
+    });
 }
 
 unsafe fn app_data(vfs: *mut ffi::sqlite3_vfs) -> Option<&'static AppData> {
@@ -220,15 +215,22 @@ unsafe extern "C" fn x_open(
                 return ffi::SQLITE_CANTOPEN;
             }
             let path = path_from_name(name);
+            let managed = path.extension().and_then(|value| value.to_str()) == Some("zsqlite");
+            if !managed {
+                output.parent = parent_file;
+                output.state = Box::into_raw(Box::new(FileState {
+                    store: None,
+                    read_only: out_read_only,
+                    lock_level: ffi::SQLITE_LOCK_NONE,
+                    vfs,
+                    sync_pending: false,
+                    owns_store_pending: false,
+                }));
+                output.base.pMethods = &raw const app.io;
+                return ffi::SQLITE_OK;
+            }
             let create = flags & ffi::SQLITE_OPEN_CREATE != 0;
-            let config = match compression_config(name) {
-                Ok(config) => config,
-                Err(error) => {
-                    unsafe { close_parent(parent_file) };
-                    return sqlite_result(&error);
-                }
-            };
-            match get_store(&path, create, !out_read_only, config) {
+            match get_store(&path, create, !out_read_only) {
                 Ok((opened, _newly_opened)) => store = Some(opened),
                 Err(crate::StoreError::NotZsqlite) => {}
                 Err(error) => {
@@ -287,21 +289,6 @@ unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
                 index_rc = error;
             }
             file_state.owns_store_pending = false;
-            if !file_state.read_only
-                && let Some(store) = &file_state.store
-                && Arc::strong_count(store) == 1
-                && index_rc == ffi::SQLITE_OK
-            {
-                index_rc = store
-                    .lock()
-                    .map_err(|_| ffi::SQLITE_IOERR)
-                    .and_then(|mut store| {
-                        store
-                            .checkpoint_index()
-                            .map_err(|error| sqlite_result(&error))
-                    })
-                    .map_or_else(|error| error, |()| ffi::SQLITE_OK);
-            }
             unsafe { drop(Box::from_raw(file.state)) };
             file.state = null_mut();
         }
@@ -916,15 +903,17 @@ unsafe extern "C" fn x_delete(
         };
         if !name.is_null() {
             let path = path_from_name(name);
-            match Store::delete_bundle(&path) {
-                Ok(()) => {
-                    if let Ok(mut stores) = registry().lock() {
-                        stores.remove(&canonical_key(&path));
+            if path.extension().and_then(|value| value.to_str()) == Some("zsqlite") {
+                match Store::delete_bundle(&path) {
+                    Ok(()) => {
+                        if let Ok(mut stores) = registry().lock() {
+                            stores.remove(&canonical_key(&path));
+                        }
+                        return ffi::SQLITE_OK;
                     }
-                    return ffi::SQLITE_OK;
+                    Err(crate::StoreError::NotZsqlite) => {}
+                    Err(error) => return sqlite_result(&error),
                 }
-                Err(crate::StoreError::NotZsqlite) => {}
-                Err(error) => return sqlite_result(&error),
             }
         }
         app.parent

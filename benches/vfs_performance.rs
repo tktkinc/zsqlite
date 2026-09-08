@@ -109,8 +109,6 @@ mod benchmark {
         page_size: usize,
         pressure_cache_mib: usize,
         resident_cache_mib: usize,
-        extent_bytes: usize,
-        seek_size: usize,
     }
 
     impl Default for Config {
@@ -125,8 +123,6 @@ mod benchmark {
                 page_size: 4096,
                 pressure_cache_mib: 8,
                 resident_cache_mib: 64,
-                extent_bytes: 1024 * 1024,
-                seek_size: 64 * 1024,
             }
         }
     }
@@ -145,6 +141,14 @@ mod benchmark {
                 if argument == "--bench" {
                     continue;
                 }
+                if argument == "--quick" {
+                    config.rows = 2_000;
+                    config.reads = 5_000;
+                    config.updates = 1_000;
+                    config.samples = 1;
+                    config.pressure_cache_mib = 2;
+                    continue;
+                }
                 let target = match argument.as_str() {
                     "--rows" => &mut config.rows,
                     "--reads" => &mut config.reads,
@@ -155,8 +159,6 @@ mod benchmark {
                     "--page-size" => &mut config.page_size,
                     "--pressure-cache-mib" => &mut config.pressure_cache_mib,
                     "--resident-cache-mib" => &mut config.resident_cache_mib,
-                    "--extent-size" => &mut config.extent_bytes,
-                    "--seek-size" => &mut config.seek_size,
                     _ => return Err(format!("unknown option {argument:?}\n\n{}", usage())),
                 };
                 let value = arguments
@@ -201,16 +203,6 @@ mod benchmark {
                     .ok_or("SQLite cache size is too large")?;
                 i64::try_from(cache_kib).map_err(|_| "SQLite cache size is too large")?;
             }
-            let compression = zsqlite::CompressionConfig::new(
-                u32::try_from(self.extent_bytes).map_err(|_| "--extent-size is too large")?,
-                u32::try_from(self.seek_size).map_err(|_| "--seek-size is too large")?,
-            )
-            .map_err(|error| error.to_string())?;
-            compression
-                .validate_page_size(
-                    u32::try_from(self.page_size).map_err(|_| "--page-size is too large")?,
-                )
-                .map_err(|error| error.to_string())?;
             Ok(())
         }
 
@@ -254,8 +246,8 @@ mod benchmark {
     struct Storage {
         logical: u64,
         allocated: u64,
-        live_extent_payload: u64,
-        live_extents: u64,
+        segment_bytes: u64,
+        segments: u64,
     }
 
     struct Sample {
@@ -308,7 +300,7 @@ mod benchmark {
                     engine.name()
                 );
                 let path = directory.join(format!(
-                    "{}-{}-{sample_index}.db",
+                    "{}-{}-{sample_index}.zsqlite",
                     profile.name,
                     engine.name()
                 ));
@@ -336,6 +328,7 @@ mod benchmark {
         Ok((native, compressed))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_sample(
         path: &Path,
         engine: Engine,
@@ -383,6 +376,11 @@ mod benchmark {
         timings[Phase::InitialCheckpoint.index()] =
             measure(|| connection.execute("PRAGMA wal_checkpoint(TRUNCATE)"))?;
         timings[Phase::CloseAfterLoad.index()] = measure(|| connection.close())?;
+        if engine == Engine::Zsqlite {
+            // Seal the active segment so reopen and random reads exercise
+            // immutable per-page frames.
+            zsqlite::flush(path)?;
+        }
 
         let started = Instant::now();
         let connection = Connection::open(path, engine, config)?;
@@ -436,6 +434,9 @@ mod benchmark {
         let (rows, revision_sum, payload_sum) = connection.aggregate()?;
         timings[Phase::Scan.index()] = started.elapsed();
         timings[Phase::FinalClose.index()] = measure(|| connection.close())?;
+        if engine == Engine::Zsqlite {
+            zsqlite::flush(path)?;
+        }
 
         Ok(Sample {
             timings,
@@ -462,7 +463,7 @@ mod benchmark {
             config.samples
         );
         println!(
-            "cache profile={} ({} MiB); rows={}, reads={}, updates={}, batch={}, payload={} B, page_size={}, extent_size={}, seek_size={}, WAL, synchronous=FULL",
+            "cache profile={} ({} MiB); rows={}, reads={}, updates={}, batch={}, payload={} B, page_size={}, WAL, synchronous=FULL",
             profile.name,
             profile.mebibytes,
             config.rows,
@@ -470,9 +471,7 @@ mod benchmark {
             config.updates,
             config.batch_size,
             config.payload_bytes,
-            config.page_size,
-            config.extent_bytes,
-            config.seek_size
+            config.page_size
         );
         println!("random point reads begin after a sequential table-cache warmup");
         println!();
@@ -522,13 +521,18 @@ mod benchmark {
             compressed_logical as f64 / native_logical as f64,
             compressed_allocated as f64 / native_allocated as f64
         );
-        let live_extent_payload = median_storage(compressed, |value| value.live_extent_payload);
-        let live_extents = median_storage(compressed, |value| value.live_extents);
+        let segment_bytes = median_storage(compressed, |value| value.segment_bytes);
+        let segments = median_storage(compressed, |value| value.segments);
+        let average = if segments == 0 {
+            0
+        } else {
+            segment_bytes / segments
+        };
         println!(
-            "zsqlite live extent payload: {} across {} extents, {} average (128-byte headers excluded)",
-            bytes(live_extent_payload),
-            live_extents,
-            bytes(live_extent_payload / live_extents)
+            "zsqlite segment bytes: {} across {} segments, {} average",
+            bytes(segment_bytes),
+            segments,
+            bytes(average)
         );
         println!(
             "Lower timing and storage ratios are better. Results are not CI pass/fail thresholds."
@@ -596,18 +600,11 @@ mod benchmark {
     }
 
     fn storage(path: &Path, engine: Engine) -> Result<Storage> {
-        let mut paths = vec![
+        let paths = vec![
             path.to_path_buf(),
             suffix(path, "-wal"),
             suffix(path, "-shm"),
         ];
-        if engine == Engine::Zsqlite {
-            paths.extend([
-                suffix(path, "-zsqlite"),
-                suffix(path, "-zsqlite-lock"),
-                suffix(path, "-zsqlite-publish"),
-            ]);
-        }
         let mut logical = 0_u64;
         let mut allocated = 0_u64;
         for candidate in paths {
@@ -620,25 +617,26 @@ mod benchmark {
                 Err(error) => return Err(error.into()),
             }
         }
-        let (live_extent_payload, live_extents) = if engine == Engine::Zsqlite {
+        let (segment_bytes, segments) = if engine == Engine::Zsqlite {
             let info = zsqlite::inspect(path)?;
-            let live_extents = u64::try_from(info.live_extents)?;
-            let header_bytes = live_extents
-                .checked_mul(zsqlite::format::EXTENT_HEADER_SIZE as u64)
-                .ok_or("live extent header size overflow")?;
-            let payload = info
-                .live_stored_bytes
-                .checked_sub(header_bytes)
-                .ok_or("live extent payload size underflow")?;
-            (payload, live_extents)
+            logical = logical
+                .saturating_add(info.segment_bytes)
+                .saturating_add(info.active_bytes);
+            allocated = allocated
+                .saturating_add(info.segment_allocated_bytes)
+                .saturating_add(info.active_allocated_bytes);
+            (
+                info.segment_bytes.saturating_add(info.active_bytes),
+                u64::try_from(info.sealed_segments)? + u64::from(info.active),
+            )
         } else {
             (0, 0)
         };
         Ok(Storage {
             logical,
             allocated,
-            live_extent_payload,
-            live_extents,
+            segment_bytes,
+            segments,
         })
     }
 
@@ -658,6 +656,7 @@ mod benchmark {
         "Usage: cargo bench --no-default-features --features static --bench vfs_performance -- [OPTIONS]\n\
          \n\
          Options:\n\
+           --quick            one small smoke-test sample per cache profile\n\
            --rows N           inserted rows per sample (default: 20000)\n\
            --reads N          random point reads per sample (default: 50000)\n\
            --updates N        updated rows per sample (default: 10000)\n\
@@ -669,8 +668,6 @@ mod benchmark {
                               constrained-cache profile size (default: 8)\n\
            --resident-cache-mib N\n\
                               cache-resident profile size (default: 64)\n\
-          --extent-size N    zsqlite logical extent bytes (default: 1048576)\n\
-          --seek-size N      zsqlite independently decoded bytes (default: 65536)\n\
            -h, --help         show this help"
     }
 
@@ -679,17 +676,8 @@ mod benchmark {
     }
 
     impl Connection {
-        fn open(path: &Path, engine: Engine, config: &Config) -> Result<Self> {
-            let filename = if engine == Engine::Zsqlite {
-                format!(
-                    "file:{}?zsqlite_extent_size={}&zsqlite_seek_size={}",
-                    path.to_string_lossy(),
-                    config.extent_bytes,
-                    config.seek_size
-                )
-            } else {
-                path.to_string_lossy().into_owned()
-            };
+        fn open(path: &Path, engine: Engine, _config: &Config) -> Result<Self> {
+            let filename = path.to_string_lossy().into_owned();
             let path = CString::new(filename)?;
             let mut raw = null_mut();
             let vfs = match engine {

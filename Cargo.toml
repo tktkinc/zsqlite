@@ -3,6 +3,7 @@ name = "zsqlite"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
+autobenches = false
 license = "MIT"
 description = "A transparent Zstandard-compressed page VFS for SQLite"
 
@@ -18,7 +19,7 @@ name = "vfs_performance"
 harness = false
 
 [[bench]]
-name = "extent_compression"
+name = "page_dictionary"
 harness = false
 
 [dependencies]
@@ -27,7 +28,7 @@ crc32fast = "1.5.0"
 getrandom = "0.4.2"
 libsqlite3-sys = "0.38.2"
 thiserror = "2.0.16"
-zstd = { version = "0.13.3", default-features = false }
+zstd = { version = "0.13.3", default-features = false, features = ["zdict_builder"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
 libc = "0.2.189"

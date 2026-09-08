@@ -1,14 +1,13 @@
-//! Zstandard-compressed page storage and a `SQLite` VFS shim.
+//! Zstandard-compressed transactional page segments and a `SQLite` VFS shim.
 
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
+mod backend;
 pub mod format;
-mod seekable;
 mod store;
-
 mod vfs;
 
-pub use store::{CompressionConfig, Inspect, StoreError};
+pub use store::{DictionaryPolicy, Inspect, StoragePolicy, StoreError};
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -18,58 +17,51 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Returns metadata for an existing V3 zsqlite database without modifying it.
+/// Returns metadata for an existing V5 `.zsqlite` database without modifying it.
 pub fn inspect(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
     store::Store::open_existing_read_only(path)?.inspect()
 }
 
-/// Verifies all live extents and the `SQLite` header of an existing database.
+/// Verifies every referenced segment, page frame, and the `SQLite` header.
 pub fn verify(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
     let path = absolute_path(path.as_ref())?;
     store::reject_auxiliary_files(&path)?;
-    let mut store = store::Store::open_existing_read_only(&path)?;
-    store.acquire_maintenance()?;
-    store.verify()?;
-    let result = store.inspect();
-    store.release_maintenance();
-    result
+    let mut database = store::Store::open_existing_read_only(&path)?;
+    database.verify()?;
+    database.inspect()
 }
 
-/// Compacts an existing database while holding the V3 lifecycle lock.
-///
-/// This fails with [`StoreError::Busy`] if any `SQLite` process has the database
-/// open. Callers must checkpoint WAL and close every connection first.
+/// Seals the current active segment, if any.
+pub fn flush(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
+    let mut database = store::Store::open_existing(path)?;
+    database.acquire_maintenance()?;
+    let result = database.flush_sidecars();
+    database.release_maintenance();
+    result?;
+    database.inspect()
+}
+
+/// Replaces all sealed segments with one endpoint-equivalent checkpoint segment.
 pub fn compact(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
-    compact_with_config(path, CompressionConfig::default())
+    let mut database = store::Store::open_existing(path)?;
+    database.compact()?;
+    database.inspect()
 }
 
-/// Compacts an existing database using the requested sizes for newly written
-/// extents and independently decompressible seek chunks.
-pub fn compact_with_config(
-    path: impl AsRef<Path>,
-    config: CompressionConfig,
-) -> Result<Inspect, StoreError> {
-    let mut store = store::Store::open_with_config(path, false, config)?;
-    store.compact()?;
-    store.checkpoint_index()?;
-    store.inspect()
+/// Replaces the persisted maintenance and adaptive dictionary policy.
+pub fn configure(path: impl AsRef<Path>, policy: StoragePolicy) -> Result<Inspect, StoreError> {
+    let mut database = store::Store::open_existing(path)?;
+    database.acquire_maintenance()?;
+    let result = database.set_storage_policy(policy);
+    database.release_maintenance();
+    result?;
+    database.inspect()
 }
 
-/// Converts a closed, ordinary `SQLite` database into a distinct V3 zsqlite
-/// database. The source is never modified and the destination must not exist.
+/// Converts a closed ordinary `SQLite` database into a distinct V5 zsqlite bundle.
 pub fn convert_to_zsqlite(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
-) -> Result<Inspect, StoreError> {
-    convert_to_zsqlite_with_config(source, destination, CompressionConfig::default())
-}
-
-/// Converts a closed ordinary `SQLite` database with explicitly configured
-/// extent and seek-chunk sizes.
-pub fn convert_to_zsqlite_with_config(
-    source: impl AsRef<Path>,
-    destination: impl AsRef<Path>,
-    config: CompressionConfig,
 ) -> Result<Inspect, StoreError> {
     let source = absolute_path(source.as_ref())?;
     let destination = absolute_path(destination.as_ref())?;
@@ -78,7 +70,7 @@ pub fn convert_to_zsqlite_with_config(
 
     let input = File::open(&source)?;
     let length = input.metadata()?.len();
-    let mut sqlite_header = [0_u8; 100];
+    let mut sqlite_header = [0; 100];
     read_exact_at(&input, 0, &mut sqlite_header)
         .map_err(|_| StoreError::InvalidStandardDatabase)?;
     let page_size = sqlite_page_size(&sqlite_header).ok_or(StoreError::InvalidStandardDatabase)?;
@@ -87,39 +79,98 @@ pub fn convert_to_zsqlite_with_config(
     }
 
     let staging = unused_staging_path(&destination, "convert")?;
-    let mut staging_cleanup = CleanupPaths::new(bundle_paths(&staging).to_vec());
-    config.validate_page_size(page_size)?;
-    let mut converted = store::Store::open_with_config(&staging, true, config)?;
-    let chunk_size = usize::try_from(config.extent_bytes()).map_err(|_| StoreError::Range)?;
-    let mut buffer = vec![0_u8; chunk_size];
+    let mut cleanup = CleanupPaths::new(bundle_paths(&staging).to_vec());
+    let mut converted = store::Store::open(&staging, true)?;
+    if let Some(dictionary) = conversion_dictionary(&input, length, page_size)? {
+        converted.install_initial_dictionary(dictionary)?;
+    }
+    let mut page = vec![0; page_size as usize];
     let mut offset = 0_u64;
     while offset < length {
-        let amount = usize::try_from((length - offset).min(chunk_size as u64))
-            .map_err(|_| StoreError::Range)?;
-        read_exact_at(&input, offset, &mut buffer[..amount])?;
-        converted.write_at(offset, &buffer[..amount])?;
-        converted.publish(true)?;
-        offset = offset.checked_add(amount as u64).ok_or(StoreError::Range)?;
+        read_exact_at(&input, offset, &mut page)?;
+        converted.write_at(offset, &page)?;
+        offset = offset
+            .checked_add(u64::from(page_size))
+            .ok_or(StoreError::Range)?;
     }
-    converted.checkpoint_index()?;
+    converted.publish(true)?;
+    converted.flush_sidecars()?;
     converted.verify()?;
     drop(converted);
-    let mut final_header = [0_u8; 100];
+
+    let mut final_header = [0; 100];
     read_exact_at(&input, 0, &mut final_header)?;
     if final_header != sqlite_header || input.metadata()?.len() != length {
         return Err(StoreError::Busy);
     }
     store::reject_auxiliary_files(&source)?;
-
     install_staged_bundle(&staging, &destination)?;
-    staging_cleanup.disarm();
+    cleanup.disarm();
     let mut installed = store::Store::open_existing(&destination)?;
     installed.verify()?;
     installed.inspect()
 }
 
-/// Exports a closed V3 zsqlite database as a distinct ordinary `SQLite` file.
-/// The output can be consumed by stock `SQLite` and tools such as Litestream.
+fn conversion_dictionary(
+    input: &File,
+    length: u64,
+    page_size: u32,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    const MAX_SAMPLES: usize = 8192;
+    const SAMPLE_BYTES: usize = 32 * 1024 * 1024;
+    const DICTIONARY_BYTES: usize = 64 * 1024;
+    const MIN_PAGES: usize = 256;
+    let page_count =
+        usize::try_from(length / u64::from(page_size)).map_err(|_| StoreError::Range)?;
+    let sample_count = page_count
+        .min(MAX_SAMPLES)
+        .min(SAMPLE_BYTES / page_size as usize);
+    if sample_count < MIN_PAGES || sample_count.saturating_mul(page_size as usize) < 1024 * 1024 {
+        return Ok(None);
+    }
+    let mut samples = Vec::with_capacity(sample_count);
+    for sample in 0..sample_count {
+        let page = sample
+            .checked_mul(page_count.saturating_sub(1))
+            .ok_or(StoreError::Range)?
+            / sample_count.saturating_sub(1).max(1);
+        let mut bytes = vec![0; page_size as usize];
+        read_exact_at(
+            input,
+            u64::try_from(page)
+                .map_err(|_| StoreError::Range)?
+                .checked_mul(u64::from(page_size))
+                .ok_or(StoreError::Range)?,
+            &mut bytes,
+        )?;
+        samples.push(bytes);
+    }
+    let split = samples.len() * 4 / 5;
+    let training = samples[..split]
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    let dictionary = zstd::dict::from_samples(&training, DICTIONARY_BYTES)
+        .map_err(|error| StoreError::Zstd(error.to_string()))?;
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &dictionary)
+        .map_err(|error| StoreError::Zstd(error.to_string()))?;
+    let raw_bytes = samples[split..].iter().map(Vec::len).sum::<usize>();
+    let compressed_bytes = samples[split..].iter().try_fold(0_usize, |total, page| {
+        let encoded = compressor
+            .compress(page)
+            .map_err(|error| StoreError::Zstd(error.to_string()))?;
+        total.checked_add(encoded.len()).ok_or(StoreError::Range)
+    })?;
+    let savings = raw_bytes.saturating_sub(compressed_bytes);
+    if savings > dictionary.len() && savings.saturating_mul(10_000) >= raw_bytes.saturating_mul(500)
+    {
+        Ok(Some(dictionary))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Exports a V5 zsqlite database as an ordinary `SQLite` file.
 pub fn export_to_sqlite(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
@@ -131,9 +182,7 @@ pub fn export_to_sqlite(
         return Err(StoreError::DestinationExists(destination));
     }
     let mut source_store = store::Store::open_existing_read_only(&source)?;
-    source_store.acquire_maintenance()?;
     source_store.verify()?;
-    store::reject_auxiliary_files(&source)?;
 
     let staging = unused_staging_path(&destination, "export")?;
     let mut cleanup = CleanupPaths::new(vec![staging.clone()]);
@@ -153,12 +202,9 @@ pub fn export_to_sqlite(
             StoreError::Io(error)
         }
     })?;
-    let mut destination_cleanup = CleanupPaths::new(vec![destination.clone()]);
     sync_parent_dir(&destination)?;
     std::fs::remove_file(&staging)?;
     cleanup.disarm();
-    destination_cleanup.disarm();
-    source_store.release_maintenance();
     Ok(length)
 }
 
@@ -184,31 +230,21 @@ fn install_staged_bundle(staging: &Path, destination: &Path) -> Result<(), Store
     let staging_paths = bundle_paths(staging);
     let destination_paths = bundle_paths(destination);
     let mut installed = CleanupPaths::new(Vec::new());
-    // Install identity-bearing companions first and make their directory
-    // entries durable. The anchor is linked last and makes the bundle visible.
-    for index in 1..staging_paths.len() {
-        link_no_replace(&staging_paths[index], &destination_paths[index])?;
-        installed.paths.push(destination_paths[index].clone());
-    }
+    std::fs::rename(&staging_paths[1], &destination_paths[1])?;
+    installed.paths.push(destination_paths[1].clone());
     sync_parent_dir(destination)?;
-    link_no_replace(&staging_paths[0], &destination_paths[0])?;
-    installed.paths.push(destination_paths[0].clone());
-    sync_parent_dir(destination)?;
-    for path in staging_paths {
-        std::fs::remove_file(path)?;
-    }
-    installed.disarm();
-    Ok(())
-}
-
-fn link_no_replace(source: &Path, destination: &Path) -> Result<(), StoreError> {
-    std::fs::hard_link(source, destination).map_err(|error| {
+    std::fs::hard_link(&staging_paths[0], &destination_paths[0]).map_err(|error| {
         if error.kind() == ErrorKind::AlreadyExists {
             StoreError::DestinationExists(destination.to_path_buf())
         } else {
             StoreError::Io(error)
         }
-    })
+    })?;
+    installed.paths.push(destination_paths[0].clone());
+    sync_parent_dir(destination)?;
+    std::fs::remove_file(&staging_paths[0])?;
+    installed.disarm();
+    Ok(())
 }
 
 fn ensure_bundle_absent(path: &Path) -> Result<(), StoreError> {
@@ -220,28 +256,23 @@ fn ensure_bundle_absent(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn bundle_paths(path: &Path) -> [PathBuf; 4] {
-    [
-        path.to_path_buf(),
-        append_suffix(path, "-zsqlite"),
-        append_suffix(path, "-zsqlite-lock"),
-        append_suffix(path, "-zsqlite-publish"),
-    ]
-}
-
-fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    PathBuf::from(value)
+fn bundle_paths(path: &Path) -> [PathBuf; 2] {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(".d");
+    [path.to_path_buf(), PathBuf::from(sidecar)]
 }
 
 fn unused_staging_path(destination: &Path, purpose: &str) -> Result<PathBuf, StoreError> {
     for _ in 0..1024 {
         let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = append_suffix(
-            destination,
-            &format!(".{purpose}.{}.{sequence}", std::process::id()),
-        );
+        let stem = destination
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("database");
+        let candidate = destination.with_file_name(format!(
+            ".{stem}.{purpose}.{}.{sequence}.zsqlite",
+            std::process::id()
+        ));
         if bundle_paths(&candidate).iter().all(|path| !path.exists()) {
             return Ok(candidate);
         }
@@ -289,7 +320,6 @@ impl CleanupPaths {
     fn new(paths: Vec<PathBuf>) -> Self {
         Self { paths }
     }
-
     fn disarm(&mut self) {
         self.paths.clear();
     }
@@ -298,7 +328,11 @@ impl CleanupPaths {
 impl Drop for CleanupPaths {
     fn drop(&mut self) {
         for path in &self.paths {
-            let _ = std::fs::remove_file(path);
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(path);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -314,81 +348,22 @@ mod tests {
         let mut page = vec![fill; 4096];
         page[..16].copy_from_slice(SQLITE_MAGIC);
         page[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        page[18] = 1;
+        page[19] = 1;
+        page[21..24].copy_from_slice(&[64, 32, 32]);
         page
     }
 
-    fn create_store(path: &Path) -> Result<(), StoreError> {
-        let mut store = store::Store::open(path, true)?;
-        store.write_at(0, &sqlite_page(b't'))?;
-        store.publish(true)?;
-        store.checkpoint_index()?;
-        store.verify()
-    }
-
     #[test]
-    fn partial_conversion_install_is_invisible_and_retry_fails_without_overwrite()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn conversion_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
-        let staging = directory.path().join("staging.db");
-        let destination = directory.path().join("destination.db");
-        create_store(&staging)?;
-        let staging_paths = bundle_paths(&staging);
-        let destination_paths = bundle_paths(&destination);
-
-        // Model interruption after the three companions were linked and made
-        // durable, but before the anchor was linked last.
-        for index in 1..staging_paths.len() {
-            std::fs::hard_link(&staging_paths[index], &destination_paths[index])?;
-        }
-        assert!(!destination_paths[0].exists());
-        assert!(inspect(&destination).is_err());
-        let before: Vec<Vec<u8>> = destination_paths[1..]
-            .iter()
-            .map(std::fs::read)
-            .collect::<Result<_, _>>()?;
-
-        assert!(matches!(
-            install_staged_bundle(&staging, &destination),
-            Err(StoreError::DestinationExists(_))
-        ));
-        assert!(!destination_paths[0].exists());
-        for (path, expected) in destination_paths[1..].iter().zip(before) {
-            assert_eq!(std::fs::read(path)?, expected);
-        }
-        assert!(staging_paths.iter().all(|path| path.exists()));
-        Ok(())
-    }
-
-    #[test]
-    fn nonempty_sqlite_auxiliary_files_block_offline_maintenance()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("auxiliary.db");
-        create_store(&path)?;
-        for suffix in ["-journal", "-wal", "-shm"] {
-            let auxiliary = append_suffix(&path, suffix);
-            std::fs::write(&auxiliary, b"possibly live")?;
-            assert!(matches!(verify(&path), Err(StoreError::Busy)), "{suffix}");
-            assert_eq!(std::fs::read(&auxiliary)?, b"possibly live");
-            std::fs::remove_file(auxiliary)?;
-        }
-        verify(&path)?;
-        Ok(())
-    }
-
-    #[test]
-    fn empty_sqlite_auxiliary_files_do_not_block_offline_maintenance()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("stale-empty-auxiliary.db");
-        create_store(&path)?;
-        for suffix in ["-journal", "-wal", "-shm"] {
-            let auxiliary = append_suffix(&path, suffix);
-            File::create(&auxiliary)?;
-            verify(&path)?;
-            assert_eq!(std::fs::metadata(&auxiliary)?.len(), 0);
-            std::fs::remove_file(auxiliary)?;
-        }
+        let source = directory.path().join("source.db");
+        let destination = directory.path().join("destination.zsqlite");
+        let output = directory.path().join("output.db");
+        std::fs::write(&source, sqlite_page(4))?;
+        convert_to_zsqlite(&source, &destination)?;
+        export_to_sqlite(&destination, &output)?;
+        assert_eq!(std::fs::read(source)?, std::fs::read(output)?);
         Ok(())
     }
 }

@@ -1,26 +1,12 @@
-use std::ffi::OsString;
 use std::path::PathBuf;
 
 enum Command {
-    Inspect {
-        database: PathBuf,
-    },
-    Verify {
-        database: PathBuf,
-    },
-    Compact {
-        database: PathBuf,
-        config: zsqlite::CompressionConfig,
-    },
-    Convert {
-        source: PathBuf,
-        output: PathBuf,
-        config: zsqlite::CompressionConfig,
-    },
-    Export {
-        database: PathBuf,
-        output: PathBuf,
-    },
+    Inspect(PathBuf),
+    Verify(PathBuf),
+    Flush(PathBuf),
+    Compact(PathBuf),
+    Convert(PathBuf, PathBuf),
+    Export(PathBuf, PathBuf),
 }
 
 fn main() {
@@ -32,49 +18,30 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     match parse_args()? {
-        Command::Inspect { database } => {
-            let info = zsqlite::inspect(database)?;
-            println!("database: {}", info.path.display());
-            println!("sidecar: {}", info.sidecar_path.display());
-            println!("format: V3 native");
-            println!("page_size: {}", info.page_size);
-            println!("page_count: {}", info.page_count);
-            println!("logical_bytes: {}", info.logical_size);
-            println!("base_bytes: {}", info.base_bytes);
-            println!("sidecar_bytes: {}", info.sidecar_bytes);
-            println!("sidecar_allocated_bytes: {}", info.sidecar_allocated_bytes);
-            println!("live_stored_bytes: {}", info.live_stored_bytes);
-            println!("generation: {}", info.generation);
-            println!("index_generation: {}", info.index_generation);
-            println!("indexed_pages: {}", info.indexed_pages);
-            println!("live_extents: {}", info.live_extents);
-            println!("committed_end: {}", info.committed_end);
-            println!("hole_punching: {}", info.hole_punching);
+        Command::Inspect(path) => print_inspect(&zsqlite::inspect(path)?),
+        Command::Verify(path) => {
+            let info = zsqlite::verify(path)?;
+            println!("ok: {} pages at TXID {}", info.page_count, info.head_txid);
         }
-        Command::Verify { database } => {
-            let info = zsqlite::verify(database)?;
-            println!("ok: {} pages", info.page_count);
+        Command::Flush(path) => {
+            let info = zsqlite::flush(path)?;
+            println!("flushed: {} sealed segment(s)", info.sealed_segments);
         }
-        Command::Compact { database, config } => {
-            let info = zsqlite::compact_with_config(database, config)?;
+        Command::Compact(path) => {
+            let info = zsqlite::compact(path)?;
             println!(
-                "compacted: {} logical bytes -> {} physical bytes",
-                info.logical_size,
-                info.base_bytes + info.sidecar_bytes
+                "compacted: {} logical bytes into {} segment bytes",
+                info.logical_size, info.segment_bytes
             );
         }
-        Command::Convert {
-            source,
-            output,
-            config,
-        } => {
-            let info = zsqlite::convert_to_zsqlite_with_config(source, output, config)?;
+        Command::Convert(source, output) => {
+            let info = zsqlite::convert_to_zsqlite(source, output)?;
             println!(
-                "converted: {} logical bytes -> {} sidecar bytes",
-                info.logical_size, info.sidecar_bytes
+                "converted: {} logical bytes into {} segment bytes",
+                info.logical_size, info.segment_bytes
             );
         }
-        Command::Export { database, output } => {
+        Command::Export(database, output) => {
             let bytes = zsqlite::export_to_sqlite(database, output)?;
             println!("exported: {bytes} bytes");
         }
@@ -82,9 +49,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn print_inspect(info: &zsqlite::Inspect) {
+    println!("database: {}", info.path.display());
+    println!("sidecar: {}", info.sidecar_path.display());
+    println!("format: V5 ltx-style-segments");
+    println!("page_size: {}", info.page_size);
+    println!("page_count: {}", info.page_count);
+    println!("logical_bytes: {}", info.logical_size);
+    println!("head_txid: {}", info.head_txid);
+    println!("head_history: {}", zsqlite::format::hex(&info.head_history));
+    println!("catalog_generation: {}", info.catalog_generation);
+    println!("sealed_segments: {}", info.sealed_segments);
+    println!("active: {}", info.active);
+    println!("anchor_bytes: {}", info.anchor_bytes);
+    println!("anchor_allocated_bytes: {}", info.anchor_allocated_bytes);
+    println!("segment_bytes: {}", info.segment_bytes);
+    println!("segment_allocated_bytes: {}", info.segment_allocated_bytes);
+    println!("active_bytes: {}", info.active_bytes);
+    println!("active_allocated_bytes: {}", info.active_allocated_bytes);
+    println!("indexed_pages: {}", info.indexed_pages);
+    println!("dictionary_bytes: {}", info.dictionary_bytes);
+    println!("settle_seconds: {}", info.policy.settle.as_secs());
+    println!("max_stale_seconds: {}", info.policy.max_stale.as_secs());
+    println!(
+        "dictionary_sample_bytes: {}",
+        info.policy.dictionary.sample_bytes
+    );
+}
+
 fn parse_args() -> Result<Command, String> {
-    let mut args = std::env::args_os().skip(1);
-    let Some(command) = args.next() else {
+    let mut arguments = std::env::args_os().skip(1);
+    let Some(command) = arguments.next() else {
         return Err(usage());
     };
     if command == "--version" || command == "-V" {
@@ -96,93 +91,18 @@ fn parse_args() -> Result<Command, String> {
         std::process::exit(0);
     }
     let command = command.to_str().ok_or_else(usage)?;
-    let remaining = args.collect::<Vec<_>>();
-    match command {
-        "inspect" | "verify" | "export" => parse_unconfigured(command, &remaining),
-        "compact" | "convert" => parse_configured(command, remaining),
-        _ => Err(usage()),
-    }
-}
-
-fn parse_unconfigured(command: &str, arguments: &[OsString]) -> Result<Command, String> {
-    match (command, arguments) {
-        ("inspect", [database]) => Ok(Command::Inspect {
-            database: PathBuf::from(database),
-        }),
-        ("verify", [database]) => Ok(Command::Verify {
-            database: PathBuf::from(database),
-        }),
-        ("export", [database, output]) => Ok(Command::Export {
-            database: PathBuf::from(database),
-            output: PathBuf::from(output),
-        }),
-        _ => Err(usage()),
-    }
-}
-
-fn parse_configured(command: &str, arguments: Vec<OsString>) -> Result<Command, String> {
-    let defaults = zsqlite::CompressionConfig::default();
-    let mut extent_size = defaults.extent_bytes();
-    let mut seek_size = defaults.seek_chunk_bytes();
-    let mut paths = Vec::new();
-    let mut arguments = arguments.into_iter();
-    while let Some(argument) = arguments.next() {
-        match argument.to_str() {
-            Some("--extent-size") => {
-                extent_size = parse_byte_size(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--extent-size requires a value".to_owned())?,
-                )?;
-            }
-            Some("--seek-size") => {
-                seek_size = parse_byte_size(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--seek-size requires a value".to_owned())?,
-                )?;
-            }
-            Some(value) if value.starts_with('-') => {
-                return Err(format!("unknown option: {value}\n{}", usage()));
-            }
-            _ => paths.push(PathBuf::from(argument)),
-        }
-    }
-    let config = zsqlite::CompressionConfig::new(extent_size, seek_size)
-        .map_err(|error| error.to_string())?;
+    let paths = arguments.map(PathBuf::from).collect::<Vec<_>>();
     match (command, paths.as_slice()) {
-        ("compact", [database]) => Ok(Command::Compact {
-            database: database.clone(),
-            config,
-        }),
-        ("convert", [source, output]) => Ok(Command::Convert {
-            source: source.clone(),
-            output: output.clone(),
-            config,
-        }),
+        ("inspect", [database]) => Ok(Command::Inspect(database.clone())),
+        ("verify", [database]) => Ok(Command::Verify(database.clone())),
+        ("flush", [database]) => Ok(Command::Flush(database.clone())),
+        ("compact", [database]) => Ok(Command::Compact(database.clone())),
+        ("convert", [source, output]) => Ok(Command::Convert(source.clone(), output.clone())),
+        ("export", [database, output]) => Ok(Command::Export(database.clone(), output.clone())),
         _ => Err(usage()),
     }
-}
-
-fn parse_byte_size(value: OsString) -> Result<u32, String> {
-    let value = value
-        .into_string()
-        .map_err(|_| "sizes must be valid UTF-8".to_owned())?;
-    let lower = value.to_ascii_lowercase();
-    let (digits, multiplier) = if let Some(digits) = lower.strip_suffix("mib") {
-        (digits, 1024_u32 * 1024)
-    } else if let Some(digits) = lower.strip_suffix("kib") {
-        (digits, 1024_u32)
-    } else {
-        (lower.as_str(), 1_u32)
-    };
-    digits
-        .parse::<u32>()
-        .ok()
-        .and_then(|number| number.checked_mul(multiplier))
-        .ok_or_else(|| format!("invalid byte size: {value}"))
 }
 
 fn usage() -> String {
-    "usage: zsqlite <inspect|verify> <database>\n       zsqlite compact [--extent-size BYTES] [--seek-size BYTES] <database>\n       zsqlite convert [--extent-size BYTES] [--seek-size BYTES] <sqlite-database> <zsqlite-database>\n       zsqlite export <zsqlite-database> <sqlite-database>".into()
+    "usage: zsqlite <inspect|verify|flush|compact> <database.zsqlite>\n       zsqlite convert <sqlite-database> <database.zsqlite>\n       zsqlite export <database.zsqlite> <sqlite-database>".into()
 }
