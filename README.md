@@ -4,29 +4,35 @@
 readable page frames in transactional, LTX-style segments. SQLite journals and
 WAL files continue to use the host VFS.
 
-The current format is V5 and intentionally has no compatibility path for older
+The current format is V6 and intentionally has no compatibility path for older
 zsqlite formats.
 
 ## Storage model
 
-A database is a small control file and a sibling object directory:
+A database is an append-only active segment and a sibling directory of sealed
+predecessors:
 
 ```text
 database.zsqlite
 database.zsqlite.d/
-  active/
-    <writer-id>.zactive
   segments/
     <start-txid>-<end-txid>-<history>-<physical>.zseg
-  roots/
-    <head-txid>-<history>-<catalog>.zroot
   locks/
+    publication.lock
+    lifecycle.lock
+    sqlite.lock
 ```
 
-The `.zsqlite` file has an identity header and two alternating 4 KiB root
-sectors. A root selects an immutable catalog and, while writes are accumulating,
-the exact committed position in one active segment. The catalog is an exact,
-ordered list of immutable segments, not a directory-listing hint.
+The `.zsqlite` file is the active segment. Its immutable header contains the
+database identity and the physical digest of its immediate sealed predecessor.
+Opening follows that digest chain through `segments/`; unrelated files are not
+authoritative. Transactions are recovered by scanning the active file to its
+last complete, checksummed commit record.
+
+The host VFS uses `sqlite.lock` as the native SQLite byte-lock and WAL-SHM
+carrier. It deliberately does not use the `.zsqlite` inode for SQLite byte
+locks: on POSIX, closing any independently opened database descriptor could otherwise release a
+live connection's process-owned `fcntl` locks.
 
 Each active or sealed segment contains:
 
@@ -47,29 +53,59 @@ digest changes.
 
 The detailed format and design invariants are in
 [`ltx-style-segments.md`](ltx-style-segments.md).
+The current durability, recovery, and concurrency review is in
+[`correctness-audit.md`](correctness-audit.md).
 
 ## Commit and durability behavior
 
-`xWrite` immediately writes the final version of each dirty SQLite page to the
-active segment. Repeated writes to the same page before publication overwrite
-or replace that uncommitted frame. A publication appends one commit record,
-optionally syncs the active file, and then switches one alternating root sector.
-The root switch is the visibility point.
+`xWrite` appends the resulting bytes of each affected SQLite page to the active
+`.zsqlite` segment. Repeated writes to the same page before publication may
+reuse that transaction's uncommitted frame; otherwise they append a replacement
+and mark the earlier uncommitted frame free. A publication writes one
+sector-aligned commit body and writes its checksummed header last. The valid commit record is the
+visibility point. Committed frames are append-only for the lifetime of that
+active segment, including frames later
+superseded by another commit. Sealing preserves those bytes; compaction can
+omit dead frames by writing a new immutable segment.
 
-With `synchronous=OFF`, the records and root are still structurally complete,
+With `synchronous=OFF`, the records are still structurally complete,
 but zsqlite does not ask the operating system to make them power-loss durable.
-With SQLite sync enabled, the active data is synced before the root that names
-it. Rollback discards unreferenced staged frames.
+With SQLite sync enabled, the complete active prefix is synced before success is
+reported. `synchronous=FULL` also propagates macOS `F_FULLFSYNC` to those Store
+files. Recovery ignores an incomplete or invalid tail and the next writer
+truncates it before appending. Rollback discards unreferenced staged frames. A commit that shrinks the
+database records an authenticated truncate low-water mark as well as its final
+size, so shrinking and re-extending in one transaction cannot resurrect old
+pages during replay.
 
-In WAL mode, WAL writes are passed through. A zsqlite TXID therefore describes
-an atomic main-database checkpoint batch, not an individual SQL transaction in
-the WAL. `SQLITE_FCNTL_CKPT_DONE` and checkpoint-lock release publish those main
-image writes.
+In WAL mode, WAL writes are passed through. When SQLite acquires its exclusive
+checkpoint SHM lock, zsqlite holds one publication lease for the whole
+checkpoint. Each successful checkpoint `xWrite` publishes its completed
+main-image change nondurably before returning, because SQLite ignores errors
+from later checkpoint-done and unlock notifications. A checkpoint `xTruncate`
+is published the same way, and a subsequent `xSync` syncs the active data and
+commit record. Consequently a zsqlite TXID describes an
+atomic main-image publication, often one checkpoint write, not an individual
+SQL transaction in the WAL.
 
-Committed frames needed by another process or by the previous root are not
-reclaimed. Once unpinned, dead active ranges become reusable and aligned
-interiors can be hole-punched. Recovery truncates an uncommitted tail only while
-holding the publication lock.
+SQLite suppresses SHM-lock callbacks in `locking_mode=EXCLUSIVE` and during
+its last-close checkpoint. For those paths, checkpoint start/done file controls
+provide the equivalent bounded publication state; partial checkpoints release
+at DONE, while an immediately following truncate remains attributable to the
+completed checkpoint.
+
+Only uncommitted frames superseded within the current publication may be reused
+or have aligned payload interiors hole-punched. Published frames are not
+overwritten or punched while their active segment remains mutable. Sealing and
+later compaction omit dead versions from the live index; whole obsolete files
+become collectible after neither the active lineage nor any reader generation needs them.
+Recovery truncates an uncommitted tail only while holding the publication lock.
+
+At rollover, zsqlite seals and syncs the current `.zsqlite`, hardlinks that
+inode into `segments/`, syncs the segment directory, writes and syncs a fresh
+active segment that names the sealed digest, atomically renames it over
+`.zsqlite`, and syncs the parent directory. Existing readers keep a valid old
+inode and reopen the new active generation at the next transaction boundary.
 
 ## Dictionaries and compaction
 
@@ -101,10 +137,17 @@ zsqlite::export_to_sqlite("app.zsqlite", "restored.db")?;
 # Ok::<(), zsqlite::StoreError>(())
 ```
 
-`configure()` persists settle, maximum-staleness, local heat, GC, and adaptive
-dictionary policy. Defaults are a 5 minute settle interval, 1 hour maximum
-active age, 24 hour hot horizon, 64 KiB dictionaries, a 32 MiB reservoir, 5%
-minimum held-out improvement, 25% churn, and a 24 hour promotion cooldown.
+A raw bundle copy is not a SQLite online backup. In WAL mode, acknowledged SQL
+transactions can exist only in the host `-wal` file while the `.zsqlite` active
+still names an older main image. Copy a closed or coordinately checkpointed
+database, or use SQLite's online-backup protocol. The `.zsqlite` file and its
+sidecar directory must be captured from one pinned point in time; copying only
+one of them is not sufficient.
+
+`configure()` persists settle, maximum-staleness, and adaptive dictionary
+policy. Defaults are a 5 minute settle interval, 1 hour maximum active age,
+64 KiB dictionaries, a 32 MiB reservoir, 5% minimum held-out improvement,
+25% churn, and a 24 hour promotion cooldown.
 
 ## CLI
 

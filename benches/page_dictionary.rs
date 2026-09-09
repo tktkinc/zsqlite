@@ -125,7 +125,7 @@ fn usage() -> &'static str {
      \n\
      Compares independent 64 KiB Zstandard frames with one frame per SQLite\n\
      page, with and without one 64 KiB dictionary trained from up to 8192\n\
-     evenly sampled database pages. Sidecar estimates use V5 frame, index,\n\
+     evenly sampled database pages. Sidecar estimates use V6 frame, index,\n\
      full-map, dictionary-table, and segment-container overhead."
 }
 

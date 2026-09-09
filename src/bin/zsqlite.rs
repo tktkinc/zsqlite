@@ -52,21 +52,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn print_inspect(info: &zsqlite::Inspect) {
     println!("database: {}", info.path.display());
     println!("sidecar: {}", info.sidecar_path.display());
-    println!("format: V5 ltx-style-segments");
+    println!("format: V6 active-segment");
     println!("page_size: {}", info.page_size);
     println!("page_count: {}", info.page_count);
     println!("logical_bytes: {}", info.logical_size);
     println!("head_txid: {}", info.head_txid);
     println!("head_history: {}", zsqlite::format::hex(&info.head_history));
-    println!("catalog_generation: {}", info.catalog_generation);
+    println!("generation: {}", info.generation);
     println!("sealed_segments: {}", info.sealed_segments);
     println!("active: {}", info.active);
-    println!("anchor_bytes: {}", info.anchor_bytes);
-    println!("anchor_allocated_bytes: {}", info.anchor_allocated_bytes);
+    println!("file_bytes: {}", info.file_bytes);
+    println!("file_allocated_bytes: {}", info.file_allocated_bytes);
     println!("segment_bytes: {}", info.segment_bytes);
     println!("segment_allocated_bytes: {}", info.segment_allocated_bytes);
-    println!("active_bytes: {}", info.active_bytes);
-    println!("active_allocated_bytes: {}", info.active_allocated_bytes);
     println!("indexed_pages: {}", info.indexed_pages);
     println!("dictionary_bytes: {}", info.dictionary_bytes);
     println!("settle_seconds: {}", info.policy.settle.as_secs());

@@ -3,11 +3,231 @@ use std::ffi::{CStr, CString};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
 const ZSQLITE_VFS: &CStr = c"zsqlite";
+
+static EXPECTED_PARENT_VFS: AtomicPtr<ffi::sqlite3_vfs> = AtomicPtr::new(null_mut());
+static EXPECTED_PARENT_APP_DATA: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+static PARENT_CONTEXT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+const PARENT_OPEN: usize = 1 << 0;
+const PARENT_DELETE: usize = 1 << 1;
+const PARENT_ACCESS: usize = 1 << 2;
+const PARENT_FULL_PATHNAME: usize = 1 << 3;
+const PARENT_DL_OPEN: usize = 1 << 4;
+const PARENT_DL_ERROR: usize = 1 << 5;
+const PARENT_DL_SYM: usize = 1 << 6;
+const PARENT_DL_CLOSE: usize = 1 << 7;
+const PARENT_RANDOMNESS: usize = 1 << 8;
+const PARENT_SLEEP: usize = 1 << 9;
+const PARENT_CURRENT_TIME: usize = 1 << 10;
+const PARENT_LAST_ERROR: usize = 1 << 11;
+const PARENT_CURRENT_TIME_I64: usize = 1 << 12;
+const PARENT_SET_SYSTEM_CALL: usize = 1 << 13;
+const PARENT_GET_SYSTEM_CALL: usize = 1 << 14;
+const PARENT_NEXT_SYSTEM_CALL: usize = 1 << 15;
+const ALL_PARENT_CONTEXT_CALLS: usize = (1 << 16) - 1;
+
+fn record_parent_context(vfs: *mut ffi::sqlite3_vfs, callback: usize) -> bool {
+    if vfs != EXPECTED_PARENT_VFS.load(Ordering::Acquire) {
+        return false;
+    }
+    // SAFETY: Equality with EXPECTED_PARENT_VFS establishes that `vfs` is the
+    // live parent object installed by the test for the duration of each call.
+    if unsafe { vfs.as_ref() }.map(|vfs| vfs.pAppData)
+        != Some(EXPECTED_PARENT_APP_DATA.load(Ordering::Acquire))
+    {
+        return false;
+    }
+    PARENT_CONTEXT_CALLS.fetch_or(callback, Ordering::AcqRel);
+    true
+}
+
+unsafe extern "C" fn context_checking_open(
+    vfs: *mut ffi::sqlite3_vfs,
+    _name: *const c_char,
+    _output: *mut ffi::sqlite3_file,
+    _flags: c_int,
+    _out_flags: *mut c_int,
+) -> c_int {
+    if record_parent_context(vfs, PARENT_OPEN) {
+        ffi::SQLITE_CANTOPEN
+    } else {
+        ffi::SQLITE_MISUSE
+    }
+}
+
+unsafe extern "C" fn context_checking_delete(
+    vfs: *mut ffi::sqlite3_vfs,
+    _name: *const c_char,
+    _sync_dir: c_int,
+) -> c_int {
+    if record_parent_context(vfs, PARENT_DELETE) {
+        ffi::SQLITE_OK
+    } else {
+        ffi::SQLITE_MISUSE
+    }
+}
+
+unsafe extern "C" fn context_checking_access(
+    vfs: *mut ffi::sqlite3_vfs,
+    _name: *const c_char,
+    _flags: c_int,
+    _output: *mut c_int,
+) -> c_int {
+    if record_parent_context(vfs, PARENT_ACCESS) {
+        ffi::SQLITE_OK
+    } else {
+        ffi::SQLITE_MISUSE
+    }
+}
+
+unsafe extern "C" fn context_checking_full_pathname(
+    vfs: *mut ffi::sqlite3_vfs,
+    _name: *const c_char,
+    _output_size: c_int,
+    _output: *mut c_char,
+) -> c_int {
+    if record_parent_context(vfs, PARENT_FULL_PATHNAME) {
+        ffi::SQLITE_OK
+    } else {
+        ffi::SQLITE_MISUSE
+    }
+}
+
+unsafe extern "C" fn context_checking_dl_open(
+    vfs: *mut ffi::sqlite3_vfs,
+    _filename: *const c_char,
+) -> *mut c_void {
+    if record_parent_context(vfs, PARENT_DL_OPEN) {
+        std::ptr::dangling_mut()
+    } else {
+        null_mut()
+    }
+}
+
+unsafe extern "C" fn context_checking_dl_error(
+    vfs: *mut ffi::sqlite3_vfs,
+    _output_size: c_int,
+    _output: *mut c_char,
+) {
+    record_parent_context(vfs, PARENT_DL_ERROR);
+}
+
+unsafe extern "C" fn context_checking_dl_entry(
+    _vfs: *mut ffi::sqlite3_vfs,
+    _handle: *mut c_void,
+    _symbol: *const c_char,
+) {
+}
+
+unsafe extern "C" fn context_checking_dl_sym(
+    vfs: *mut ffi::sqlite3_vfs,
+    _handle: *mut c_void,
+    _symbol: *const c_char,
+) -> Option<unsafe extern "C" fn(*mut ffi::sqlite3_vfs, *mut c_void, *const c_char)> {
+    record_parent_context(vfs, PARENT_DL_SYM).then_some(context_checking_dl_entry)
+}
+
+unsafe extern "C" fn context_checking_dl_close(vfs: *mut ffi::sqlite3_vfs, _handle: *mut c_void) {
+    record_parent_context(vfs, PARENT_DL_CLOSE);
+}
+
+unsafe extern "C" fn context_checking_randomness(
+    vfs: *mut ffi::sqlite3_vfs,
+    _amount: c_int,
+    _output: *mut c_char,
+) -> c_int {
+    if record_parent_context(vfs, PARENT_RANDOMNESS) {
+        7
+    } else {
+        -1
+    }
+}
+
+unsafe extern "C" fn context_checking_sleep(
+    vfs: *mut ffi::sqlite3_vfs,
+    microseconds: c_int,
+) -> c_int {
+    if record_parent_context(vfs, PARENT_SLEEP) {
+        microseconds
+    } else {
+        -1
+    }
+}
+
+unsafe extern "C" fn context_checking_current_time(
+    vfs: *mut ffi::sqlite3_vfs,
+    output: *mut f64,
+) -> c_int {
+    if !record_parent_context(vfs, PARENT_CURRENT_TIME) {
+        return ffi::SQLITE_MISUSE;
+    }
+    if let Some(output) = unsafe { output.as_mut() } {
+        *output = 17.0;
+    }
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn context_checking_last_error(
+    vfs: *mut ffi::sqlite3_vfs,
+    _output_size: c_int,
+    _output: *mut c_char,
+) -> c_int {
+    if record_parent_context(vfs, PARENT_LAST_ERROR) {
+        19
+    } else {
+        -1
+    }
+}
+
+unsafe extern "C" fn context_checking_current_time_i64(
+    vfs: *mut ffi::sqlite3_vfs,
+    output: *mut ffi::sqlite3_int64,
+) -> c_int {
+    if !record_parent_context(vfs, PARENT_CURRENT_TIME_I64) {
+        return ffi::SQLITE_MISUSE;
+    }
+    if let Some(output) = unsafe { output.as_mut() } {
+        *output = 23;
+    }
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn context_checking_system_call() {}
+
+unsafe extern "C" fn context_checking_set_system_call(
+    vfs: *mut ffi::sqlite3_vfs,
+    _name: *const c_char,
+    _call: ffi::sqlite3_syscall_ptr,
+) -> c_int {
+    if record_parent_context(vfs, PARENT_SET_SYSTEM_CALL) {
+        29
+    } else {
+        -1
+    }
+}
+
+unsafe extern "C" fn context_checking_get_system_call(
+    vfs: *mut ffi::sqlite3_vfs,
+    _name: *const c_char,
+) -> ffi::sqlite3_syscall_ptr {
+    record_parent_context(vfs, PARENT_GET_SYSTEM_CALL).then_some(context_checking_system_call)
+}
+
+unsafe extern "C" fn context_checking_next_system_call(
+    vfs: *mut ffi::sqlite3_vfs,
+    _name: *const c_char,
+) -> *const c_char {
+    if record_parent_context(vfs, PARENT_NEXT_SYSTEM_CALL) {
+        c"next".as_ptr()
+    } else {
+        null()
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum Value {
@@ -334,6 +554,104 @@ fn wal_database_round_trip_through_vfs() -> Result<(), Box<dyn std::error::Error
 }
 
 #[test]
+fn exclusive_locking_wal_repeated_checkpoints_preserve_every_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    register()?;
+    let path = directory.path().join("exclusive-wal-checkpoints.zsqlite");
+    {
+        let connection = Connection::open(&path)?;
+        connection.execute(
+            "PRAGMA page_size=1024;
+             PRAGMA locking_mode=EXCLUSIVE;
+             PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=FULL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE events(id INTEGER PRIMARY KEY, body BLOB);
+             INSERT INTO events VALUES(1, randomblob(900));",
+        )?;
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        connection.execute(
+            "WITH RECURSIVE sequence(id) AS (
+               VALUES(2) UNION ALL SELECT id+1 FROM sequence WHERE id<100
+             )
+             INSERT INTO events SELECT id, randomblob(900) FROM sequence;",
+        )?;
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        assert_eq!(connection.integer("SELECT count(*) FROM events")?, 100);
+    }
+
+    let reopened = Connection::open(&path)?;
+    assert_eq!(reopened.integer("SELECT count(*) FROM events")?, 100);
+    assert_integrity(&reopened)?;
+    Ok(())
+}
+
+#[test]
+fn rollback_journal_post_commit_truncate_updates_the_store_size()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    register()?;
+    let path = directory
+        .path()
+        .join("rollback-post-commit-truncate.zsqlite");
+    let shrunk_pages;
+    {
+        let connection = Connection::open(&path)?;
+        connection.execute(
+            "PRAGMA page_size=4096;
+             PRAGMA auto_vacuum=FULL;
+             PRAGMA journal_mode=DELETE;
+             PRAGMA synchronous=FULL;
+             CREATE TABLE events(id INTEGER PRIMARY KEY, body BLOB);
+             WITH RECURSIVE sequence(id) AS (
+               VALUES(1) UNION ALL SELECT id+1 FROM sequence WHERE id<300
+             )
+             INSERT INTO events SELECT id, randomblob(3000) FROM sequence;",
+        )?;
+        let grown_pages = connection.integer("PRAGMA page_count")?;
+        connection.execute("DELETE FROM events WHERE id > 10")?;
+        shrunk_pages = connection.integer("PRAGMA page_count")?;
+        assert!(shrunk_pages < grown_pages);
+    }
+
+    let store = Store::open_existing(&path)?;
+    let info = store.inspect()?;
+    assert_eq!(info.page_count, u32::try_from(shrunk_pages)?);
+    drop(store);
+    let reopened = Connection::open(&path)?;
+    assert_eq!(reopened.integer("PRAGMA page_count")?, shrunk_pages);
+    assert_eq!(reopened.integer("SELECT count(*) FROM events")?, 10);
+    assert_integrity(&reopened)?;
+    Ok(())
+}
+
+#[test]
+fn moving_the_active_path_rejects_a_write() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    register()?;
+    let path = directory.path().join("moved-active.zsqlite");
+    let moved = directory.path().join("moved-active-away.zsqlite");
+    let connection = Connection::open(&path)?;
+    connection.execute(
+        "PRAGMA journal_mode=DELETE;
+         CREATE TABLE events(id INTEGER PRIMARY KEY);",
+    )?;
+
+    std::fs::rename(&path, &moved)?;
+    let result = connection.execute_with_code("INSERT INTO events VALUES(1)");
+    let extended = unsafe { ffi::sqlite3_extended_errcode(connection.0) };
+    std::fs::rename(&moved, &path)?;
+    assert!(result.is_err());
+    assert_ne!(extended, ffi::SQLITE_OK);
+    drop(connection);
+
+    let reopened = Connection::open(&path)?;
+    assert_eq!(reopened.integer("SELECT count(*) FROM events")?, 0);
+    Ok(())
+}
+
+#[test]
 fn sidecar_flush_does_not_checkpoint_sqlite_wal() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     register()?;
@@ -382,8 +700,339 @@ fn registration_is_idempotent_under_concurrency() -> Result<(), Box<dyn std::err
 }
 
 #[test]
-fn vfs_delete_removes_anchor_and_sidecar_for_unusual_path() -> Result<(), Box<dyn std::error::Error>>
+#[allow(clippy::too_many_lines)]
+fn inherited_parent_vfs_callbacks_receive_the_parent_context() {
+    // SAFETY: An all-zero sqlite3_vfs contains only integers, raw pointers,
+    // and nullable function pointers. The fields used below are initialized
+    // before the callback is invoked.
+    let mut parent: ffi::sqlite3_vfs = unsafe { std::mem::zeroed() };
+    parent.iVersion = 3;
+    parent.szOsFile =
+        c_int::try_from(std::mem::size_of::<ffi::sqlite3_file>()).expect("sqlite3_file size fits");
+    parent.xOpen = Some(context_checking_open);
+    parent.xDelete = Some(context_checking_delete);
+    parent.xAccess = Some(context_checking_access);
+    parent.xFullPathname = Some(context_checking_full_pathname);
+    parent.xDlOpen = Some(context_checking_dl_open);
+    parent.xDlError = Some(context_checking_dl_error);
+    parent.xDlSym = Some(context_checking_dl_sym);
+    parent.xDlClose = Some(context_checking_dl_close);
+    parent.xRandomness = Some(context_checking_randomness);
+    parent.xSleep = Some(context_checking_sleep);
+    parent.xCurrentTime = Some(context_checking_current_time);
+    parent.xGetLastError = Some(context_checking_last_error);
+    parent.xCurrentTimeInt64 = Some(context_checking_current_time_i64);
+    parent.xSetSystemCall = Some(context_checking_set_system_call);
+    parent.xGetSystemCall = Some(context_checking_get_system_call);
+    parent.xNextSystemCall = Some(context_checking_next_system_call);
+    let mut parent_context = 0_u8;
+    parent.pAppData = (&raw mut parent_context).cast();
+    let parent_pointer = &raw mut parent;
+    EXPECTED_PARENT_VFS.store(parent_pointer, Ordering::Release);
+    EXPECTED_PARENT_APP_DATA.store(parent.pAppData, Ordering::Release);
+    PARENT_CONTEXT_CALLS.store(0, Ordering::Release);
+
+    let app = AppData {
+        parent: parent_pointer,
+    };
+    let mut shim = parent;
+    shim.pAppData = std::ptr::from_ref(&app).cast_mut().cast();
+    install_parent_vfs_wrappers(&mut shim, &parent);
+
+    let mut file = std::mem::MaybeUninit::<ZFile>::uninit();
+    assert_eq!(
+        unsafe {
+            shim.xOpen.expect("open")(
+                &raw mut shim,
+                null(),
+                file.as_mut_ptr().cast(),
+                0,
+                null_mut(),
+            )
+        },
+        ffi::SQLITE_CANTOPEN
+    );
+    assert_eq!(
+        unsafe { shim.xDelete.expect("delete")(&raw mut shim, null(), 0) },
+        ffi::SQLITE_OK
+    );
+    assert_eq!(
+        unsafe { shim.xAccess.expect("access")(&raw mut shim, null(), 0, null_mut()) },
+        ffi::SQLITE_OK
+    );
+    assert_eq!(
+        unsafe { shim.xFullPathname.expect("full pathname")(&raw mut shim, null(), 0, null_mut()) },
+        ffi::SQLITE_OK
+    );
+    let handle = unsafe { shim.xDlOpen.expect("dl open")(&raw mut shim, null()) };
+    assert!(!handle.is_null());
+    unsafe { shim.xDlError.expect("dl error")(&raw mut shim, 0, null_mut()) };
+    assert!(unsafe { shim.xDlSym.expect("dl sym")(&raw mut shim, handle, null()) }.is_some());
+    unsafe { shim.xDlClose.expect("dl close")(&raw mut shim, handle) };
+    assert_eq!(
+        unsafe { shim.xRandomness.expect("randomness")(&raw mut shim, 0, null_mut()) },
+        7,
+    );
+    assert_eq!(
+        unsafe { shim.xSleep.expect("sleep")(&raw mut shim, 31) },
+        31
+    );
+    let mut current_time = 0.0;
+    assert_eq!(
+        unsafe { shim.xCurrentTime.expect("current time")(&raw mut shim, &raw mut current_time) },
+        ffi::SQLITE_OK
+    );
+    assert_eq!(current_time.to_bits(), 17.0_f64.to_bits());
+    assert_eq!(
+        unsafe { shim.xGetLastError.expect("last error")(&raw mut shim, 0, null_mut()) },
+        19
+    );
+    let mut current_time_i64 = 0;
+    assert_eq!(
+        unsafe {
+            shim.xCurrentTimeInt64.expect("current time i64")(
+                &raw mut shim,
+                &raw mut current_time_i64,
+            )
+        },
+        ffi::SQLITE_OK
+    );
+    assert_eq!(current_time_i64, 23);
+    assert_eq!(
+        unsafe { shim.xSetSystemCall.expect("set system call")(&raw mut shim, null(), None) },
+        29
+    );
+    assert!(
+        unsafe { shim.xGetSystemCall.expect("get system call")(&raw mut shim, null()) }.is_some()
+    );
+    assert_eq!(
+        unsafe { shim.xNextSystemCall.expect("next system call")(&raw mut shim, null()) },
+        c"next".as_ptr()
+    );
+    assert_eq!(
+        PARENT_CONTEXT_CALLS.load(Ordering::Acquire),
+        ALL_PARENT_CONTEXT_CALLS,
+        "at least one callback did not receive the parent VFS"
+    );
+}
+
+#[test]
+fn advertised_io_version_tracks_each_parent_files_capabilities() {
+    let mut parent = ffi::sqlite3_io_methods {
+        iVersion: 1,
+        xClose: Some(x_close),
+        xRead: Some(x_read),
+        xWrite: Some(x_write),
+        xTruncate: Some(x_truncate),
+        xSync: Some(x_sync),
+        xFileSize: Some(x_file_size),
+        xLock: Some(x_lock),
+        xUnlock: Some(x_unlock),
+        xCheckReservedLock: Some(x_check_reserved_lock),
+        xFileControl: Some(x_file_control),
+        xSectorSize: None,
+        xDeviceCharacteristics: Some(x_device_characteristics),
+        xShmMap: None,
+        xShmLock: None,
+        xShmBarrier: None,
+        xShmUnmap: None,
+        xFetch: None,
+        xUnfetch: None,
+    };
+
+    let methods = io_methods(&parent).expect("valid v1 parent");
+    assert_eq!(methods.iVersion, 1);
+    assert!(methods.xShmMap.is_none());
+    assert!(methods.xFetch.is_none());
+
+    parent.iVersion = 2;
+    parent.xShmMap = Some(x_shm_map);
+    assert_eq!(io_methods(&parent).expect("partial v2 parent").iVersion, 1);
+    parent.xShmLock = Some(x_shm_lock);
+    parent.xShmBarrier = Some(x_shm_barrier);
+    parent.xShmUnmap = Some(x_shm_unmap);
+    let methods = io_methods(&parent).expect("complete v2 parent");
+    assert_eq!(methods.iVersion, 2);
+    assert!(methods.xShmMap.is_some());
+    assert!(methods.xFetch.is_none());
+
+    parent.iVersion = 3;
+    parent.xFetch = Some(x_fetch);
+    assert_eq!(io_methods(&parent).expect("partial v3 parent").iVersion, 2);
+    parent.xUnfetch = Some(x_unfetch);
+    let methods = io_methods(&parent).expect("complete v3 parent");
+    assert_eq!(methods.iVersion, 3);
+    assert!(methods.xFetch.is_some());
+    assert!(methods.xUnfetch.is_some());
+}
+
+#[test]
+fn advertised_vfs_version_and_optional_callbacks_do_not_exceed_the_parent() {
+    // SAFETY: Every field in sqlite3_vfs is an integer, raw pointer, or
+    // nullable function pointer. No callback is invoked in this test.
+    let mut parent: ffi::sqlite3_vfs = unsafe { std::mem::zeroed() };
+    parent.iVersion = 1;
+    parent.xCurrentTimeInt64 = Some(context_checking_current_time_i64);
+    parent.xSetSystemCall = Some(context_checking_set_system_call);
+    parent.xGetSystemCall = Some(context_checking_get_system_call);
+    parent.xNextSystemCall = Some(context_checking_next_system_call);
+    let mut shim = parent;
+    install_parent_vfs_wrappers(&mut shim, &parent);
+    assert_eq!(shim.iVersion, 1);
+    assert!(shim.xCurrentTimeInt64.is_none());
+    assert!(shim.xSetSystemCall.is_none());
+    assert!(shim.xGetSystemCall.is_none());
+    assert!(shim.xNextSystemCall.is_none());
+
+    parent.iVersion = 7;
+    parent.xDlOpen = Some(context_checking_dl_open);
+    let mut shim = parent;
+    install_parent_vfs_wrappers(&mut shim, &parent);
+    assert_eq!(shim.iVersion, 3);
+    assert!(shim.xDlOpen.is_some());
+    assert!(shim.xDlError.is_none());
+    assert!(shim.xCurrentTimeInt64.is_some());
+    assert!(shim.xSetSystemCall.is_some());
+    assert!(shim.xGetSystemCall.is_some());
+    assert!(shim.xNextSystemCall.is_some());
+}
+
+#[test]
+fn registry_open_of_one_database_does_not_block_another() -> Result<(), Box<dyn std::error::Error>>
 {
+    let directory = tempfile::tempdir()?;
+    let slow_path = directory.path().join("slow-open.zsqlite");
+    let fast_path = directory.path().join("fast-open.zsqlite");
+    let (slow_started_tx, slow_started_rx) = mpsc::channel();
+    let (release_slow_tx, release_slow_rx) = mpsc::channel();
+
+    let slow = std::thread::spawn(move || -> Result<(), String> {
+        let (store, _) = get_store_with(&slow_path, true, |key| {
+            slow_started_tx
+                .send(())
+                .map_err(|_| crate::StoreError::Range)?;
+            release_slow_rx
+                .recv()
+                .map_err(|_| crate::StoreError::Range)?;
+            Store::open(key, true)
+        })
+        .map_err(|error| error.to_string())?;
+        drop(store);
+        Ok(())
+    });
+    slow_started_rx.recv_timeout(Duration::from_secs(5))?;
+
+    let (fast_done_tx, fast_done_rx) = mpsc::channel();
+    let fast = std::thread::spawn(move || {
+        let result = get_store(&fast_path, true, true)
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let _ = fast_done_tx.send(result);
+    });
+    fast_done_rx
+        .recv_timeout(Duration::from_secs(5))?
+        .map_err(|error| format!("independent open failed: {error}"))?;
+
+    release_slow_tx.send(())?;
+    slow.join().map_err(|_| "slow open thread panicked")??;
+    fast.join().map_err(|_| "fast open thread panicked")?;
+    Ok(())
+}
+
+#[test]
+fn registry_delete_returns_busy_while_same_path_is_opening()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("opening.zsqlite");
+    let opening_path = canonical_key(&path);
+    let (open_started_tx, open_started_rx) = mpsc::channel();
+    let (release_open_tx, release_open_rx) = mpsc::channel();
+    let opener = std::thread::spawn(move || -> Result<(), String> {
+        get_store_with(&opening_path, true, |key| {
+            open_started_tx
+                .send(())
+                .map_err(|_| crate::StoreError::Range)?;
+            release_open_rx
+                .recv()
+                .map_err(|_| crate::StoreError::Range)?;
+            Store::open(key, true)
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    });
+    open_started_rx.recv_timeout(Duration::from_secs(5))?;
+
+    let delete_called = AtomicBool::new(false);
+    let result = delete_registered_store_with(&path, |_| {
+        delete_called.store(true, Ordering::Release);
+        Ok(((), true))
+    });
+    assert!(matches!(result, Err(crate::StoreError::Busy)));
+    assert!(!delete_called.load(Ordering::Acquire));
+
+    release_open_tx.send(())?;
+    opener.join().map_err(|_| "open thread panicked")??;
+    Ok(())
+}
+
+#[test]
+fn registry_delete_cannot_remove_a_racing_replacement() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("delete-recreate.zsqlite");
+    let key = canonical_key(&path);
+    let original = Arc::new(Mutex::new(Store::open(&key, true)?));
+    let entry = registry_entry(&key)?;
+    *entry.store.lock().map_err(|_| "registry entry poisoned")? = Arc::downgrade(&original);
+    drop(original);
+
+    let delete_path = path.clone();
+    let (deleted_tx, deleted_rx) = mpsc::channel();
+    let (finish_delete_tx, finish_delete_rx) = mpsc::channel();
+    let deleter = std::thread::spawn(move || -> Result<(), String> {
+        delete_registered_store_with(&delete_path, |key| {
+            Store::delete_bundle(key)?;
+            deleted_tx.send(()).map_err(|_| crate::StoreError::Range)?;
+            finish_delete_rx
+                .recv()
+                .map_err(|_| crate::StoreError::Range)?;
+            Ok(((), true))
+        })
+        .map_err(|error| error.to_string())
+    });
+    deleted_rx.recv_timeout(Duration::from_secs(5))?;
+    assert!(!path.exists());
+    assert!(!append_suffix(&path, ".d").exists());
+
+    let recreate_path = path.clone();
+    let (recreate_started_tx, recreate_started_rx) = mpsc::channel();
+    let (recreated_tx, recreated_rx) = mpsc::channel();
+    let recreator = std::thread::spawn(move || {
+        let _ = recreate_started_tx.send(());
+        let result = get_store(&recreate_path, true, true).map_err(|error| error.to_string());
+        let _ = recreated_tx.send(result);
+    });
+    recreate_started_rx.recv_timeout(Duration::from_secs(5))?;
+    assert!(
+        recreated_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+
+    finish_delete_tx.send(())?;
+    deleter.join().map_err(|_| "delete thread panicked")??;
+    let (replacement, newly_opened) = recreated_rx.recv_timeout(Duration::from_secs(5))??;
+    assert!(newly_opened);
+    recreator.join().map_err(|_| "recreate thread panicked")?;
+
+    let (same_replacement, newly_opened) = get_store(&path, true, true)?;
+    assert!(!newly_opened);
+    assert!(Arc::ptr_eq(&replacement, &same_replacement));
+    Ok(())
+}
+
+#[test]
+fn vfs_delete_removes_database_and_sidecar_for_unusual_path()
+-> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("spaces-and-ünicode.zsqlite");
@@ -437,13 +1086,13 @@ fn hard_linked_working_file_is_rejected_without_modification()
              INSERT INTO messages VALUES(1, 'preserve me');",
         )?;
     }
-    let anchor_alias = directory.path().join("anchor-alias");
-    std::fs::hard_link(&path, &anchor_alias)?;
+    let active_alias = directory.path().join("active-alias");
+    std::fs::hard_link(&path, &active_alias)?;
     assert!(matches!(
         Store::open_existing(&path),
         Err(crate::StoreError::Busy)
     ));
-    std::fs::remove_file(anchor_alias)?;
+    std::fs::remove_file(active_alias)?;
 
     let reopened = Connection::open(&path)?;
     assert_eq!(
@@ -514,8 +1163,9 @@ fn rollback_journal_savepoints_vacuum_and_incremental_vacuum()
     let path = directory.path().join("rollback.zsqlite");
     {
         let connection = Connection::open(&path)?;
-        connection.execute(
-            "PRAGMA page_size=8192;
+        connection
+            .execute(
+                "PRAGMA page_size=8192;
              PRAGMA auto_vacuum=INCREMENTAL;
              PRAGMA journal_mode=DELETE;
              CREATE TABLE transcript(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
@@ -534,17 +1184,22 @@ fn rollback_journal_savepoints_vacuum_and_incremental_vacuum()
              BEGIN;
              DELETE FROM transcript WHERE id<=50;
              ROLLBACK;",
-        )?;
+            )
+            .map_err(|error| format!("initial rollback/savepoint workload: {error}"))?;
         assert_eq!(connection.integer("SELECT count(*) FROM transcript")?, 250);
         assert_eq!(
             connection.integer("SELECT count(*) FROM transcript WHERE body LIKE '%discarded%'")?,
             0
         );
-        connection.execute(
-            "DELETE FROM transcript WHERE id%2=0;
-             PRAGMA incremental_vacuum;
-             VACUUM;",
-        )?;
+        connection
+            .execute("DELETE FROM transcript WHERE id%2=0")
+            .map_err(|error| format!("delete before vacuum: {error}"))?;
+        connection
+            .execute("PRAGMA incremental_vacuum")
+            .map_err(|error| format!("incremental vacuum: {error}"))?;
+        connection
+            .execute("VACUUM")
+            .map_err(|error| format!("full vacuum: {error}"))?;
         assert_eq!(connection.integer("PRAGMA page_size")?, 8192);
         assert_integrity(&connection)?;
     }
@@ -2059,7 +2714,7 @@ fn compaction_preserves_the_exact_exported_sqlite_image() -> Result<(), Box<dyn 
     let before = std::fs::read(&before_path)?;
     assert_eq!(before_length, before.len() as u64);
     let compacted = crate::compact(&path)?;
-    assert!(compacted.catalog_generation > 0);
+    assert!(compacted.generation > 0);
     let after_length = crate::export_to_sqlite(&path, &after_path)?;
     let after = std::fs::read(&after_path)?;
     assert_eq!(after_length, after.len() as u64);

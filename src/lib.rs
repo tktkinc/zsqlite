@@ -4,6 +4,8 @@
 
 mod backend;
 pub mod format;
+mod fs;
+mod segment_codec;
 mod store;
 mod vfs;
 
@@ -14,10 +16,12 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::fs::{absolute_path, read_exact_at, sync_parent_dir};
+
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Returns metadata for an existing V5 `.zsqlite` database without modifying it.
+/// Returns metadata for an existing V6 `.zsqlite` database without modifying it.
 pub fn inspect(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
     store::Store::open_existing_read_only(path)?.inspect()
 }
@@ -58,7 +62,7 @@ pub fn configure(path: impl AsRef<Path>, policy: StoragePolicy) -> Result<Inspec
     database.inspect()
 }
 
-/// Converts a closed ordinary `SQLite` database into a distinct V5 zsqlite bundle.
+/// Converts a closed ordinary `SQLite` database into a distinct V6 zsqlite bundle.
 pub fn convert_to_zsqlite(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
@@ -170,7 +174,7 @@ fn conversion_dictionary(
     }
 }
 
-/// Exports a V5 zsqlite database as an ordinary `SQLite` file.
+/// Exports a V6 zsqlite database as an ordinary `SQLite` file.
 pub fn export_to_sqlite(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
@@ -203,8 +207,14 @@ pub fn export_to_sqlite(
         }
     })?;
     sync_parent_dir(&destination)?;
-    std::fs::remove_file(&staging)?;
+
+    // The destination link is now the committed result. Staging cleanup is
+    // post-commit housekeeping and must not turn success into an ambiguous
+    // error while leaving the complete destination in place.
     cleanup.disarm();
+    if std::fs::remove_file(&staging).is_ok() {
+        let _ = sync_parent_dir(&destination);
+    }
     Ok(length)
 }
 
@@ -229,11 +239,33 @@ fn install_staged_bundle(staging: &Path, destination: &Path) -> Result<(), Store
     ensure_bundle_absent(destination)?;
     let staging_paths = bundle_paths(staging);
     let destination_paths = bundle_paths(destination);
+    let file_staging = unused_staging_path(destination, "active")?;
+    let mut file_cleanup = CleanupPaths::new(vec![file_staging.clone()]);
     let mut installed = CleanupPaths::new(Vec::new());
-    std::fs::rename(&staging_paths[1], &destination_paths[1])?;
-    installed.paths.push(destination_paths[1].clone());
-    sync_parent_dir(destination)?;
-    std::fs::hard_link(&staging_paths[0], &destination_paths[0]).map_err(|error| {
+
+    // Build a separately allocated, durable copy before publishing its name.
+    // A direct hard link from the staging bundle would leave the installed
+    // database aliased if the process died before staging cleanup. Store opens
+    // reject aliased mutable active files because two names can otherwise
+    // acquire different sidecar locks for the same inode.
+    let mut source_file = File::open(&staging_paths[0])?;
+    let expected = source_file.metadata()?.len();
+    let mut copied_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&file_staging)?;
+    let copied = std::io::copy(&mut source_file, &mut copied_file)?;
+    if copied != expected {
+        return Err(std::io::Error::from(ErrorKind::UnexpectedEof).into());
+    }
+    copied_file.sync_all()?;
+    drop(copied_file);
+
+    // Publish the complete recognizable active file first. Until the sidecar
+    // arrives, a racing VFS open fails closed; it cannot create a new database
+    // inside a sidecar directory that this installer is about to replace.
+    std::fs::hard_link(&file_staging, &destination_paths[0]).map_err(|error| {
         if error.kind() == ErrorKind::AlreadyExists {
             StoreError::DestinationExists(destination.to_path_buf())
         } else {
@@ -242,8 +274,31 @@ fn install_staged_bundle(staging: &Path, destination: &Path) -> Result<(), Store
     })?;
     installed.paths.push(destination_paths[0].clone());
     sync_parent_dir(destination)?;
-    std::fs::remove_file(&staging_paths[0])?;
+
+    // Remove the publication helper before making the sidecar visible. Thus a
+    // complete installed bundle never has an aliased active file, even if the
+    // process dies before the original conversion staging bundle is cleaned.
+    std::fs::remove_file(&file_staging)?;
+    file_cleanup.disarm();
+    sync_parent_dir(destination)?;
+
+    std::fs::rename(&staging_paths[1], &destination_paths[1])?;
+    installed.paths.push(destination_paths[1].clone());
+
+    // Both components are now visible and a racing process may have opened
+    // the bundle. Never tear this pair back down through the cleanup guard,
+    // even if the directory sync reports an error: that outcome is ambiguous,
+    // but deleting beneath the racing opener could lose later writes.
     installed.disarm();
+    sync_parent_dir(destination)?;
+
+    // The destination became durable at the preceding directory sync. A
+    // failure to remove the now-unreferenced staging file must not turn a
+    // successful install into an ambiguous error or tear the destination back
+    // down through `installed`'s cleanup guard.
+    if std::fs::remove_file(&staging_paths[0]).is_ok() {
+        let _ = sync_parent_dir(destination);
+    }
     Ok(())
 }
 
@@ -280,38 +335,6 @@ fn unused_staging_path(destination: &Path, purpose: &str) -> Result<PathBuf, Sto
     Err(StoreError::Range)
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf, std::io::Error> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(path))
-    }
-}
-
-#[cfg(unix)]
-fn read_exact_at(file: &File, mut offset: u64, mut output: &mut [u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    while !output.is_empty() {
-        let amount = match file.read_at(output, offset) {
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            result => result?,
-        };
-        if amount == 0 {
-            return Err(std::io::Error::from(ErrorKind::UnexpectedEof));
-        }
-        offset = offset
-            .checked_add(amount as u64)
-            .ok_or_else(|| std::io::Error::from(ErrorKind::InvalidInput))?;
-        output = &mut output[amount..];
-    }
-    Ok(())
-}
-
-fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
-    File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
-    Ok(())
-}
-
 struct CleanupPaths {
     paths: Vec<PathBuf>,
 }
@@ -327,7 +350,10 @@ impl CleanupPaths {
 
 impl Drop for CleanupPaths {
     fn drop(&mut self) {
-        for path in &self.paths {
+        // Bundle paths are registered active file first and sidecar second.
+        // Remove in reverse so a recognizable file remains as a fail-closed guard
+        // until its associated storage is gone.
+        for path in self.paths.iter().rev() {
             if path.is_dir() {
                 let _ = std::fs::remove_dir_all(path);
             } else {

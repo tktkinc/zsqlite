@@ -619,14 +619,12 @@ mod benchmark {
         }
         let (segment_bytes, segments) = if engine == Engine::Zsqlite {
             let info = zsqlite::inspect(path)?;
-            logical = logical
-                .saturating_add(info.segment_bytes)
-                .saturating_add(info.active_bytes);
-            allocated = allocated
-                .saturating_add(info.segment_allocated_bytes)
-                .saturating_add(info.active_allocated_bytes);
+            // The ordinary path walk already counted the active `.zsqlite`
+            // file. Only sealed segment files live in the sidecar.
+            logical = logical.saturating_add(info.segment_bytes);
+            allocated = allocated.saturating_add(info.segment_allocated_bytes);
             (
-                info.segment_bytes.saturating_add(info.active_bytes),
+                info.segment_bytes.saturating_add(info.file_bytes),
                 u64::try_from(info.sealed_segments)? + u64::from(info.active),
             )
         } else {

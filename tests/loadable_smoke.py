@@ -52,14 +52,15 @@ def main() -> None:
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         connection.close()
 
-        anchor = database.read_bytes()
-        assert len(anchor) == 12_288 and anchor.startswith(b"ZSQLSG05")
+        active = database.read_bytes()
+        assert len(active) >= 4_096 and active.startswith(b"ZSQLSE06")
         sidecar = Path(f"{database}.d")
         assert sidecar.is_dir()
-        assert any((sidecar / "roots").glob("*.zroot"))
-        assert any((sidecar / "active").glob("*.zactive"))
+        assert not (sidecar / "roots").exists()
+        assert not (sidecar / "active").exists()
         assert (sidecar / "locks" / "lifecycle.lock").is_file()
         assert (sidecar / "locks" / "publication.lock").is_file()
+        assert (sidecar / "locks" / "sqlite.lock").is_file()
 
         reopened = sqlite3.connect(uri, uri=True)
         assert reopened.execute("PRAGMA page_size").fetchone() == (8192,)
@@ -80,7 +81,7 @@ def main() -> None:
                 stdout=subprocess.PIPE,
             )
             assert "page_size: 8192" in result.stdout
-            assert "format: V5 ltx-style-segments" in result.stdout
+            assert "format: V6 active-segment" in result.stdout
 
             exported = Path(directory) / "exported.db"
             subprocess.run([args.cli, "export", database, exported], check=True)
