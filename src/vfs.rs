@@ -411,14 +411,26 @@ unsafe extern "C" fn x_open(
             if name.is_null() {
                 return ffi::SQLITE_CANTOPEN;
             }
-            let path = path_from_name(name);
+            let path = crate::facade::vfs_storage_path(&path_from_name(name));
             let managed = path.extension().and_then(|value| value.to_str()) == Some("zsqlite");
             if managed {
                 let create = flags & ffi::SQLITE_OPEN_CREATE != 0;
+                let storage_existed = path.exists();
+                if !storage_existed
+                    && crate::facade::notice_path(&path).is_some_and(|notice| notice.exists())
+                {
+                    return ffi::SQLITE_CANTOPEN;
+                }
+                if let Err(error) = crate::facade::validate_notice(&path) {
+                    return sqlite_result(&error);
+                }
                 let opened = match get_store(&path, create, !requested_read_only) {
                     Ok((opened, _newly_opened)) => opened,
                     Err(error) => return sqlite_result(&error),
                 };
+                if !requested_read_only && let Err(error) = crate::facade::ensure_notice(&path) {
+                    return sqlite_result(&error);
+                }
                 let lock_path = match opened.lock() {
                     Ok(store) => store.sqlite_lock_path(),
                     Err(_) => return ffi::SQLITE_IOERR,
@@ -1401,22 +1413,32 @@ unsafe extern "C" fn x_delete(
         let Some(app) = app_data(vfs) else {
             return ffi::SQLITE_INTERNAL;
         };
+        let Ok(mapped) = mapped_storage_name(name) else {
+            return ffi::SQLITE_CANTOPEN;
+        };
+        let parent_name = mapped.as_ref().map_or(name, |path| path.as_ptr());
         if !name.is_null() {
-            let path = path_from_name(name);
+            let path = crate::facade::vfs_storage_path(&path_from_name(name));
             if path.extension().and_then(|value| value.to_str()) == Some("zsqlite") {
+                if let Err(error) = crate::facade::validate_notice(&path) {
+                    return sqlite_result(&error);
+                }
                 // Keep the same-path registry gate through both managed
                 // bundle deletion and the parent-VFS fallback. Releasing it
                 // between the two would let a racing xOpen create a new
                 // database file which this xDelete then removes.
                 match delete_registered_store_with(&path, |key| match Store::delete_bundle(key) {
-                    Ok(()) => Ok((ffi::SQLITE_OK, true)),
+                    Ok(()) => {
+                        crate::facade::delete_notice(key)?;
+                        Ok((ffi::SQLITE_OK, true))
+                    }
                     Err(crate::StoreError::NotZsqlite) => {
                         let rc = app
                             .parent
                             .as_ref()
                             .and_then(|parent| parent.xDelete)
                             .map_or(ffi::SQLITE_IOERR_DELETE, |delete| {
-                                delete(app.parent, name, sync_dir)
+                                delete(app.parent, parent_name, sync_dir)
                             });
                         Ok((rc, rc == ffi::SQLITE_OK))
                     }
@@ -1431,7 +1453,7 @@ unsafe extern "C" fn x_delete(
             .as_ref()
             .and_then(|parent| parent.xDelete)
             .map_or(ffi::SQLITE_IOERR_DELETE, |delete| {
-                delete(app.parent, name, sync_dir)
+                delete(app.parent, parent_name, sync_dir)
             })
     })
 }
@@ -1446,6 +1468,10 @@ unsafe extern "C" fn x_access(
         let Some(app) = app_data(vfs) else {
             return ffi::SQLITE_INTERNAL;
         };
+        let Ok(mapped) = mapped_storage_name(name) else {
+            return ffi::SQLITE_CANTOPEN;
+        };
+        let name = mapped.as_ref().map_or(name, |path| path.as_ptr());
         app.parent
             .as_ref()
             .and_then(|parent| parent.xAccess)
@@ -1465,6 +1491,10 @@ unsafe extern "C" fn x_full_pathname(
         let Some(app) = app_data(vfs) else {
             return ffi::SQLITE_INTERNAL;
         };
+        let Ok(mapped) = mapped_storage_name(name) else {
+            return ffi::SQLITE_CANTOPEN;
+        };
+        let name = mapped.as_ref().map_or(name, |path| path.as_ptr());
         app.parent
             .as_ref()
             .and_then(|parent| parent.xFullPathname)
@@ -1636,6 +1666,19 @@ fn path_from_name(name: *const c_char) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(bytes))
 }
 
+fn mapped_storage_name(name: *const c_char) -> Result<Option<CString>, ()> {
+    if name.is_null() {
+        return Ok(None);
+    }
+    let input = path_from_name(name);
+    let storage = crate::facade::vfs_storage_path(&input);
+    if storage == input {
+        Ok(None)
+    } else {
+        path_to_c_string(&storage).map(Some)
+    }
+}
+
 fn io_methods(parent: &ffi::sqlite3_io_methods) -> Option<ffi::sqlite3_io_methods> {
     if parent.iVersion < 1
         || parent.xClose.is_none()
@@ -1791,6 +1834,7 @@ unsafe fn register_vfs() -> c_int {
         Ok(size) => size,
         Err(_) => return ffi::SQLITE_ERROR,
     };
+    shim.mxPathname = parent_ref.mxPathname.saturating_add(8);
     let app = Box::new(AppData { parent });
     let app_ptr = Box::into_raw(app);
     shim.pNext = null_mut();

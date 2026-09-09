@@ -3,6 +3,7 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 mod backend;
+mod facade;
 pub mod format;
 mod fs;
 mod segment_codec;
@@ -21,14 +22,16 @@ use crate::fs::{absolute_path, read_exact_at, sync_parent_dir};
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Returns metadata for an existing V6 `.zsqlite` database without modifying it.
+/// Returns metadata for an existing V6 database without modifying it.
+/// A logical `name.db` resolves to `name.db.zsqlite`; direct `.zsqlite` paths
+/// remain supported.
 pub fn inspect(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
-    store::Store::open_existing_read_only(path)?.inspect()
+    store::Store::open_existing_read_only(database_storage_path(path.as_ref())?)?.inspect()
 }
 
 /// Verifies every referenced segment, page frame, and the `SQLite` header.
 pub fn verify(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
-    let path = absolute_path(path.as_ref())?;
+    let path = database_storage_path(path.as_ref())?;
     store::reject_auxiliary_files(&path)?;
     let mut database = store::Store::open_existing_read_only(&path)?;
     database.verify()?;
@@ -37,7 +40,7 @@ pub fn verify(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
 
 /// Seals the current active segment, if any.
 pub fn flush(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
-    let mut database = store::Store::open_existing(path)?;
+    let mut database = store::Store::open_existing(database_storage_path(path.as_ref())?)?;
     database.acquire_maintenance()?;
     let result = database.flush_sidecars();
     database.release_maintenance();
@@ -47,14 +50,14 @@ pub fn flush(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
 
 /// Replaces all sealed segments with one endpoint-equivalent checkpoint segment.
 pub fn compact(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
-    let mut database = store::Store::open_existing(path)?;
+    let mut database = store::Store::open_existing(database_storage_path(path.as_ref())?)?;
     database.compact()?;
     database.inspect()
 }
 
 /// Replaces the persisted maintenance and adaptive dictionary policy.
 pub fn configure(path: impl AsRef<Path>, policy: StoragePolicy) -> Result<Inspect, StoreError> {
-    let mut database = store::Store::open_existing(path)?;
+    let mut database = store::Store::open_existing(database_storage_path(path.as_ref())?)?;
     database.acquire_maintenance()?;
     let result = database.set_storage_policy(policy);
     database.release_maintenance();
@@ -63,13 +66,19 @@ pub fn configure(path: impl AsRef<Path>, policy: StoragePolicy) -> Result<Inspec
 }
 
 /// Converts a closed ordinary `SQLite` database into a distinct V6 zsqlite bundle.
+/// A `.db` destination gets a read-only notice at that path and stores the
+/// active segment at the corresponding `.db.zsqlite` path.
 pub fn convert_to_zsqlite(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
 ) -> Result<Inspect, StoreError> {
     let source = absolute_path(source.as_ref())?;
-    let destination = absolute_path(destination.as_ref())?;
+    let logical_destination = absolute_path(destination.as_ref())?;
+    let destination = facade::storage_path(&logical_destination);
     store::reject_auxiliary_files(&source)?;
+    if destination != logical_destination && logical_destination.exists() {
+        return Err(StoreError::DestinationExists(logical_destination));
+    }
     ensure_bundle_absent(&destination)?;
 
     let input = File::open(&source)?;
@@ -110,6 +119,7 @@ pub fn convert_to_zsqlite(
     store::reject_auxiliary_files(&source)?;
     install_staged_bundle(&staging, &destination)?;
     cleanup.disarm();
+    facade::ensure_notice(&destination)?;
     let mut installed = store::Store::open_existing(&destination)?;
     installed.verify()?;
     installed.inspect()
@@ -179,7 +189,7 @@ pub fn export_to_sqlite(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
 ) -> Result<u64, StoreError> {
-    let source = absolute_path(source.as_ref())?;
+    let source = database_storage_path(source.as_ref())?;
     let destination = absolute_path(destination.as_ref())?;
     store::reject_auxiliary_files(&source)?;
     if destination.exists() {
@@ -233,6 +243,12 @@ fn sqlite_page_size(header: &[u8; 100]) -> Option<u32> {
         u32::from(encoded)
     };
     format::valid_page_size(page_size).then_some(page_size)
+}
+
+fn database_storage_path(path: &Path) -> Result<PathBuf, StoreError> {
+    let storage = facade::storage_path(&absolute_path(path)?);
+    facade::validate_notice(&storage)?;
+    Ok(storage)
 }
 
 fn install_staged_bundle(staging: &Path, destination: &Path) -> Result<(), StoreError> {
@@ -384,11 +400,14 @@ mod tests {
     fn conversion_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let source = directory.path().join("source.db");
-        let destination = directory.path().join("destination.zsqlite");
+        let destination = directory.path().join("destination.db");
+        let storage = facade::storage_path(&destination);
         let output = directory.path().join("output.db");
         std::fs::write(&source, sqlite_page(4))?;
         convert_to_zsqlite(&source, &destination)?;
         export_to_sqlite(&destination, &output)?;
+        assert_eq!(&std::fs::read(&destination)?[..16], SQLITE_MAGIC);
+        assert_eq!(&std::fs::read(&storage)?[..8], format::SEGMENT_MAGIC);
         assert_eq!(std::fs::read(source)?, std::fs::read(output)?);
         Ok(())
     }

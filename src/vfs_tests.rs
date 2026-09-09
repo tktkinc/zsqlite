@@ -508,6 +508,95 @@ fn all_authenticated_storage_corruption_maps_to_sqlite_ioerr_data() {
 }
 
 #[test]
+fn db_facade_is_a_read_only_native_notice() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    register()?;
+    let logical = directory.path().join("application.db");
+    let storage = append_suffix(&logical, ".zsqlite");
+    let storage_wal = append_suffix(&storage, "-wal");
+    let native_wal = append_suffix(&logical, "-wal");
+
+    let writer = Connection::open(&logical)?;
+    assert_eq!(writer.text("PRAGMA journal_mode=WAL")?, "wal");
+    writer.execute(
+        "CREATE TABLE actual_data(value TEXT NOT NULL);
+         INSERT INTO actual_data VALUES('stored by zsqlite');",
+    )?;
+
+    assert_eq!(std::fs::read(&storage)?[..8], *b"ZSQLSE06");
+    assert_eq!(std::fs::metadata(&logical)?.len(), 4096);
+    assert!(storage_wal.exists());
+    assert!(!native_wal.exists());
+
+    let native = Connection::open_native(&logical)?;
+    assert_eq!(
+        native.text("SELECT message FROM zsqlite_extension_required")?,
+        "This database uses zsqlite storage. Load the zsqlite extension and reopen with vfs=zsqlite."
+    );
+    assert_integrity(&native)?;
+    let Err((write_rc, write_error)) =
+        native.execute_with_code("CREATE TABLE accidental_write(value)")
+    else {
+        return Err("the native notice database accepted a write".into());
+    };
+    assert_eq!(write_rc & 0xff, ffi::SQLITE_READONLY, "{write_error}");
+    assert!(
+        native
+            .execute_with_code("SELECT * FROM actual_data")
+            .is_err(),
+        "the native notice exposed the real schema"
+    );
+    assert_eq!(
+        writer.text("SELECT value FROM actual_data")?,
+        "stored by zsqlite"
+    );
+    Ok(())
+}
+
+#[test]
+fn db_facade_never_overwrites_an_existing_native_database() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    register()?;
+    let logical = directory.path().join("existing.db");
+    let native = Connection::open_native(&logical)?;
+    native.execute("CREATE TABLE native_data(value)")?;
+    drop(native);
+
+    let Err(error) = Connection::open(&logical) else {
+        return Err("zsqlite replaced a native database".into());
+    };
+    assert!(
+        error.contains("SQLite error 14"),
+        "unexpected error: {error}"
+    );
+    assert!(!append_suffix(&logical, ".zsqlite").exists());
+    let native = Connection::open_native(&logical)?;
+    assert_eq!(native.integer("SELECT count(*) FROM native_data")?, 0);
+    Ok(())
+}
+
+#[test]
+fn deleting_a_logical_db_removes_its_notice_and_bundle() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    register()?;
+    let logical = directory.path().join("delete.db");
+    let storage = append_suffix(&logical, ".zsqlite");
+    let sidecar = append_suffix(&storage, ".d");
+    Connection::open(&logical)?.execute("CREATE TABLE payload(value)")?;
+
+    let vfs = unsafe { ffi::sqlite3_vfs_find(VFS_NAME.as_ptr().cast()) };
+    let vfs = unsafe { vfs.as_mut() }.ok_or("zsqlite VFS is not registered")?;
+    let encoded = CString::new(logical.as_os_str().as_bytes())?;
+    let rc = unsafe { vfs.xDelete.expect("xDelete")(&raw mut *vfs, encoded.as_ptr(), 1) };
+    assert_eq!(rc, ffi::SQLITE_OK);
+    assert!(!logical.exists());
+    assert!(!storage.exists());
+    assert!(!sidecar.exists());
+    Ok(())
+}
+
+#[test]
 fn wal_database_round_trip_through_vfs() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     register()?;
@@ -2589,12 +2678,11 @@ fn transactions_and_wal_checkpoints_larger_than_pending_memory_commit_or_rollbac
 }
 
 #[test]
-fn ordinary_sqlite_databases_pass_through_without_adoption()
--> Result<(), Box<dyn std::error::Error>> {
+fn non_db_sqlite_paths_pass_through_without_adoption() -> Result<(), Box<dyn std::error::Error>> {
     register()?;
     let directory = tempfile::tempdir()?;
     for page_size in [512_u32, 8192, 65_536] {
-        let path = directory.path().join(format!("native-{page_size}.db"));
+        let path = directory.path().join(format!("native-{page_size}.sqlite"));
         {
             let native = Connection::open_native(&path)?;
             native.execute(&format!(

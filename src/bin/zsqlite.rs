@@ -102,5 +102,5 @@ fn parse_args() -> Result<Command, String> {
 }
 
 fn usage() -> String {
-    "usage: zsqlite <inspect|verify|flush|compact> <database.zsqlite>\n       zsqlite convert <sqlite-database> <database.zsqlite>\n       zsqlite export <database.zsqlite> <sqlite-database>".into()
+    "usage: zsqlite <inspect|verify|flush|compact> <database.db>\n       zsqlite convert <sqlite-database> <database.db>\n       zsqlite export <database.db> <sqlite-database>".into()
 }

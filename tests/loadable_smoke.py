@@ -20,7 +20,8 @@ def main() -> None:
         raise FileNotFoundError(extension)
 
     with tempfile.TemporaryDirectory(prefix="zsqlite-loadable-") as directory:
-        database = Path(directory) / "host.zsqlite"
+        database = Path(directory) / "host.db"
+        storage = Path(f"{database}.zsqlite")
         bootstrap = sqlite3.connect(":memory:")
         bootstrap.enable_load_extension(True)
         bootstrap.execute(
@@ -49,12 +50,23 @@ def main() -> None:
         connection.commit()
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert connection.execute("SELECT count(*) FROM transcript").fetchone() == (300,)
+        assert Path(f"{storage}-wal").is_file()
+        assert not Path(f"{database}-wal").exists()
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         connection.close()
 
-        active = database.read_bytes()
+        notice = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
+        assert notice.execute(
+            "SELECT message FROM zsqlite_extension_required"
+        ).fetchone() == (
+            "This database uses zsqlite storage. Load the zsqlite extension and reopen with vfs=zsqlite.",
+        )
+        notice.close()
+
+        active = storage.read_bytes()
         assert len(active) >= 4_096 and active.startswith(b"ZSQLSE06")
-        sidecar = Path(f"{database}.d")
+        assert database.read_bytes().startswith(b"SQLite format 3\x00")
+        sidecar = Path(f"{storage}.d")
         assert sidecar.is_dir()
         assert not (sidecar / "roots").exists()
         assert not (sidecar / "active").exists()

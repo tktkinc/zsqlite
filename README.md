@@ -9,12 +9,14 @@ zsqlite formats.
 
 ## Storage model
 
-A database is an append-only active segment and a sibling directory of sealed
-predecessors:
+A logical `.db` name is a small ordinary SQLite notice database. Selecting the
+`zsqlite` VFS maps that name to an append-only active segment and a sibling
+directory of sealed predecessors:
 
 ```text
-database.zsqlite
-database.zsqlite.d/
+database.db                           read-only SQLite notice
+database.db.zsqlite                   mutable active segment
+database.db.zsqlite.d/
   segments/
     <start-txid>-<end-txid>-<history>-<physical>.zseg
   locks/
@@ -23,14 +25,25 @@ database.zsqlite.d/
     sqlite.lock
 ```
 
-The `.zsqlite` file is the active segment. Its immutable header contains the
+Without the VFS, `sqlite3 database.db` can read the
+`zsqlite_extension_required` view, which explains how to reopen the database.
+The notice is made read-only to reject accidental native writes. With the VFS,
+`file:database.db?vfs=zsqlite` opens `database.db.zsqlite`; SQLite derives its
+journal and WAL paths from that storage name, so native notice-file recovery
+state cannot collide with the real database. An existing ordinary
+`database.db` is never overwritten or implicitly converted.
+
+Direct `.zsqlite` paths remain supported for existing bundles and low-level
+maintenance, but they do not create a separate notice database.
+
+The `.db.zsqlite` file is the active segment. Its immutable header contains the
 database identity and the physical digest of its immediate sealed predecessor.
 Opening follows that digest chain through `segments/`; unrelated files are not
 authoritative. Transactions are recovered by scanning the active file to its
 last complete, checksummed commit record.
 
 The host VFS uses `sqlite.lock` as the native SQLite byte-lock and WAL-SHM
-carrier. It deliberately does not use the `.zsqlite` inode for SQLite byte
+carrier. It deliberately does not use the active segment inode for SQLite byte
 locks: on POSIX, closing any independently opened database descriptor could otherwise release a
 live connection's process-owned `fcntl` locks.
 
@@ -51,15 +64,10 @@ Fixed-width hexadecimal TXID prefixes preserve LTX-style lexical range order.
 The ending history hash remains unchanged by compaction; only the physical
 digest changes.
 
-The detailed format and design invariants are in
-[`ltx-style-segments.md`](ltx-style-segments.md).
-The current durability, recovery, and concurrency review is in
-[`correctness-audit.md`](correctness-audit.md).
-
 ## Commit and durability behavior
 
 `xWrite` appends the resulting bytes of each affected SQLite page to the active
-`.zsqlite` segment. Repeated writes to the same page before publication may
+`.db.zsqlite` segment. Repeated writes to the same page before publication may
 reuse that transaction's uncommitted frame; otherwise they append a replacement
 and mark the earlier uncommitted frame free. A publication writes one
 sector-aligned commit body and writes its checksummed header last. The valid commit record is the
@@ -101,10 +109,10 @@ later compaction omit dead versions from the live index; whole obsolete files
 become collectible after neither the active lineage nor any reader generation needs them.
 Recovery truncates an uncommitted tail only while holding the publication lock.
 
-At rollover, zsqlite seals and syncs the current `.zsqlite`, hardlinks that
+At rollover, zsqlite seals and syncs the current `.db.zsqlite`, hardlinks that
 inode into `segments/`, syncs the segment directory, writes and syncs a fresh
 active segment that names the sealed digest, atomically renames it over
-`.zsqlite`, and syncs the parent directory. Existing readers keep a valid old
+`.db.zsqlite`, and syncs the parent directory. Existing readers keep a valid old
 inode and reopen the new active generation at the next transaction boundary.
 
 ## Dictionaries and compaction
@@ -126,23 +134,23 @@ dictionary selectors, and publishes a new snapshot segment beginning at TXID
 ## Rust API
 
 ```rust,no_run
-let info = zsqlite::inspect("app.zsqlite")?;
-zsqlite::verify("app.zsqlite")?;
-zsqlite::flush("app.zsqlite")?;
-zsqlite::compact("app.zsqlite")?;
+let info = zsqlite::inspect("app.db")?;
+zsqlite::verify("app.db")?;
+zsqlite::flush("app.db")?;
+zsqlite::compact("app.db")?;
 
-zsqlite::convert_to_zsqlite("app.db", "app.zsqlite")?;
-zsqlite::export_to_sqlite("app.zsqlite", "restored.db")?;
+zsqlite::convert_to_zsqlite("legacy.db", "app.db")?;
+zsqlite::export_to_sqlite("app.db", "restored.db")?;
 
 # Ok::<(), zsqlite::StoreError>(())
 ```
 
 A raw bundle copy is not a SQLite online backup. In WAL mode, acknowledged SQL
-transactions can exist only in the host `-wal` file while the `.zsqlite` active
+transactions can exist only in the host `-wal` file while the `.db.zsqlite` active
 still names an older main image. Copy a closed or coordinately checkpointed
-database, or use SQLite's online-backup protocol. The `.zsqlite` file and its
-sidecar directory must be captured from one pinned point in time; copying only
-one of them is not sufficient.
+database, or use SQLite's online-backup protocol. The notice, active segment,
+sidecar directory, and any live SQLite auxiliary files must be captured from
+one pinned point in time; `database.db` by itself contains no application data.
 
 `configure()` persists settle, maximum-staleness, and adaptive dictionary
 policy. Defaults are a 5 minute settle interval, 1 hour maximum active age,
@@ -152,12 +160,12 @@ policy. Defaults are a 5 minute settle interval, 1 hour maximum active age,
 ## CLI
 
 ```text
-zsqlite inspect database.zsqlite
-zsqlite verify database.zsqlite
-zsqlite flush database.zsqlite
-zsqlite compact database.zsqlite
-zsqlite convert database.db database.zsqlite
-zsqlite export database.zsqlite database.db
+zsqlite inspect database.db
+zsqlite verify database.db
+zsqlite flush database.db
+zsqlite compact database.db
+zsqlite convert legacy.db database.db
+zsqlite export database.db restored.db
 ```
 
 ## Performance checks
