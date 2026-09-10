@@ -55,7 +55,7 @@ pub fn compact(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
     database.inspect()
 }
 
-/// Replaces the persisted maintenance and adaptive dictionary policy.
+/// Replaces the persisted maintenance and dictionary sizing policy.
 pub fn configure(path: impl AsRef<Path>, policy: StoragePolicy) -> Result<Inspect, StoreError> {
     let mut database = store::Store::open_existing(database_storage_path(path.as_ref())?)?;
     database.acquire_maintenance()?;
@@ -94,9 +94,6 @@ pub fn convert_to_zsqlite(
     let staging = unused_staging_path(&destination, "convert")?;
     let mut cleanup = CleanupPaths::new(bundle_paths(&staging).to_vec());
     let mut converted = store::Store::open(&staging, true)?;
-    if let Some(dictionary) = conversion_dictionary(&input, length, page_size)? {
-        converted.install_initial_dictionary(dictionary)?;
-    }
     let mut page = vec![0; page_size as usize];
     let mut offset = 0_u64;
     while offset < length {
@@ -123,65 +120,6 @@ pub fn convert_to_zsqlite(
     let mut installed = store::Store::open_existing(&destination)?;
     installed.verify()?;
     installed.inspect()
-}
-
-fn conversion_dictionary(
-    input: &File,
-    length: u64,
-    page_size: u32,
-) -> Result<Option<Vec<u8>>, StoreError> {
-    const MAX_SAMPLES: usize = 8192;
-    const SAMPLE_BYTES: usize = 32 * 1024 * 1024;
-    const DICTIONARY_BYTES: usize = 64 * 1024;
-    const MIN_PAGES: usize = 256;
-    let page_count =
-        usize::try_from(length / u64::from(page_size)).map_err(|_| StoreError::Range)?;
-    let sample_count = page_count
-        .min(MAX_SAMPLES)
-        .min(SAMPLE_BYTES / page_size as usize);
-    if sample_count < MIN_PAGES || sample_count.saturating_mul(page_size as usize) < 1024 * 1024 {
-        return Ok(None);
-    }
-    let mut samples = Vec::with_capacity(sample_count);
-    for sample in 0..sample_count {
-        let page = sample
-            .checked_mul(page_count.saturating_sub(1))
-            .ok_or(StoreError::Range)?
-            / sample_count.saturating_sub(1).max(1);
-        let mut bytes = vec![0; page_size as usize];
-        read_exact_at(
-            input,
-            u64::try_from(page)
-                .map_err(|_| StoreError::Range)?
-                .checked_mul(u64::from(page_size))
-                .ok_or(StoreError::Range)?,
-            &mut bytes,
-        )?;
-        samples.push(bytes);
-    }
-    let split = samples.len() * 4 / 5;
-    let training = samples[..split]
-        .iter()
-        .map(Vec::as_slice)
-        .collect::<Vec<_>>();
-    let dictionary = zstd::dict::from_samples(&training, DICTIONARY_BYTES)
-        .map_err(|error| StoreError::Zstd(error.to_string()))?;
-    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &dictionary)
-        .map_err(|error| StoreError::Zstd(error.to_string()))?;
-    let raw_bytes = samples[split..].iter().map(Vec::len).sum::<usize>();
-    let compressed_bytes = samples[split..].iter().try_fold(0_usize, |total, page| {
-        let encoded = compressor
-            .compress(page)
-            .map_err(|error| StoreError::Zstd(error.to_string()))?;
-        total.checked_add(encoded.len()).ok_or(StoreError::Range)
-    })?;
-    let savings = raw_bytes.saturating_sub(compressed_bytes);
-    if savings > dictionary.len() && savings.saturating_mul(10_000) >= raw_bytes.saturating_mul(500)
-    {
-        Ok(Some(dictionary))
-    } else {
-        Ok(None)
-    }
 }
 
 /// Exports a V6 zsqlite database as an ordinary `SQLite` file.

@@ -79,21 +79,17 @@ pub enum StoreError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DictionaryPolicy {
+    /// Maximum size of the one dictionary trained for future writes.
     pub dictionary_bytes: u32,
+    /// Maximum memory retained from committed write buffers for training.
     pub sample_bytes: u64,
-    pub min_improvement_bps: u16,
-    pub retrain_churn_bps: u16,
-    pub promotion_cooldown: Duration,
 }
 
 impl Default for DictionaryPolicy {
     fn default() -> Self {
         Self {
             dictionary_bytes: 64 * 1024,
-            sample_bytes: 32 * 1024 * 1024,
-            min_improvement_bps: 500,
-            retrain_churn_bps: 2_500,
-            promotion_cooldown: Duration::from_secs(24 * 60 * 60),
+            sample_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -127,9 +123,11 @@ impl StoragePolicy {
             dictionary: DictionaryPolicyRecord {
                 dictionary_bytes: self.dictionary.dictionary_bytes,
                 sample_bytes: self.dictionary.sample_bytes,
-                min_improvement_bps: self.dictionary.min_improvement_bps,
-                retrain_churn_bps: self.dictionary.retrain_churn_bps,
-                promotion_cooldown_seconds: seconds(self.dictionary.promotion_cooldown)?,
+                // These fields remain encoded in V6 but are reserved by the
+                // forward-only dictionary policy.
+                min_improvement_bps: 500,
+                retrain_churn_bps: 2_500,
+                promotion_cooldown_seconds: 24 * 60 * 60,
             },
         };
         validate_policy(record)?;
@@ -143,11 +141,6 @@ impl StoragePolicy {
             dictionary: DictionaryPolicy {
                 dictionary_bytes: value.dictionary.dictionary_bytes,
                 sample_bytes: value.dictionary.sample_bytes,
-                min_improvement_bps: value.dictionary.min_improvement_bps,
-                retrain_churn_bps: value.dictionary.retrain_churn_bps,
-                promotion_cooldown: Duration::from_secs(u64::from(
-                    value.dictionary.promotion_cooldown_seconds,
-                )),
             },
         }
     }
@@ -297,6 +290,10 @@ impl PageCache {
     }
 
     fn insert(&mut self, key: PageCacheKey, value: Vec<u8>) {
+        self.insert_shared(key, Arc::new(value));
+    }
+
+    fn insert_shared(&mut self, key: PageCacheKey, value: Arc<Vec<u8>>) {
         if let Some(position) = self
             .entries
             .iter()
@@ -305,7 +302,6 @@ impl PageCache {
         {
             self.bytes = self.bytes.saturating_sub(old.len());
         }
-        let value = Arc::new(value);
         self.bytes = self.bytes.saturating_add(value.len());
         self.entries.push_front((key, value));
         while self.bytes > self.capacity && self.entries.len() > 1 {
@@ -323,29 +319,82 @@ impl PageCache {
 
 #[derive(Debug, Default)]
 struct DictionaryTrainer {
-    pages: BTreeMap<u32, Vec<u8>>,
-    order: VecDeque<u32>,
+    pages: BTreeMap<u32, Arc<Vec<u8>>>,
+    pending: BTreeMap<u32, Arc<Vec<u8>>>,
     bytes: usize,
-    changed_pages: BTreeSet<u32>,
+    pending_bytes: usize,
+    attempted: bool,
+    candidate: Option<Vec<u8>>,
+}
+
+pub(crate) struct DictionaryTraining {
+    samples: Vec<Arc<Vec<u8>>>,
+    dictionary_bytes: usize,
+}
+
+impl DictionaryTraining {
+    pub(crate) fn train(self) -> Option<Vec<u8>> {
+        let samples = self
+            .samples
+            .iter()
+            .map(|page| page.as_slice())
+            .collect::<Vec<_>>();
+        zstd::dict::from_samples(&samples, self.dictionary_bytes).ok()
+    }
 }
 
 impl DictionaryTrainer {
-    fn remember(&mut self, page_no: u32, page: Vec<u8>, limit: usize) {
-        let page_bytes = page.len();
-        if let Some(previous) = self.pages.insert(page_no, page) {
-            self.bytes = self.bytes.saturating_sub(previous.len());
-        } else {
-            self.order.push_back(page_no);
+    fn remember_pending(&mut self, page_no: u32, page: Arc<Vec<u8>>, limit: usize) {
+        if self.attempted || self.pages.contains_key(&page_no) {
+            return;
         }
-        self.bytes = self.bytes.saturating_add(page_bytes);
-        while self.bytes > limit {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            if let Some(page) = self.pages.remove(&oldest) {
-                self.bytes = self.bytes.saturating_sub(page.len());
-            }
+        if let Some(previous) = self.pending.get_mut(&page_no) {
+            *previous = page;
+            return;
         }
+        if self
+            .bytes
+            .saturating_add(self.pending_bytes)
+            .saturating_add(page.len())
+            > limit
+        {
+            return;
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(page.len());
+        self.pending.insert(page_no, page);
+    }
+
+    fn commit_pending(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        self.bytes = self.bytes.saturating_add(self.pending_bytes);
+        self.pending_bytes = 0;
+        self.pages.extend(pending);
+    }
+
+    fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.pending_bytes = 0;
+    }
+
+    fn truncate_pending(&mut self, max_page: u32) {
+        self.pending.retain(|page_no, _| *page_no <= max_page);
+        self.pending_bytes = self.pending.values().map(|page| page.len()).sum();
+    }
+
+    fn take_training(&mut self, dictionary_bytes: usize) -> Option<DictionaryTraining> {
+        if self.attempted
+            || self.pages.len() < MIN_TRAINING_PAGES
+            || self.bytes < MIN_TRAINING_BYTES
+        {
+            return None;
+        }
+        self.attempted = true;
+        let samples = std::mem::take(&mut self.pages).into_values().collect();
+        self.bytes = 0;
+        Some(DictionaryTraining {
+            samples,
+            dictionary_bytes,
+        })
     }
 }
 
@@ -704,6 +753,7 @@ impl Store {
         // outside the last valid commit's end, so forgetting them is a
         // complete rollback; a later writer truncates the unreachable tail.
         self.pending_pages.clear();
+        self.trainer.discard_pending();
         // Reload restores the last complete append-only commit, including the
         // pre-format state when a first-page bootstrap was abandoned.
         let _ = self.reload();
@@ -883,6 +933,7 @@ impl Store {
                 self.mark_frame_free(frame.offset, frame.header.capacity)?;
             }
         }
+        self.trainer.truncate_pending(max_page);
         self.pending_size = size;
         self.pending_dirty = true;
         Ok(())
@@ -1077,24 +1128,12 @@ impl Store {
                     page_hash: entry.page_hash,
                 },
             );
-            self.trainer.changed_pages.insert(entry.page_no);
         }
         if truncate_pages.is_some() {
             self.locations.retain(|page, _| *page <= max_page);
         }
-        let pending = std::mem::take(&mut self.pending_pages);
-        for (page, frame) in pending {
-            if let Ok(raw) = self.read_frame(
-                FrameSource::Active,
-                frame.offset,
-                u32::try_from(frame.header.record_len()).unwrap_or(u32::MAX),
-                page,
-                txid,
-                frame.header.page_hash,
-            ) {
-                self.remember_training_page(page, raw);
-            }
-        }
+        self.pending_pages.clear();
+        self.trainer.commit_pending();
         self.pending_truncate_pages = None;
         self.pending_dirty = false;
         self.pending_size = self.head.logical_size;
@@ -1158,7 +1197,14 @@ impl Store {
         }
         self.pending_pages
             .insert(page_no, PendingFrame { offset, header });
-        self.cache.insert((page_no, txid, page_hash), page.to_vec());
+        let raw = Arc::new(page.to_vec());
+        self.cache
+            .insert_shared((page_no, txid, page_hash), Arc::clone(&raw));
+        if self.active.dictionaries.is_empty() {
+            let limit = usize::try_from(self.active.header.policy.dictionary.sample_bytes)
+                .unwrap_or(usize::MAX);
+            self.trainer.remember_pending(page_no, raw, limit);
+        }
         Ok(())
     }
 
@@ -1512,6 +1558,7 @@ impl Store {
         self.pending_truncate_pages = None;
         self.pending_dirty = false;
         self.pending_pages.clear();
+        self.trainer.discard_pending();
         self.bootstrap = None;
         self.cache.clear();
         Ok(())
@@ -1803,13 +1850,24 @@ impl Store {
             trailer,
             dictionaries: self.active.dictionaries.clone(),
         };
-        let dictionary = self
+        let mut dictionary = self
             .active
             .dictionaries
             .first()
             .map_or_else(Vec::new, |entry| entry.bytes.clone());
         let policy = self.active.header.policy;
-        let promotion = self.active.header.last_dictionary_promotion_unix;
+        let mut promotion = self.active.header.last_dictionary_promotion_unix;
+        if dictionary.is_empty() {
+            let candidate = self.trainer.candidate.take().or_else(|| {
+                self.trainer
+                    .take_training(policy.dictionary.dictionary_bytes as usize)
+                    .and_then(DictionaryTraining::train)
+            });
+            if let Some(candidate) = candidate {
+                dictionary = candidate;
+                promotion = unix_time();
+            }
+        }
         let next = match self.create_active(id.physical_digest, dictionary, policy, promotion) {
             Ok(active) => active,
             Err(error) => {
@@ -2131,22 +2189,6 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn install_initial_dictionary(
-        &mut self,
-        dictionary: Vec<u8>,
-    ) -> Result<(), StoreError> {
-        if self.head.txid != 0 || self.has_pending() || dictionary.is_empty() {
-            return Err(StoreError::InvalidConfiguration(
-                "an initial dictionary can only be installed into an empty database",
-            ));
-        }
-        self.begin_write()?;
-        let promoted = unix_time();
-        self.install_active(dictionary, self.active.header.policy, promoted)?;
-        self.release_publication();
-        Ok(())
-    }
-
     pub(crate) fn background_flush_due(&self) -> bool {
         if self.has_pending() || self.head.txid < self.active.header.start_txid {
             return false;
@@ -2162,13 +2204,29 @@ impl Store {
         if self.has_pending() || self.publication_owner == PublicationOwner::Checkpoint {
             return Ok(());
         }
-        if self.maybe_promote_dictionary()? || self.background_flush_due() {
+        if self.background_flush_due() {
             self.acquire_maintenance()?;
             let result = self.flush_sidecars();
             self.release_maintenance();
             result?;
         }
         self.collect_garbage(8)
+    }
+
+    pub(crate) fn take_dictionary_training(&mut self) -> Option<DictionaryTraining> {
+        if !self.active.dictionaries.is_empty() {
+            return None;
+        }
+        self.trainer.take_training(
+            usize::try_from(self.active.header.policy.dictionary.dictionary_bytes)
+                .unwrap_or(usize::MAX),
+        )
+    }
+
+    pub(crate) fn stage_dictionary_candidate(&mut self, candidate: Vec<u8>) {
+        if self.active.dictionaries.is_empty() && !candidate.is_empty() {
+            self.trainer.candidate = Some(candidate);
+        }
     }
 
     pub(crate) fn acquire_maintenance(&mut self) -> Result<(), StoreError> {
@@ -2200,75 +2258,6 @@ impl Store {
             self.publication_owner = PublicationOwner::Transaction;
         }
         self.release_publication();
-    }
-
-    fn maybe_promote_dictionary(&mut self) -> Result<bool, StoreError> {
-        let policy = StoragePolicy::decode(self.active.header.policy).dictionary;
-        if self.trainer.pages.len() < MIN_TRAINING_PAGES || self.trainer.bytes < MIN_TRAINING_BYTES
-        {
-            return Ok(false);
-        }
-        let page_count = page_count(self.head.logical_size, self.head.page_size)?.max(1) as usize;
-        let current_dictionary = self
-            .active
-            .dictionaries
-            .first()
-            .map_or(&[][..], |entry| entry.bytes.as_slice());
-        if !current_dictionary.is_empty()
-            && self.trainer.changed_pages.len().saturating_mul(10_000)
-                < page_count.saturating_mul(policy.retrain_churn_bps as usize)
-        {
-            return Ok(false);
-        }
-        if self.active.header.last_dictionary_promotion_unix != 0
-            && unix_time().saturating_sub(self.active.header.last_dictionary_promotion_unix)
-                < policy.promotion_cooldown.as_secs()
-        {
-            return Ok(false);
-        }
-        let samples = self.trainer.pages.values().collect::<Vec<_>>();
-        let split = samples.len().saturating_mul(4) / 5;
-        let training = samples[..split]
-            .iter()
-            .map(|sample| sample.as_slice())
-            .collect::<Vec<_>>();
-        let candidate = zstd::dict::from_samples(&training, policy.dictionary_bytes as usize)
-            .map_err(|error| StoreError::Zstd(error.to_string()))?;
-        let heldout = &samples[split..];
-        let baseline = compressed_sample_size(heldout, current_dictionary)?;
-        let proposed = compressed_sample_size(heldout, &candidate)?;
-        if baseline == 0
-            || baseline.saturating_sub(proposed).saturating_mul(10_000)
-                < baseline.saturating_mul(policy.min_improvement_bps as usize)
-            || baseline.saturating_sub(proposed) <= candidate.len()
-        {
-            return Ok(false);
-        }
-        self.begin_write()?;
-        let result = (|| {
-            if self.head.txid >= self.active.header.start_txid {
-                self.flush_sidecars()?;
-                self.begin_write()?;
-            }
-            let promoted = unix_time();
-            self.install_active(candidate, self.active.header.policy, promoted)?;
-            self.trainer.changed_pages.clear();
-            self.release_publication();
-            Ok(true)
-        })();
-        if result.is_err() {
-            // Background-worker errors are currently best-effort. They must
-            // never leave the cross-process publication lease attached to the
-            // shared Store and wedge all future writers.
-            self.release_publication();
-        }
-        result
-    }
-
-    fn remember_training_page(&mut self, page_no: u32, page: Vec<u8>) {
-        let limit = usize::try_from(self.active.header.policy.dictionary.sample_bytes)
-            .unwrap_or(usize::MAX);
-        self.trainer.remember(page_no, page, limit);
     }
 
     fn page_txid_map(&self) -> Result<Vec<u64>, StoreError> {
@@ -2719,26 +2708,6 @@ fn union_dictionaries(segments: &[SegmentMeta]) -> Vec<DictionaryEntry> {
         .into_iter()
         .map(|(digest, bytes)| DictionaryEntry { digest, bytes })
         .collect()
-}
-
-fn compressed_sample_size(samples: &[&Vec<u8>], dictionary: &[u8]) -> Result<usize, StoreError> {
-    if dictionary.is_empty() {
-        return Ok(samples.iter().map(|sample| sample.len()).sum());
-    }
-    let mut compressor = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, dictionary)
-        .map_err(|error| StoreError::Zstd(error.to_string()))?;
-    let mut total = 0_usize;
-    for sample in samples {
-        total = total
-            .checked_add(
-                compressor
-                    .compress(sample)
-                    .map_err(|error| StoreError::Zstd(error.to_string()))?
-                    .len(),
-            )
-            .ok_or(StoreError::Range)?;
-    }
-    Ok(total)
 }
 
 fn verify_segment_physical(segment: &SegmentMeta) -> Result<(), StoreError> {
@@ -3212,6 +3181,87 @@ mod tests {
             Store::open_existing(&path),
             Err(StoreError::Format(crate::format::FormatError::Checksum))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_samples_are_bounded_and_transactional() {
+        let mut trainer = DictionaryTrainer::default();
+        let first = Arc::new(vec![1; 4096]);
+        let second = Arc::new(vec![2; 4096]);
+        let rejected = Arc::new(vec![3; 4096]);
+
+        trainer.remember_pending(1, Arc::clone(&first), 8192);
+        trainer.remember_pending(2, Arc::clone(&second), 8192);
+        trainer.remember_pending(3, rejected, 8192);
+        assert_eq!(trainer.pending_bytes, 8192);
+        assert!(Arc::ptr_eq(&trainer.pending[&1], &first));
+        trainer.discard_pending();
+        assert!(trainer.pages.is_empty());
+        assert_eq!(trainer.pending_bytes, 0);
+
+        trainer.remember_pending(1, first, 8192);
+        trainer.remember_pending(2, second, 8192);
+        trainer.commit_pending();
+        assert_eq!(trainer.bytes, 8192);
+        assert_eq!(trainer.pages.len(), 2);
+    }
+
+    #[test]
+    fn dictionary_is_trained_once_and_only_used_by_future_segments()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PAGE_SIZE: usize = 4096;
+        const PAGE_COUNT: usize = 256;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("forward-dictionary.zsqlite");
+        let mut image = vec![0_u8; PAGE_SIZE * PAGE_COUNT];
+        for (page_index, page) in image.chunks_exact_mut(PAGE_SIZE).enumerate() {
+            for (word_index, word) in page.chunks_exact_mut(8).enumerate() {
+                let value = u64::try_from(page_index)?
+                    .wrapping_mul(31)
+                    .wrapping_add(u64::try_from(word_index)? % 17);
+                word.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        image[..16].copy_from_slice(SQLITE_MAGIC);
+        image[16..18].copy_from_slice(&u16::try_from(PAGE_SIZE)?.to_be_bytes());
+
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &image)?;
+        store.publish(true)?;
+        assert!(store.active.dictionaries.is_empty());
+        assert_eq!(store.trainer.bytes, image.len());
+
+        let training = store
+            .take_dictionary_training()
+            .ok_or("dictionary training was not scheduled")?;
+        let candidate = training.train().ok_or("dictionary training failed")?;
+        let dictionary_digest = digest(&candidate);
+        let mut maintenance = Store::open_existing(&path)?;
+        maintenance.stage_dictionary_candidate(candidate);
+        maintenance.flush_sidecars()?;
+        assert!(maintenance.segments[0].dictionaries.is_empty());
+        drop(maintenance);
+
+        store.refresh()?;
+        let dictionary = store
+            .active
+            .dictionaries
+            .first()
+            .ok_or("dictionary was not installed for future writes")?;
+        assert!(!dictionary.bytes.is_empty());
+        assert!(dictionary.bytes.len() <= 64 * 1024);
+        assert!(store.trainer.attempted);
+        assert!(store.trainer.pages.is_empty());
+        assert_eq!(dictionary.digest, dictionary_digest);
+
+        let replacement = page(7, u32::try_from(PAGE_SIZE)?);
+        store.write_at(0, &replacement)?;
+        store.publish(true)?;
+        assert!(store.trainer.pages.is_empty());
+        store.flush_sidecars()?;
+        assert_eq!(store.active.dictionaries[0].digest, dictionary_digest);
         Ok(())
     }
 

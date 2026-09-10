@@ -250,9 +250,19 @@ mod benchmark {
         segments: u64,
     }
 
+    #[derive(Clone, Copy)]
+    struct CacheStats {
+        used: u64,
+        hits: u64,
+        misses: u64,
+        writes: u64,
+        spills: u64,
+    }
+
     struct Sample {
         timings: [Duration; PHASE_COUNT],
         storage: Storage,
+        cache: CacheStats,
         validation: Validation,
     }
 
@@ -389,6 +399,7 @@ mod benchmark {
             "PRAGMA cache_size=-{cache_kib}; PRAGMA wal_autocheckpoint=0"
         ))?;
         connection.warm_page_cache()?;
+        connection.reset_cache_counters()?;
 
         let mut select =
             connection.prepare("SELECT revision, length(body) FROM records WHERE id=?1")?;
@@ -433,6 +444,7 @@ mod benchmark {
         let started = Instant::now();
         let (rows, revision_sum, payload_sum) = connection.aggregate()?;
         timings[Phase::Scan.index()] = started.elapsed();
+        let cache = connection.cache_stats()?;
         timings[Phase::FinalClose.index()] = measure(|| connection.close())?;
         if engine == Engine::Zsqlite {
             zsqlite::flush(path)?;
@@ -441,6 +453,7 @@ mod benchmark {
         Ok(Sample {
             timings,
             storage: storage(path, engine)?,
+            cache,
             validation: Validation {
                 rows,
                 revision_sum,
@@ -534,6 +547,26 @@ mod benchmark {
             segments,
             bytes(average)
         );
+        let native_cache = median_cache_stats(native);
+        let compressed_cache = median_cache_stats(compressed);
+        println!(
+            "SQLite page cache after warmup: native={} used, {} hits / {} misses ({:.2}% hit), {} writes, {} spills",
+            bytes(native_cache.used),
+            native_cache.hits,
+            native_cache.misses,
+            hit_rate(native_cache),
+            native_cache.writes,
+            native_cache.spills
+        );
+        println!(
+            "SQLite page cache after warmup: zsqlite={} used, {} hits / {} misses ({:.2}% hit), {} writes, {} spills",
+            bytes(compressed_cache.used),
+            compressed_cache.hits,
+            compressed_cache.misses,
+            hit_rate(compressed_cache),
+            compressed_cache.writes,
+            compressed_cache.spills
+        );
         println!(
             "Lower timing and storage ratios are better. Results are not CI pass/fail thresholds."
         );
@@ -555,6 +588,34 @@ mod benchmark {
             .collect();
         values.sort_unstable();
         values[values.len() / 2]
+    }
+
+    fn median_cache_stats(samples: &[Sample]) -> CacheStats {
+        let median = |select: fn(CacheStats) -> u64| {
+            let mut values = samples
+                .iter()
+                .map(|sample| select(sample.cache))
+                .collect::<Vec<_>>();
+            values.sort_unstable();
+            values[values.len() / 2]
+        };
+        CacheStats {
+            used: median(|stats| stats.used),
+            hits: median(|stats| stats.hits),
+            misses: median(|stats| stats.misses),
+            writes: median(|stats| stats.writes),
+            spills: median(|stats| stats.spills),
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn hit_rate(stats: CacheStats) -> f64 {
+        let accesses = stats.hits.saturating_add(stats.misses);
+        if accesses == 0 {
+            0.0
+        } else {
+            stats.hits as f64 * 100.0 / accesses as f64
+        }
     }
 
     fn milliseconds(duration: Duration) -> f64 {
@@ -766,6 +827,44 @@ mod benchmark {
             }
             statement.expect_done()?;
             Ok(())
+        }
+
+        fn reset_cache_counters(&self) -> Result<()> {
+            for operation in [
+                ffi::SQLITE_DBSTATUS_CACHE_HIT,
+                ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                ffi::SQLITE_DBSTATUS_CACHE_WRITE,
+                ffi::SQLITE_DBSTATUS_CACHE_SPILL,
+            ] {
+                let _ = self.cache_status(operation, true)?;
+            }
+            Ok(())
+        }
+
+        fn cache_stats(&self) -> Result<CacheStats> {
+            Ok(CacheStats {
+                used: self.cache_status(ffi::SQLITE_DBSTATUS_CACHE_USED, false)?,
+                hits: self.cache_status(ffi::SQLITE_DBSTATUS_CACHE_HIT, false)?,
+                misses: self.cache_status(ffi::SQLITE_DBSTATUS_CACHE_MISS, false)?,
+                writes: self.cache_status(ffi::SQLITE_DBSTATUS_CACHE_WRITE, false)?,
+                spills: self.cache_status(ffi::SQLITE_DBSTATUS_CACHE_SPILL, false)?,
+            })
+        }
+
+        fn cache_status(&self, operation: c_int, reset: bool) -> Result<u64> {
+            let mut current = 0;
+            let mut highwater = 0;
+            let code = unsafe {
+                ffi::sqlite3_db_status(
+                    self.raw,
+                    operation,
+                    &raw mut current,
+                    &raw mut highwater,
+                    c_int::from(reset),
+                )
+            };
+            self.check(code, "reading SQLite page-cache status")?;
+            Ok(u64::try_from(current).unwrap_or(0))
         }
 
         fn close(mut self) -> Result<()> {

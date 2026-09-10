@@ -117,14 +117,16 @@ inode and reopen the new active generation at the next transaction boundary.
 
 ## Dictionaries and compaction
 
-An empty database starts with raw page frames. zsqlite keeps a discardable,
-bounded reservoir of recently changed pages and trains a 64 KiB dictionary from
-up to 32 MiB of samples. A candidate is promoted at a segment boundary only
-when held-out samples improve by at least 5%, repay the dictionary bytes, meet
-the configured page-churn threshold, and satisfy the promotion cooldown.
+An empty database starts with raw page frames. zsqlite captures up to 8 MiB of
+unique committed page images directly from SQLite's write buffers. Once enough
+samples exist, a background worker trains one 64 KiB dictionary and installs it
+at the next ordinary segment rollover. The dictionary applies only to future
+writes; existing frames are never read back, decompressed, or recompressed for
+training. A future page is stored raw whenever one dictionary-compression
+attempt does not save at least 64 bytes.
 
-Offline conversion performs the same kind of training pass before writing page
-frames when the source is large enough.
+Offline conversion is likewise single-pass. Converted pages remain raw, while
+the dictionary learned from that stream is available for later writes.
 
 Sealing does not decompress or recompress pages. Compaction copies live raw or
 Zstandard frame payloads byte-for-byte, rewrites only structural offsets and
@@ -152,10 +154,11 @@ database, or use SQLite's online-backup protocol. The notice, active segment,
 sidecar directory, and any live SQLite auxiliary files must be captured from
 one pinned point in time; `database.db` by itself contains no application data.
 
-`configure()` persists settle, maximum-staleness, and adaptive dictionary
-policy. Defaults are a 5 minute settle interval, 1 hour maximum active age,
-64 KiB dictionaries, a 32 MiB reservoir, 5% minimum held-out improvement,
-25% churn, and a 24 hour promotion cooldown.
+`configure()` persists settle, maximum-staleness, and dictionary sizing policy.
+Defaults are a 5 minute settle interval, 1 hour maximum active age, 64 KiB
+dictionaries, and an 8 MiB in-memory sample budget. V6 retains its former
+adaptive-policy fields on disk for format compatibility, but forward-only
+dictionary training does not use them.
 
 ## CLI
 
@@ -182,7 +185,8 @@ cargo bench --no-default-features --features static \
 
 Use `--pressure-cache-mib` and `--resident-cache-mib` to change the two SQLite
 cache profiles. `--rows`, `--reads`, `--updates`, `--payload-bytes`,
-`--page-size`, and `--samples` control workload size.
+`--page-size`, and `--samples` control workload size. The report includes
+SQLite's post-warmup page-cache usage, hit/miss, write, and spill counters.
 
 The separate dictionary experiment accepts an ordinary, checkpointed SQLite
 database and compares 64 KiB frames with per-page frames with and without a
