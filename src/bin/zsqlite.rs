@@ -69,6 +69,7 @@ fn print_inspect(info: &zsqlite::Inspect) {
     println!("dictionary_bytes: {}", info.dictionary_bytes);
     println!("settle_seconds: {}", info.policy.settle.as_secs());
     println!("max_stale_seconds: {}", info.policy.max_stale.as_secs());
+    println!("target_segment_bytes: {}", info.policy.target_segment_bytes);
     println!(
         "dictionary_sample_bytes: {}",
         info.policy.dictionary.sample_bytes

@@ -328,23 +328,7 @@ fn spawn_maintenance_worker(store: Weak<Mutex<Store>>) {
             let Some(store) = store.upgrade() else {
                 break;
             };
-            let separate_flush = store.try_lock().ok().and_then(|mut opened| {
-                opened.background_flush_due().then(|| {
-                    let path = opened.path();
-                    let training = opened.take_dictionary_training();
-                    (path, training)
-                })
-            });
-            if let Some((path, training)) = separate_flush {
-                drop(store);
-                let candidate = training.and_then(crate::store::DictionaryTraining::train);
-                if let Ok(mut maintenance) = Store::open_existing(&path) {
-                    if let Some(candidate) = candidate {
-                        maintenance.stage_dictionary_candidate(candidate);
-                    }
-                    let _ = maintenance.try_background_maintenance();
-                }
-            } else if let Ok(mut opened) = store.try_lock() {
+            if let Ok(mut opened) = store.try_lock() {
                 let _ = opened.try_background_maintenance();
             }
         }

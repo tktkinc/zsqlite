@@ -25,3 +25,5 @@
 *.dylib
 *.so
 *.dll
+kiwix-data/
+*.zim

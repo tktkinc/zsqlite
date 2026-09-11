@@ -12,8 +12,8 @@ use std::ptr::null_mut;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use zsqlite::format::{
-    COMMIT_HEADER_SIZE, COMMIT_MAGIC, CommitHeader, FRAME_HEADER_SIZE, FrameHeader, SECTOR_SIZE,
-    SEGMENT_MAGIC, SegmentHeader, SegmentId,
+    ACTIVE_STATE_SIZE, ActiveState, FRAME_HEADER_SIZE, FrameHeader, SECTOR_SIZE, SEGMENT_MAGIC,
+    SegmentHeader, SegmentId,
 };
 
 const VFS: &CStr = c"zsqlite";
@@ -177,24 +177,17 @@ fn segment_paths(path: &Path) -> TestResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn commits(path: &Path) -> TestResult<Vec<(u64, CommitHeader)>> {
+fn active_states(path: &Path) -> TestResult<Vec<(u64, ActiveState)>> {
     let file = File::open(path)?;
-    let header = active_header(path)?;
-    let file_len = file.metadata()?.len();
     let mut output = Vec::new();
-    let mut offset = header.records_offset;
-    while offset + COMMIT_HEADER_SIZE as u64 <= file_len {
-        let mut magic = [0; 4];
-        read_exact_at(&file, offset, &mut magic)?;
-        if &magic == COMMIT_MAGIC {
-            let mut encoded = [0; COMMIT_HEADER_SIZE];
-            read_exact_at(&file, offset, &mut encoded)?;
-            if let Ok(commit) = CommitHeader::decode(&encoded) {
-                output.push((offset, commit));
-            }
+    for offset in [SECTOR_SIZE as u64, 2 * SECTOR_SIZE as u64] {
+        let mut encoded = [0; ACTIVE_STATE_SIZE];
+        read_exact_at(&file, offset, &mut encoded)?;
+        if let Ok(state) = ActiveState::decode(&encoded) {
+            output.push((offset, state));
         }
-        offset += SECTOR_SIZE as u64;
     }
+    output.sort_by_key(|(_, state)| state.sequence);
     Ok(output)
 }
 
@@ -234,12 +227,7 @@ fn unreachable_active_tail_is_ignored_and_reclaimed_by_the_next_writer() -> Test
     let path = directory.path().join("active-tail.zsqlite");
     create_database(&path)?;
     let before = zsqlite::verify(&path)?;
-    let (commit_offset, commit) = commits(&path)?
-        .into_iter()
-        .next_back()
-        .ok_or("active file has no commit")?;
-    let committed_end = commit_offset + u64::from(commit.record_len);
-    assert_eq!(path.metadata()?.len(), committed_end);
+    let committed_end = path.metadata()?.len();
 
     let garbage = vec![0xa5; 777];
     let mut file = OpenOptions::new().append(true).open(&path)?;
@@ -287,14 +275,11 @@ fn incomplete_last_commit_recovers_the_previous_valid_prefix() -> TestResult {
     create_database(&path)?;
     let before = zsqlite::verify(&path)?;
     assert!(before.head_txid > 1);
-    let (commit_offset, _) = commits(&path)?
+    let (state_offset, _) = active_states(&path)?
         .into_iter()
         .next_back()
-        .ok_or("active file has no commit")?;
-    OpenOptions::new()
-        .write(true)
-        .open(&path)?
-        .set_len(commit_offset + COMMIT_HEADER_SIZE as u64 / 2)?;
+        .ok_or("active file has no state")?;
+    flip_byte(&path, state_offset + ACTIVE_STATE_SIZE as u64 - 1)?;
 
     let recovered = zsqlite::verify(&path)?;
     assert!(recovered.head_txid < before.head_txid);
@@ -308,12 +293,11 @@ fn torn_last_commit_entries_recover_the_previous_valid_prefix() -> TestResult {
     create_database(&path)?;
     let before = zsqlite::verify(&path)?;
     assert!(before.head_txid > 1);
-    let (commit_offset, commit) = commits(&path)?
+    let (state_offset, _) = active_states(&path)?
         .into_iter()
         .next_back()
-        .ok_or("active file has no commit")?;
-    assert!(commit.entry_count > 0);
-    flip_byte(&path, commit_offset + COMMIT_HEADER_SIZE as u64 + 24)?;
+        .ok_or("active file has no state")?;
+    flip_byte(&path, state_offset + 64)?;
 
     let recovered = zsqlite::verify(&path)?;
     assert!(recovered.head_txid < before.head_txid);
@@ -380,7 +364,6 @@ fn compaction_refuses_to_bless_corrupt_sealed_payloads() -> TestResult {
     let mut frame_bytes = [0; FRAME_HEADER_SIZE];
     read_exact_at(&file, header.records_offset, &mut frame_bytes)?;
     let frame = FrameHeader::decode(&frame_bytes)?;
-    assert!(!frame.free);
     assert!(frame.stored_len > 0);
     drop(file);
     flip_byte(damaged, header.records_offset + FRAME_HEADER_SIZE as u64)?;
@@ -398,7 +381,7 @@ fn compaction_refuses_to_bless_corrupt_sealed_payloads() -> TestResult {
 }
 
 #[test]
-fn rollover_hardlinks_the_old_active_inode_and_publishes_a_new_one() -> TestResult {
+fn seal_publishes_a_compressed_snapshot_and_a_new_active_inode() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("hardlink-rollover.zsqlite");
     create_database(&path)?;
@@ -412,8 +395,9 @@ fn rollover_hardlinks_the_old_active_inode_and_publishes_a_new_one() -> TestResu
         .ok_or("flush produced no sealed segment")?;
     let sealed_metadata = sealed.metadata()?;
     assert_eq!(sealed_metadata.dev(), old_active.dev());
-    assert_eq!(sealed_metadata.ino(), old_active.ino());
+    assert_ne!(sealed_metadata.ino(), old_active.ino());
     assert_ne!(path.metadata()?.ino(), old_active.ino());
+    assert_ne!(path.metadata()?.ino(), sealed_metadata.ino());
 
     // A parseable but unreferenced filename is not part of the lineage, even
     // when it repeats the live segment's physical-digest field.
@@ -444,27 +428,33 @@ fn rollover_hardlinks_the_old_active_inode_and_publishes_a_new_one() -> TestResu
 }
 
 #[test]
-fn crash_left_sealed_active_alias_is_rolled_forward() -> TestResult {
+fn unreachable_sealed_snapshot_is_ignored_until_publication() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("sealed-active-crash.zsqlite");
+    let path = directory.path().join("unpublished-snapshot.zsqlite");
     create_database(&path)?;
-    let flushed = zsqlite::flush(&path)?;
-    let sealed = segment_paths(&path)?
+    let before = zsqlite::inspect(&path)?;
+    let clone = directory.path().join("snapshot-source.zsqlite");
+    copy_bundle(&path, &clone)?;
+    zsqlite::flush(&clone)?;
+    let sealed = segment_paths(&clone)?
         .pop()
         .ok_or("flush produced no sealed segment")?;
 
-    // Model a crash after the hardlink was durable but before the fresh active
-    // inode was renamed over `.zsqlite`.
-    std::fs::remove_file(&path)?;
-    std::fs::hard_link(&sealed, &path)?;
-    assert_eq!(path.metadata()?.ino(), sealed.metadata()?.ino());
-    assert_eq!(zsqlite::inspect(&path)?.head_txid, flushed.head_txid);
+    // Model a crash after the staged snapshot reached segments/ but before
+    // the small active generation was renamed over the raw active image.
+    std::fs::copy(
+        &sealed,
+        sidecar(&path)
+            .join("segments")
+            .join(sealed.file_name().ok_or("segment has no filename")?),
+    )?;
+    assert_eq!(zsqlite::inspect(&path)?.head_txid, before.head_txid);
+    assert_eq!(zsqlite::inspect(&path)?.sealed_segments, 0);
 
     let connection = Connection::open(&path)?;
     connection.execute("INSERT INTO events VALUES(2, randomblob(5000))")?;
     assert_eq!(connection.integer("SELECT count(*) FROM events")?, 2);
     drop(connection);
-    assert_ne!(path.metadata()?.ino(), sealed.metadata()?.ino());
     zsqlite::verify(&path)?;
     Ok(())
 }

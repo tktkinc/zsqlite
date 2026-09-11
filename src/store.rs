@@ -2,12 +2,11 @@
 
 use crate::backend::{FsSegmentBackend, sidecar_dir};
 use crate::format::{
-    COMMIT_ENTRY_SIZE, COMMIT_HEADER_SIZE, Codec, CommitEntry, CommitHeader, DatabaseId,
-    DictionaryEntry, DictionaryPolicyRecord, Digest, FRAME_HEADER_SIZE, FrameHeader,
-    MAX_SECTION_BYTES, SECTOR_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_INDEX_ENTRY_SIZE, SEGMENT_MAGIC,
-    SEGMENT_TRAILER_SIZE, SegmentHeader, SegmentId, SegmentIndexEntry, SegmentTrailer,
-    StoragePolicyRecord, decode_dictionary_table, digest, encode_dictionary_table, genesis_history,
-    valid_page_size,
+    ACTIVE_STATE_SIZE, ActiveState, Codec, DatabaseId, DictionaryEntry, DictionaryPolicyRecord,
+    Digest, FRAME_HEADER_SIZE, FrameHeader, MAX_SECTION_BYTES, SECTOR_SIZE, SEGMENT_HEADER_SIZE,
+    SEGMENT_INDEX_ENTRY_SIZE, SEGMENT_MAGIC, SEGMENT_TRAILER_SIZE, SegmentHeader, SegmentId,
+    SegmentIndexEntry, SegmentTrailer, StoragePolicyRecord, decode_dictionary_table, digest,
+    encode_dictionary_table, genesis_history, valid_page_size,
 };
 use crate::fs::{absolute_path, allocated_bytes, read_exact_at, sync_parent_dir, write_all_at};
 #[cfg(test)]
@@ -32,6 +31,9 @@ const PAGE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const MIN_TRAINING_PAGES: usize = 256;
 const MIN_TRAINING_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
+const ACTIVE_STATE_A_OFFSET: u64 = SEGMENT_HEADER_SIZE as u64;
+const ACTIVE_STATE_B_OFFSET: u64 = ACTIVE_STATE_A_OFFSET + ACTIVE_STATE_SIZE as u64;
+const ACTIVE_METADATA_END: u64 = ACTIVE_STATE_B_OFFSET + ACTIVE_STATE_SIZE as u64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -79,9 +81,9 @@ pub enum StoreError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DictionaryPolicy {
-    /// Maximum size of the one dictionary trained for future writes.
+    /// Maximum size of the one dictionary trained while sealing a snapshot.
     pub dictionary_bytes: u32,
-    /// Maximum memory retained from committed write buffers for training.
+    /// Maximum raw image bytes sampled while training at seal time.
     pub sample_bytes: u64,
 }
 
@@ -98,6 +100,9 @@ impl Default for DictionaryPolicy {
 pub struct StoragePolicy {
     pub settle: Duration,
     pub max_stale: Duration,
+    /// Seal the active generation at a committed boundary once its raw records
+    /// reach this many bytes. Zero disables size-triggered sealing.
+    pub target_segment_bytes: u64,
     pub dictionary: DictionaryPolicy,
 }
 
@@ -106,6 +111,7 @@ impl Default for StoragePolicy {
         Self {
             settle: Duration::from_secs(5 * 60),
             max_stale: Duration::from_secs(60 * 60),
+            target_segment_bytes: 0,
             dictionary: DictionaryPolicy::default(),
         }
     }
@@ -120,14 +126,10 @@ impl StoragePolicy {
         let record = StoragePolicyRecord {
             settle_seconds: seconds(self.settle)?,
             max_stale_seconds: seconds(self.max_stale)?,
+            target_segment_bytes: self.target_segment_bytes,
             dictionary: DictionaryPolicyRecord {
                 dictionary_bytes: self.dictionary.dictionary_bytes,
                 sample_bytes: self.dictionary.sample_bytes,
-                // These fields remain encoded in V6 but are reserved by the
-                // forward-only dictionary policy.
-                min_improvement_bps: 500,
-                retrain_churn_bps: 2_500,
-                promotion_cooldown_seconds: 24 * 60 * 60,
             },
         };
         validate_policy(record)?;
@@ -138,6 +140,7 @@ impl StoragePolicy {
         Self {
             settle: Duration::from_secs(u64::from(value.settle_seconds)),
             max_stale: Duration::from_secs(u64::from(value.max_stale_seconds)),
+            target_segment_bytes: value.target_segment_bytes,
             dictionary: DictionaryPolicy {
                 dictionary_bytes: value.dictionary.dictionary_bytes,
                 sample_bytes: value.dictionary.sample_bytes,
@@ -167,15 +170,9 @@ pub struct Inspect {
     pub policy: StoragePolicy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FrameSource {
-    Active,
-    Segment(usize),
-}
-
 #[derive(Clone, Copy, Debug)]
 struct PageLocation {
-    source: FrameSource,
+    segment_index: usize,
     last_txid: u64,
     frame_offset: u64,
     frame_record_len: u32,
@@ -183,9 +180,9 @@ struct PageLocation {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PendingFrame {
-    offset: u64,
-    header: FrameHeader,
+struct PageChange {
+    page_no: u32,
+    page_hash: Digest,
 }
 
 #[derive(Debug)]
@@ -214,7 +211,9 @@ struct SegmentMeta {
     file: File,
     file_len: u64,
     trailer: SegmentTrailer,
-    dictionaries: Vec<DictionaryEntry>,
+    /// Dictionaries available at this point in the lineage. Small successor
+    /// segments share this allocation when they add no dictionary.
+    dictionaries: Arc<Vec<DictionaryEntry>>,
 }
 
 #[derive(Debug)]
@@ -230,8 +229,9 @@ struct DiscoveredSegment {
 struct ActiveSegment {
     file: File,
     header: SegmentHeader,
-    trailer: Option<SegmentTrailer>,
-    dictionaries: Vec<DictionaryEntry>,
+    state_sequence: u64,
+    active_records: BTreeMap<u32, u64>,
+    truncate_pages: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,87 +317,6 @@ impl PageCache {
     }
 }
 
-#[derive(Debug, Default)]
-struct DictionaryTrainer {
-    pages: BTreeMap<u32, Arc<Vec<u8>>>,
-    pending: BTreeMap<u32, Arc<Vec<u8>>>,
-    bytes: usize,
-    pending_bytes: usize,
-    attempted: bool,
-    candidate: Option<Vec<u8>>,
-}
-
-pub(crate) struct DictionaryTraining {
-    samples: Vec<Arc<Vec<u8>>>,
-    dictionary_bytes: usize,
-}
-
-impl DictionaryTraining {
-    pub(crate) fn train(self) -> Option<Vec<u8>> {
-        let samples = self
-            .samples
-            .iter()
-            .map(|page| page.as_slice())
-            .collect::<Vec<_>>();
-        zstd::dict::from_samples(&samples, self.dictionary_bytes).ok()
-    }
-}
-
-impl DictionaryTrainer {
-    fn remember_pending(&mut self, page_no: u32, page: Arc<Vec<u8>>, limit: usize) {
-        if self.attempted || self.pages.contains_key(&page_no) {
-            return;
-        }
-        if let Some(previous) = self.pending.get_mut(&page_no) {
-            *previous = page;
-            return;
-        }
-        if self
-            .bytes
-            .saturating_add(self.pending_bytes)
-            .saturating_add(page.len())
-            > limit
-        {
-            return;
-        }
-        self.pending_bytes = self.pending_bytes.saturating_add(page.len());
-        self.pending.insert(page_no, page);
-    }
-
-    fn commit_pending(&mut self) {
-        let pending = std::mem::take(&mut self.pending);
-        self.bytes = self.bytes.saturating_add(self.pending_bytes);
-        self.pending_bytes = 0;
-        self.pages.extend(pending);
-    }
-
-    fn discard_pending(&mut self) {
-        self.pending.clear();
-        self.pending_bytes = 0;
-    }
-
-    fn truncate_pending(&mut self, max_page: u32) {
-        self.pending.retain(|page_no, _| *page_no <= max_page);
-        self.pending_bytes = self.pending.values().map(|page| page.len()).sum();
-    }
-
-    fn take_training(&mut self, dictionary_bytes: usize) -> Option<DictionaryTraining> {
-        if self.attempted
-            || self.pages.len() < MIN_TRAINING_PAGES
-            || self.bytes < MIN_TRAINING_BYTES
-        {
-            return None;
-        }
-        self.attempted = true;
-        let samples = std::mem::take(&mut self.pages).into_values().collect();
-        self.bytes = 0;
-        Some(DictionaryTraining {
-            samples,
-            dictionary_bytes,
-        })
-    }
-}
-
 /// Internal page store. `SQLite`'s ordinary lock file protocol surrounds access.
 pub(crate) struct Store {
     path: PathBuf,
@@ -411,13 +330,13 @@ pub(crate) struct Store {
     segments: Vec<SegmentMeta>,
     locations: BTreeMap<u32, PageLocation>,
     active: ActiveSegment,
-    pending_pages: BTreeMap<u32, PendingFrame>,
+    pending_raw_pages: BTreeSet<u32>,
+    pending_raw_originals: BTreeMap<u32, Vec<u8>>,
     pending_size: u64,
     pending_truncate_pages: Option<u32>,
     pending_dirty: bool,
     bootstrap: Option<BootstrapFile>,
     cache: PageCache,
-    trainer: DictionaryTrainer,
 }
 
 impl Store {
@@ -460,7 +379,7 @@ impl Store {
             return Self::initialize(path, file);
         }
         let header = read_segment_header(&file)?;
-        reject_aliased_active(&file, header)?;
+        reject_aliased_active(&file)?;
         let backend = FsSegmentBackend::open(sidecar_dir(&path), false)?;
         let publication = open_lock(&backend.lock_path("publication"), writable, false)?;
         let lifecycle = open_lock(&backend.lock_path("lifecycle"), writable, false)?;
@@ -500,10 +419,11 @@ impl Store {
         let policy = StoragePolicy::default().encode()?;
         let dictionary_bytes = encode_dictionary_table(&[])?;
         let base_map = encode_map(&[])?;
-        let dictionary_offset = SEGMENT_HEADER_SIZE as u64;
+        let dictionary_offset = ACTIVE_METADATA_END;
         let base_map_offset = dictionary_offset + dictionary_bytes.len() as u64;
         let records_offset = align_up(base_map_offset + base_map.len() as u64, SECTOR_SIZE as u64)?;
         let header = SegmentHeader {
+            mutable_snapshot: true,
             database_id,
             page_size: 0,
             start_txid: 1,
@@ -511,7 +431,6 @@ impl Store {
             parent_physical_digest: [0; 32],
             base_logical_size: 0,
             generation: 1,
-            last_dictionary_promotion_unix: 0,
             policy,
             dictionary_offset,
             dictionary_len: dictionary_bytes.len() as u64,
@@ -520,6 +439,22 @@ impl Store {
             records_offset,
         };
         write_all_at(&file, 0, &header.encode())?;
+        write_all_at(
+            &file,
+            ACTIVE_STATE_A_OFFSET,
+            &ActiveState {
+                database_id,
+                sequence: 1,
+                txid: 0,
+                logical_size: 0,
+                page_size: 0,
+                history: genesis_history(),
+                commit_unix: 0,
+                record_count: 0,
+                truncate_pages: None,
+            }
+            .encode(),
+        )?;
         write_all_at(&file, dictionary_offset, &dictionary_bytes)?;
         write_all_at(&file, base_map_offset, &base_map)?;
         file.set_len(records_offset)?;
@@ -568,16 +503,17 @@ impl Store {
             active: ActiveSegment {
                 file,
                 header,
-                trailer: None,
-                dictionaries: Vec::new(),
+                state_sequence: 1,
+                active_records: BTreeMap::new(),
+                truncate_pages: None,
             },
-            pending_pages: BTreeMap::new(),
+            pending_raw_pages: BTreeSet::new(),
+            pending_raw_originals: BTreeMap::new(),
             pending_size: 0,
             pending_truncate_pages: None,
             pending_dirty: false,
             bootstrap: None,
             cache: PageCache::new(PAGE_CACHE_BYTES),
-            trainer: DictionaryTrainer::default(),
         }
     }
 
@@ -654,10 +590,6 @@ impl Store {
         self.pending_size
     }
 
-    pub(crate) fn path(&self) -> PathBuf {
-        self.path.clone()
-    }
-
     pub(crate) fn sqlite_lock_path(&self) -> PathBuf {
         self.backend.lock_path("sqlite")
     }
@@ -709,14 +641,20 @@ impl Store {
     }
 
     pub(crate) fn has_pending(&self) -> bool {
-        self.pending_dirty || !self.pending_pages.is_empty() || self.bootstrap.is_some()
+        self.pending_dirty
+            || !self.pending_raw_pages.is_empty()
+            || !self.pending_raw_originals.is_empty()
+            || self.bootstrap.is_some()
     }
 
     pub(crate) fn refresh(&mut self) -> Result<(), StoreError> {
         if self.has_pending() {
             return Ok(());
         }
-        if self.current_inode_changed()?
+        let mutable_advanced = read_active_state(&self.active.file, self.active.header.database_id)
+            .is_ok_and(|state| state.sequence > self.active.state_sequence);
+        if mutable_advanced
+            || self.current_inode_changed()?
             || self.active.file.metadata()?.len() > self.head.active_commit_end
         {
             self.reload()?;
@@ -735,10 +673,9 @@ impl Store {
             lock_exclusive(&self.publication, true)?;
             self.publication_owner = PublicationOwner::Transaction;
             if let Err(error) = self.reload().and_then(|()| {
-                if self.active.trailer.is_some() {
-                    self.finish_sealed_rollover()?;
+                if self.active.file.metadata()?.len() > self.head.active_commit_end {
+                    self.active.file.set_len(self.head.active_commit_end)?;
                 }
-                self.active.file.set_len(self.head.active_commit_end)?;
                 Ok(())
             }) {
                 self.release_publication();
@@ -749,22 +686,7 @@ impl Store {
     }
 
     pub(crate) fn discard_pending(&mut self) {
-        // Pending frames are never placed into committed free slots. They are
-        // outside the last valid commit's end, so forgetting them is a
-        // complete rollback; a later writer truncates the unreachable tail.
-        self.pending_pages.clear();
-        self.trainer.discard_pending();
-        // Reload restores the last complete append-only commit, including the
-        // pre-format state when a first-page bootstrap was abandoned.
-        let _ = self.reload();
-        self.pending_size = self.head.logical_size;
-        self.pending_truncate_pages = None;
-        self.pending_dirty = false;
-        self.bootstrap = None;
-        if self.publication_owner == PublicationOwner::Checkpoint {
-            self.publication_owner = PublicationOwner::Transaction;
-        }
-        self.release_publication();
+        self.discard_mutable_pending();
     }
 
     pub(crate) fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, StoreError> {
@@ -819,7 +741,7 @@ impl Store {
             self.write_bootstrap(offset, input, end)?;
             return Ok(input.len());
         }
-        self.write_pages(offset, input)?;
+        self.write_mutable_pages(offset, input)?;
         self.pending_size = self.pending_size.max(end);
         self.pending_dirty = true;
         Ok(input.len())
@@ -862,7 +784,7 @@ impl Store {
                 read_exact_at(&bootstrap.file, page_offset, &mut page[..amount])?;
                 let page_no = u32::try_from(page_offset / u64::from(page_size) + 1)
                     .map_err(|_| StoreError::Range)?;
-                self.stage_page(page_no, &page)?;
+                self.write_mutable_page(page_no, &page)?;
                 page_offset = page_offset
                     .checked_add(u64::from(page_size))
                     .ok_or(StoreError::Range)?;
@@ -871,7 +793,92 @@ impl Store {
         Ok(())
     }
 
-    fn write_pages(&mut self, offset: u64, input: &[u8]) -> Result<(), StoreError> {
+    fn active_record_offset(&self, page_no: u32) -> Result<u64, StoreError> {
+        self.active
+            .active_records
+            .get(&page_no)
+            .copied()
+            .ok_or(StoreError::Range)
+    }
+
+    fn active_frame_header(&self, page_no: u32) -> FrameHeader {
+        FrameHeader {
+            page_no,
+            codec: Codec::Raw,
+            dictionary_index: u16::MAX,
+            stored_len: self.head.page_size,
+            raw_len: self.head.page_size,
+        }
+    }
+
+    fn read_mutable_page(&self, page_no: u32) -> Result<Vec<u8>, StoreError> {
+        let offset = self.active_record_offset(page_no)?;
+        let mut encoded = [0; FRAME_HEADER_SIZE];
+        read_exact_at(&self.active.file, offset, &mut encoded)?;
+        let header = FrameHeader::decode(&encoded)?;
+        if header.page_no != page_no
+            || header.codec != Codec::Raw
+            || header.dictionary_index != u16::MAX
+            || header.stored_len != self.head.page_size
+            || header.raw_len != self.head.page_size
+        {
+            return Err(StoreError::Corrupt(offset));
+        }
+        let mut page = vec![0; self.head.page_size as usize];
+        read_exact_at(
+            &self.active.file,
+            offset + FRAME_HEADER_SIZE as u64,
+            &mut page,
+        )?;
+        Ok(page)
+    }
+
+    fn overwrite_active_record(&self, page_no: u32, page: &[u8]) -> Result<(), StoreError> {
+        let offset = self.active_record_offset(page_no)?;
+        write_all_at(&self.active.file, offset + FRAME_HEADER_SIZE as u64, page)?;
+        Ok(())
+    }
+
+    fn append_active_record(&mut self, page_no: u32, page: &[u8]) -> Result<(), StoreError> {
+        let offset = self.active.file.metadata()?.len();
+        let header = self.active_frame_header(page_no);
+        let end = offset
+            .checked_add(header.record_len())
+            .ok_or(StoreError::Range)?;
+        self.active.file.set_len(end)?;
+        write_all_at(&self.active.file, offset + FRAME_HEADER_SIZE as u64, page)?;
+        write_all_at(&self.active.file, offset, &header.encode())?;
+        self.active.active_records.insert(page_no, offset);
+        Ok(())
+    }
+
+    fn write_mutable_page(&mut self, page_no: u32, page: &[u8]) -> Result<(), StoreError> {
+        if page.len() != self.head.page_size as usize {
+            return Err(StoreError::InvalidPageLength {
+                page_no,
+                actual: page.len(),
+                expected: self.head.page_size as usize,
+            });
+        }
+        if page_no == 1 && parse_page_size(page) != Some(self.head.page_size) {
+            return Err(StoreError::InvalidPageSize(
+                parse_page_size(page).unwrap_or(0),
+            ));
+        }
+        if !self.pending_raw_originals.contains_key(&page_no) {
+            let original = self.read_page(page_no)?;
+            self.pending_raw_originals.insert(page_no, original);
+        }
+        if self.active.active_records.contains_key(&page_no) {
+            self.overwrite_active_record(page_no, page)?;
+        } else {
+            self.append_active_record(page_no, page)?;
+        }
+        self.pending_raw_pages.insert(page_no);
+        Ok(())
+    }
+
+    fn write_mutable_pages(&mut self, offset: u64, input: &[u8]) -> Result<(), StoreError> {
         let page_size = self.head.page_size as usize;
         let page_size_u64 = u64::from(self.head.page_size);
         let mut consumed = 0_usize;
@@ -879,25 +886,52 @@ impl Store {
             let logical = offset
                 .checked_add(u64::try_from(consumed).map_err(|_| StoreError::Range)?)
                 .ok_or(StoreError::Range)?;
-            let page_no = u32::try_from(
-                logical
-                    .checked_div(page_size_u64)
-                    .and_then(|page| page.checked_add(1))
-                    .ok_or(StoreError::Range)?,
-            )
-            .map_err(|_| StoreError::Range)?;
+            let page_no =
+                u32::try_from(logical / page_size_u64 + 1).map_err(|_| StoreError::Range)?;
             let within = usize::try_from(logical % page_size_u64).map_err(|_| StoreError::Range)?;
             let amount = (input.len() - consumed).min(page_size - within);
             let mut page = if within == 0 && amount == page_size {
                 input[consumed..consumed + amount].to_vec()
+            } else if self
+                .pending_truncate_pages
+                .is_some_and(|preserved_pages| page_no > preserved_pages)
+            {
+                vec![0; page_size]
             } else {
                 self.read_page(page_no)?
             };
             page[within..within + amount].copy_from_slice(&input[consumed..consumed + amount]);
-            self.stage_page(page_no, &page)?;
+            self.write_mutable_page(page_no, &page)?;
             consumed += amount;
         }
         Ok(())
+    }
+
+    fn discard_mutable_pending(&mut self) {
+        let committed_end = self.head.active_commit_end;
+        for (page_no, page) in std::mem::take(&mut self.pending_raw_originals) {
+            if self
+                .active
+                .active_records
+                .get(&page_no)
+                .is_some_and(|offset| *offset < committed_end)
+            {
+                let _ = self.overwrite_active_record(page_no, &page);
+            }
+        }
+        let _ = self.active.file.set_len(committed_end);
+        self.active
+            .active_records
+            .retain(|_, offset| *offset < committed_end);
+        self.pending_raw_pages.clear();
+        self.pending_size = self.head.logical_size;
+        self.pending_truncate_pages = None;
+        self.pending_dirty = false;
+        self.bootstrap = None;
+        if self.publication_owner == PublicationOwner::Checkpoint {
+            self.publication_owner = PublicationOwner::Transaction;
+        }
+        self.release_publication();
     }
 
     pub(crate) fn truncate(&mut self, size: u64) -> Result<(), StoreError> {
@@ -915,25 +949,21 @@ impl Store {
             page_count(size, self.head.page_size)?
         };
         if self.head.page_size != 0 && size < self.pending_size {
+            let pages = self
+                .active
+                .active_records
+                .range(max_page.saturating_add(1)..)
+                .map(|(page_no, _)| *page_no)
+                .collect::<Vec<_>>();
+            let zero = vec![0; self.head.page_size as usize];
+            for page_no in pages {
+                self.write_mutable_page(page_no, &zero)?;
+            }
             self.pending_truncate_pages = Some(
                 self.pending_truncate_pages
                     .map_or(max_page, |previous| previous.min(max_page)),
             );
         }
-        let removed = max_page
-            .checked_add(1)
-            .map_or_else(Vec::new, |first_removed| {
-                self.pending_pages
-                    .range(first_removed..)
-                    .map(|(page, _)| *page)
-                    .collect::<Vec<_>>()
-            });
-        for page in removed {
-            if let Some(frame) = self.pending_pages.remove(&page) {
-                self.mark_frame_free(frame.offset, frame.header.capacity)?;
-            }
-        }
-        self.trainer.truncate_pending(max_page);
         self.pending_size = size;
         self.pending_dirty = true;
         Ok(())
@@ -946,7 +976,7 @@ impl Store {
 
     /// Publishes a commit using the durability strength requested by `SQLite`'s
     /// xSync flags. On macOS, FULL includes `F_FULLFSYNC` for both the active
-    /// page data and the commit record that makes it visible.
+    /// page data and the state sector that makes it visible.
     pub(crate) fn publish_synced(&mut self, full_sync: bool) -> Result<(), StoreError> {
         self.publish_inner(true, false, full_sync)
     }
@@ -987,7 +1017,6 @@ impl Store {
         self.release_publication();
     }
 
-    #[allow(clippy::too_many_lines)]
     fn publish_inner(
         &mut self,
         durable: bool,
@@ -1015,27 +1044,15 @@ impl Store {
             }
             return Err(StoreError::UnknownPageSize);
         }
-        self.ensure_active()?;
-        let active = &self.active.file;
         let txid = self.head.txid.checked_add(1).ok_or(StoreError::Range)?;
-        let entries = self
-            .pending_pages
-            .iter()
-            .map(|(page_no, frame)| CommitEntry {
+        let mut entries = Vec::with_capacity(self.pending_raw_pages.len());
+        for page_no in &self.pending_raw_pages {
+            let page = self.read_mutable_page(*page_no)?;
+            entries.push(PageChange {
                 page_no: *page_no,
-                frame_offset: frame.offset,
-                frame_record_len: u32::try_from(frame.header.record_len()).unwrap_or(u32::MAX),
-                page_hash: frame.header.page_hash,
-            })
-            .collect::<Vec<_>>();
-        if entries
-            .iter()
-            .any(|entry| entry.frame_record_len == u32::MAX)
-        {
-            return Err(StoreError::Range);
+                page_hash: page_hash(txid, *page_no, &page),
+            });
         }
-        let entry_bytes = encode_commit_entries(&entries);
-        let entries_digest = digest(&entry_bytes);
         let transaction_hash = transaction_hash(
             txid,
             self.pending_size,
@@ -1044,218 +1061,63 @@ impl Store {
             &entries,
         );
         let resulting_history = history_hash(self.head.history, transaction_hash);
-        let unaligned_record_len = COMMIT_HEADER_SIZE
-            .checked_add(entry_bytes.len())
-            .ok_or(StoreError::Range)?;
-        let record_len =
-            usize::try_from(align_up(unaligned_record_len as u64, SECTOR_SIZE as u64)?)
-                .map_err(|_| StoreError::Range)?;
-        let frames_end = active.metadata()?.len();
-        let commit_offset = align_up(frames_end, SECTOR_SIZE as u64)?;
-        if commit_offset > frames_end {
-            zero_range(
-                active,
-                frames_end,
-                usize::try_from(commit_offset - frames_end).map_err(|_| StoreError::Range)?,
-            )?;
+        let raw_end = self.active.file.metadata()?.len();
+        if durable {
+            sync_file(&self.active.file, full_sync)?;
         }
         let now = unix_time();
-        let header = CommitHeader {
-            record_len: u32::try_from(record_len).map_err(|_| StoreError::Range)?,
-            entry_count: u32::try_from(entries.len()).map_err(|_| StoreError::Range)?,
+        let sequence = self
+            .active
+            .state_sequence
+            .checked_add(1)
+            .ok_or(StoreError::Range)?;
+        let state = ActiveState {
+            database_id: self.active.header.database_id,
+            sequence,
             txid,
-            previous_commit: self.head.active_commit_offset,
             logical_size: self.pending_size,
             page_size: self.head.page_size,
-            truncate_pages: self.pending_truncate_pages,
-            previous_history: self.head.history,
-            transaction_hash,
-            resulting_history,
-            entries_digest,
+            history: resulting_history,
             commit_unix: now,
+            record_count: u64::try_from(self.active.active_records.len())
+                .map_err(|_| StoreError::Range)?,
+            truncate_pages: match (self.active.truncate_pages, self.pending_truncate_pages) {
+                (Some(previous), Some(current)) => Some(previous.min(current)),
+                (Some(previous), None) => Some(previous),
+                (None, current) => current,
+            },
         };
-        // Write the commit body first and its checksummed header last. Until
-        // that final sector is present, recovery sees only an uncommitted
-        // zero/invalid tail.
         write_all_at(
-            active,
-            commit_offset + COMMIT_HEADER_SIZE as u64,
-            &entry_bytes,
+            &self.active.file,
+            active_state_offset(sequence),
+            &state.encode(),
         )?;
-        let commit_end = commit_offset
-            .checked_add(record_len as u64)
-            .ok_or(StoreError::Range)?;
-        if record_len > unaligned_record_len {
-            zero_range(
-                active,
-                commit_offset + unaligned_record_len as u64,
-                record_len - unaligned_record_len,
-            )?;
-        }
-        active.set_len(commit_end)?;
-        write_all_at(active, commit_offset, &header.encode())?;
-
-        let max_page = page_count(self.pending_size, self.head.page_size)?;
-        let truncate_pages = self.pending_truncate_pages;
         if durable {
-            sync_file(active, full_sync)?;
+            sync_file(&self.active.file, full_sync)?;
         }
+
+        self.active.state_sequence = sequence;
+        self.active.truncate_pages = state.truncate_pages;
         self.head.logical_size = self.pending_size;
         self.head.txid = txid;
         self.head.history = resulting_history;
-        self.head.active_commit_offset = commit_offset;
-        self.head.active_commit_end = commit_end;
+        self.head.active_commit_offset = active_state_offset(sequence);
+        self.head.active_commit_end = raw_end;
         if self.head.oldest_dirty_unix == 0 {
             self.head.oldest_dirty_unix = now;
         }
         self.head.last_dirty_unix = now;
-
-        if let Some(preserved_pages) = truncate_pages {
-            self.locations.retain(|page, _| *page <= preserved_pages);
-        }
-        for entry in &entries {
-            let frame = self
-                .pending_pages
-                .get(&entry.page_no)
-                .ok_or(StoreError::Range)?;
-            self.locations.insert(
-                entry.page_no,
-                PageLocation {
-                    source: FrameSource::Active,
-                    last_txid: txid,
-                    frame_offset: frame.offset,
-                    frame_record_len: entry.frame_record_len,
-                    page_hash: entry.page_hash,
-                },
-            );
-        }
-        if truncate_pages.is_some() {
-            self.locations.retain(|page, _| *page <= max_page);
-        }
-        self.pending_pages.clear();
-        self.trainer.commit_pending();
+        self.pending_raw_pages.clear();
+        self.pending_raw_originals.clear();
         self.pending_truncate_pages = None;
         self.pending_dirty = false;
-        self.pending_size = self.head.logical_size;
+        self.bootstrap = None;
         if retain_publication {
             self.publication_owner = PublicationOwner::Checkpoint;
         } else {
             self.release_publication();
+            self.rollover_at_size_target()?;
         }
-        Ok(())
-    }
-
-    fn stage_page(&mut self, page_no: u32, page: &[u8]) -> Result<(), StoreError> {
-        if page.len() != self.head.page_size as usize {
-            return Err(StoreError::InvalidPageLength {
-                page_no,
-                actual: page.len(),
-                expected: self.head.page_size as usize,
-            });
-        }
-        if page_no == 1 && parse_page_size(page) != Some(self.head.page_size) {
-            return Err(StoreError::InvalidPageSize(
-                parse_page_size(page).unwrap_or(0),
-            ));
-        }
-        self.ensure_active()?;
-        let txid = self.head.txid.checked_add(1).ok_or(StoreError::Range)?;
-        let page_hash = page_hash(txid, page_no, page);
-        let (codec, dictionary_index, stored) = self.encode_page(page)?;
-        let existing = self.pending_pages.remove(&page_no);
-        let stored_len = u32::try_from(stored.len()).map_err(|_| StoreError::Range)?;
-        let reusable = existing.filter(|frame| frame.header.capacity >= stored_len);
-        let offset_and_capacity = if let Some(frame) = reusable {
-            (frame.offset, frame.header.capacity)
-        } else {
-            if let Some(frame) = existing {
-                self.mark_frame_free(frame.offset, frame.header.capacity)?;
-            }
-            self.allocate_frame(u32::try_from(stored.len()).map_err(|_| StoreError::Range)?)?
-        };
-        let (offset, capacity) = offset_and_capacity;
-        let header = FrameHeader {
-            free: false,
-            page_no,
-            txid,
-            codec,
-            dictionary_index,
-            stored_len,
-            raw_len: self.head.page_size,
-            capacity,
-            page_hash,
-        };
-        let active = &self.active.file;
-        write_all_at(active, offset, &header.encode())?;
-        write_all_at(active, offset + FRAME_HEADER_SIZE as u64, &stored)?;
-        if capacity as usize > stored.len() {
-            zero_range(
-                active,
-                offset + FRAME_HEADER_SIZE as u64 + stored.len() as u64,
-                capacity as usize - stored.len(),
-            )?;
-        }
-        self.pending_pages
-            .insert(page_no, PendingFrame { offset, header });
-        let raw = Arc::new(page.to_vec());
-        self.cache
-            .insert_shared((page_no, txid, page_hash), Arc::clone(&raw));
-        if self.active.dictionaries.is_empty() {
-            let limit = usize::try_from(self.active.header.policy.dictionary.sample_bytes)
-                .unwrap_or(usize::MAX);
-            self.trainer.remember_pending(page_no, raw, limit);
-        }
-        Ok(())
-    }
-
-    fn encode_page(&self, page: &[u8]) -> Result<(Codec, u16, Vec<u8>), StoreError> {
-        let Some(dictionary) = self.active.dictionaries.first() else {
-            return Ok((Codec::Raw, u16::MAX, page.to_vec()));
-        };
-        let mut compressor = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, &dictionary.bytes)
-            .map_err(|error| StoreError::Zstd(error.to_string()))?;
-        let compressed = compressor
-            .compress(page)
-            .map_err(|error| StoreError::Zstd(error.to_string()))?;
-        if compressed.len().saturating_add(MIN_FRAME_SAVINGS) < page.len() {
-            Ok((Codec::Zstd, 0, compressed))
-        } else {
-            Ok((Codec::Raw, u16::MAX, page.to_vec()))
-        }
-    }
-
-    fn allocate_frame(&mut self, needed: u32) -> Result<(u64, u32), StoreError> {
-        let active = &self.active.file;
-        let offset = active.metadata()?.len();
-        let end = offset
-            .checked_add(FRAME_HEADER_SIZE as u64 + u64::from(needed))
-            .ok_or(StoreError::Range)?;
-        active.set_len(end)?;
-        Ok((offset, needed))
-    }
-
-    fn mark_frame_free(&mut self, offset: u64, capacity: u32) -> Result<(), StoreError> {
-        if capacity == 0 {
-            return Ok(());
-        }
-        let header = FrameHeader {
-            free: true,
-            page_no: 0,
-            txid: 0,
-            codec: Codec::Raw,
-            dictionary_index: u16::MAX,
-            stored_len: 0,
-            raw_len: 0,
-            capacity,
-            page_hash: [0; 32],
-        };
-        let active = &self.active.file;
-        write_all_at(active, offset, &header.encode())?;
-        let _ = punch_payload(
-            active,
-            offset + FRAME_HEADER_SIZE as u64,
-            u64::from(capacity),
-        );
         Ok(())
     }
 
@@ -1270,32 +1132,15 @@ impl Store {
         if header.page_size != 0 || self.head.txid != 0 || self.head.active_commit_offset != 0 {
             return Err(StoreError::IdentityMismatch);
         }
-        self.install_active(
-            self.active
-                .dictionaries
-                .first()
-                .map_or_else(Vec::new, |entry| entry.bytes.clone()),
-            self.active.header.policy,
-            self.active.header.last_dictionary_promotion_unix,
-        )
+        self.install_active(self.active.header.policy)
     }
 
-    fn install_active(
-        &mut self,
-        dictionary: Vec<u8>,
-        policy: StoragePolicyRecord,
-        last_dictionary_promotion_unix: u64,
-    ) -> Result<(), StoreError> {
+    fn install_active(&mut self, policy: StoragePolicyRecord) -> Result<(), StoreError> {
         let parent_physical_digest = self
             .segments
             .last()
             .map_or([0; 32], |segment| segment.id.physical_digest);
-        let active = self.create_active(
-            parent_physical_digest,
-            dictionary,
-            policy,
-            last_dictionary_promotion_unix,
-        )?;
+        let active = self.create_active(parent_physical_digest, policy)?;
         self.adopt_active(active);
         Ok(())
     }
@@ -1303,23 +1148,12 @@ impl Store {
     fn create_active(
         &self,
         parent_physical_digest: Digest,
-        dictionary: Vec<u8>,
         policy: StoragePolicyRecord,
-        last_dictionary_promotion_unix: u64,
     ) -> Result<ActiveSegment, StoreError> {
         let staging_id = random_bytes()?;
-        let dictionaries = if dictionary.is_empty() {
-            Vec::new()
-        } else {
-            let dictionary_digest = digest(&dictionary);
-            vec![DictionaryEntry {
-                digest: dictionary_digest,
-                bytes: dictionary,
-            }]
-        };
-        let dictionary_bytes = encode_dictionary_table(&dictionaries)?;
+        let dictionary_bytes = encode_dictionary_table(&[])?;
         let base_map = encode_map(&self.page_txid_map()?)?;
-        let dictionary_offset = SEGMENT_HEADER_SIZE as u64;
+        let dictionary_offset = ACTIVE_METADATA_END;
         let base_map_offset = dictionary_offset
             .checked_add(dictionary_bytes.len() as u64)
             .ok_or(StoreError::Range)?;
@@ -1328,6 +1162,7 @@ impl Store {
             .ok_or(StoreError::Range)?;
         let records_offset = align_up(unaligned_records_offset, SECTOR_SIZE as u64)?;
         let header = SegmentHeader {
+            mutable_snapshot: true,
             database_id: self.active.header.database_id,
             page_size: self.head.page_size,
             start_txid: self.head.txid.checked_add(1).ok_or(StoreError::Range)?,
@@ -1340,7 +1175,6 @@ impl Store {
                 .generation
                 .checked_add(1)
                 .ok_or(StoreError::Range)?,
-            last_dictionary_promotion_unix,
             policy,
             dictionary_offset,
             dictionary_len: dictionary_bytes.len() as u64,
@@ -1356,6 +1190,22 @@ impl Store {
             .create_new(true)
             .open(&path)?;
         write_all_at(&file, 0, &header.encode())?;
+        write_all_at(
+            &file,
+            ACTIVE_STATE_A_OFFSET,
+            &ActiveState {
+                database_id: header.database_id,
+                sequence: 1,
+                txid: self.head.txid,
+                logical_size: self.head.logical_size,
+                page_size: self.head.page_size,
+                history: self.head.history,
+                commit_unix: 0,
+                record_count: 0,
+                truncate_pages: None,
+            }
+            .encode(),
+        )?;
         write_all_at(&file, dictionary_offset, &dictionary_bytes)?;
         write_all_at(&file, base_map_offset, &base_map)?;
         file.set_len(records_offset)?;
@@ -1369,8 +1219,9 @@ impl Store {
         Ok(ActiveSegment {
             file: current,
             header,
-            trailer: None,
-            dictionaries,
+            state_sequence: 1,
+            active_records: BTreeMap::new(),
+            truncate_pages: None,
         })
     }
 
@@ -1384,18 +1235,19 @@ impl Store {
     }
 
     fn read_page(&mut self, page_no: u32) -> Result<Vec<u8>, StoreError> {
-        if let Some(frame) = self.pending_pages.get(&page_no).copied() {
-            return self.read_frame(
-                FrameSource::Active,
-                frame.offset,
-                u32::try_from(frame.header.record_len()).map_err(|_| StoreError::Range)?,
-                page_no,
-                frame.header.txid,
-                frame.header.page_hash,
-            );
-        }
         if self
             .pending_truncate_pages
+            .is_some_and(|preserved_pages| page_no > preserved_pages)
+            && !self.pending_raw_pages.contains(&page_no)
+        {
+            return Ok(vec![0; self.head.page_size as usize]);
+        }
+        if self.active.active_records.contains_key(&page_no) {
+            return self.read_mutable_page(page_no);
+        }
+        if self
+            .active
+            .truncate_pages
             .is_some_and(|preserved_pages| page_no > preserved_pages)
         {
             return Ok(vec![0; self.head.page_size as usize]);
@@ -1408,7 +1260,7 @@ impl Store {
             return Ok((*page).clone());
         }
         let page = self.read_frame(
-            location.source,
+            location.segment_index,
             location.frame_offset,
             location.frame_record_len,
             page_no,
@@ -1421,7 +1273,7 @@ impl Store {
 
     fn read_frame(
         &self,
-        source: FrameSource,
+        segment_index: usize,
         offset: u64,
         expected_record_len: u32,
         page_no: u32,
@@ -1429,29 +1281,25 @@ impl Store {
         expected_hash: Digest,
     ) -> Result<Vec<u8>, StoreError> {
         let mut encoded = [0; FRAME_HEADER_SIZE];
-        self.read_source(source, offset, &mut encoded)?;
+        self.read_source(segment_index, offset, &mut encoded)?;
         let header = FrameHeader::decode(&encoded)?;
-        if header.free
-            || header.record_len() != u64::from(expected_record_len)
+        if header.record_len() != u64::from(expected_record_len)
             || header.page_no != page_no
-            || header.txid != txid
-            || header.page_hash != expected_hash
             || header.raw_len != self.head.page_size
         {
             return Err(StoreError::Corrupt(offset));
         }
         let mut stored = vec![0; header.stored_len as usize];
-        self.read_source(source, offset + FRAME_HEADER_SIZE as u64, &mut stored)?;
-        let dictionaries = match source {
-            FrameSource::Active => &self.active.dictionaries,
-            FrameSource::Segment(index) => {
-                &self
-                    .segments
-                    .get(index)
-                    .ok_or(StoreError::Corrupt(offset))?
-                    .dictionaries
-            }
-        };
+        self.read_source(
+            segment_index,
+            offset + FRAME_HEADER_SIZE as u64,
+            &mut stored,
+        )?;
+        let dictionaries = &self
+            .segments
+            .get(segment_index)
+            .ok_or(StoreError::Corrupt(offset))?
+            .dictionaries;
         decode_frame_payload(
             header,
             &stored,
@@ -1465,36 +1313,34 @@ impl Store {
 
     fn read_source(
         &self,
-        source: FrameSource,
+        segment_index: usize,
         offset: u64,
         output: &mut [u8],
     ) -> Result<(), StoreError> {
-        match source {
-            FrameSource::Active => read_exact_at(&self.active.file, offset, output)?,
-            FrameSource::Segment(index) => read_exact_at(
-                &self
-                    .segments
-                    .get(index)
-                    .ok_or(StoreError::Corrupt(offset))?
-                    .file,
-                offset,
-                output,
-            )?,
-        }
+        read_exact_at(
+            &self
+                .segments
+                .get(segment_index)
+                .ok_or(StoreError::Corrupt(offset))?
+                .file,
+            offset,
+            output,
+        )?;
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn reload(&mut self) -> Result<(), StoreError> {
         let mut options = OpenOptions::new();
         options.read(true).write(self.writable);
         let current = options.open(&self.path)?;
         let header = read_segment_header(&current)?;
-        if header.database_id != self.active.header.database_id {
+        if header.database_id != self.active.header.database_id || !header.mutable_snapshot {
             return Err(StoreError::IdentityMismatch);
         }
         let discovered = discover_lineage(&self.backend, header)?;
         let page_size = header.page_size;
-        let (segments, mut locations) = load_segments(discovered, header.database_id, page_size)?;
+        let (segments, locations) = load_segments(discovered, header.database_id, page_size)?;
         let sealed_logical_size = segments
             .last()
             .map_or(0, |segment| segment.trailer.logical_size);
@@ -1530,241 +1376,59 @@ impl Store {
         if base_map != full_page_txid_map(&locations, base_page_count)? {
             return Err(StoreError::Corrupt(header.base_map_offset));
         }
-        let trailer = read_current_trailer(&current, header)?;
-        let active = ActiveSegment {
+        if !dictionaries.is_empty() {
+            return Err(StoreError::Corrupt(header.dictionary_offset));
+        }
+        let state = read_active_state(&current, header.database_id)?;
+        if state.page_size != header.page_size
+            || state.txid < sealed_head_txid
+            || (state.txid == sealed_head_txid
+                && (state.history != sealed_head_history
+                    || state.logical_size != sealed_logical_size))
+            || (state.txid > sealed_head_txid && state.txid < header.start_txid)
+        {
+            return Err(StoreError::IdentityMismatch);
+        }
+        let (active_records, expected_active_end) = load_active_records(
+            &current,
+            header.records_offset,
+            state.page_size,
+            state.record_count,
+        )?;
+        let file_len = current.metadata()?.len();
+        if file_len < expected_active_end {
+            return Err(StoreError::Corrupt(file_len));
+        }
+        self.active = ActiveSegment {
             file: current,
             header,
-            trailer,
-            dictionaries,
+            state_sequence: state.sequence,
+            active_records,
+            truncate_pages: state.truncate_pages,
         };
-        let mut head = HeadState {
-            page_size,
-            logical_size: sealed_logical_size,
-            txid: sealed_head_txid,
-            history: sealed_head_history,
-            active_commit_offset: 0,
-            active_commit_end: header.records_offset,
-            oldest_dirty_unix: 0,
-            last_dirty_unix: 0,
+        self.head = HeadState {
+            page_size: state.page_size,
+            logical_size: state.logical_size,
+            txid: state.txid,
+            history: state.history,
+            active_commit_offset: if state.txid < header.start_txid {
+                0
+            } else {
+                active_state_offset(state.sequence)
+            },
+            active_commit_end: expected_active_end,
+            oldest_dirty_unix: state.commit_unix,
+            last_dirty_unix: state.commit_unix,
         };
-        Self::apply_active_commits(&active, &segments, &mut head, &mut locations)?;
-        let _ = full_page_txid_map(&locations, page_count(head.logical_size, head.page_size)?)?;
-
-        self.active = active;
-        self.head = head;
         self.segments = segments;
         self.locations = locations;
-        self.pending_size = self.head.logical_size;
+        self.pending_size = state.logical_size;
         self.pending_truncate_pages = None;
         self.pending_dirty = false;
-        self.pending_pages.clear();
-        self.trainer.discard_pending();
+        self.pending_raw_pages.clear();
+        self.pending_raw_originals.clear();
         self.bootstrap = None;
         self.cache.clear();
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn apply_active_commits(
-        active: &ActiveSegment,
-        segments: &[SegmentMeta],
-        head: &mut HeadState,
-        locations: &mut BTreeMap<u32, PageLocation>,
-    ) -> Result<(), StoreError> {
-        let header = active.header;
-        let file = &active.file;
-        let file_len = file.metadata()?.len();
-        let scan_end = active
-            .trailer
-            .map_or(file_len, |trailer| trailer.index_offset);
-        let mut cursor = header.records_offset;
-        let mut previous_commit = 0_u64;
-        let mut txid = segments
-            .last()
-            .map_or(0, |segment| segment.trailer.end_txid);
-        let mut history = segments
-            .last()
-            .map_or_else(genesis_history, |segment| segment.trailer.end_history);
-        let mut logical_size = header.base_logical_size;
-        let mut page_size = header.page_size;
-        let mut committed_end = header.records_offset;
-        // Commit entries can only reference frames written since the previous
-        // commit. Keeping every historical frame header made reopen memory
-        // scale with all writes in the active segment, including dead ones.
-        let mut transaction_frames = BTreeMap::<u64, FrameHeader>::new();
-        'scan: while cursor < scan_end {
-            if scan_end - cursor < 4 {
-                break;
-            }
-            let mut magic = [0; 4];
-            read_exact_at(file, cursor, &mut magic)?;
-            if &magic == crate::format::FRAME_MAGIC || &magic == crate::format::FREE_MAGIC {
-                if scan_end - cursor < FRAME_HEADER_SIZE as u64 {
-                    break;
-                }
-                let mut encoded = [0; FRAME_HEADER_SIZE];
-                read_exact_at(file, cursor, &mut encoded)?;
-                let frame = match FrameHeader::decode(&encoded) {
-                    Ok(frame) => frame,
-                    Err(error) if active.trailer.is_none() => {
-                        let _ = error;
-                        break;
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                let frame_end = cursor
-                    .checked_add(frame.record_len())
-                    .ok_or(StoreError::Range)?;
-                if frame_end > scan_end {
-                    break;
-                }
-                transaction_frames.insert(cursor, frame);
-                cursor = frame_end;
-            } else if magic == [0; 4] && !cursor.is_multiple_of(SECTOR_SIZE as u64) {
-                let padding_end = align_up(cursor, SECTOR_SIZE as u64)?;
-                if padding_end > scan_end {
-                    break;
-                }
-                let mut padding =
-                    vec![0; usize::try_from(padding_end - cursor).map_err(|_| StoreError::Range)?];
-                read_exact_at(file, cursor, &mut padding)?;
-                if padding.iter().any(|byte| *byte != 0) {
-                    break;
-                }
-                cursor = padding_end;
-            } else if &magic == crate::format::COMMIT_MAGIC {
-                let (commit, entries) = match read_commit(file, cursor, scan_end) {
-                    Ok(commit) => commit,
-                    Err(error) if active.trailer.is_none() => {
-                        let _ = error;
-                        break;
-                    }
-                    Err(error) => return Err(error),
-                };
-                let expected_txid = txid.checked_add(1).ok_or(StoreError::Corrupt(cursor))?;
-                let expected_page_size = if page_size == 0 {
-                    commit.page_size
-                } else {
-                    page_size
-                };
-                if commit.previous_commit != previous_commit
-                    || commit.txid != expected_txid
-                    || commit.page_size != expected_page_size
-                    || commit.previous_history != history
-                    || commit.entries_digest != digest(&encode_commit_entries(&entries))
-                    || commit.transaction_hash
-                        != transaction_hash(
-                            commit.txid,
-                            commit.logical_size,
-                            commit.page_size,
-                            commit.truncate_pages,
-                            &entries,
-                        )
-                    || commit.resulting_history != history_hash(history, commit.transaction_hash)
-                {
-                    if active.trailer.is_none() {
-                        break 'scan;
-                    }
-                    return Err(StoreError::Corrupt(cursor));
-                }
-                let max_page = page_count(commit.logical_size, commit.page_size)?;
-                let mut previous_page = 0_u32;
-                for entry in &entries {
-                    let frame = transaction_frames
-                        .get(&entry.frame_offset)
-                        .ok_or(StoreError::Corrupt(entry.frame_offset))?;
-                    if entry.page_no <= previous_page
-                        || entry.page_no > max_page
-                        || frame.free
-                        || frame.page_no != entry.page_no
-                        || frame.txid != commit.txid
-                        || frame.record_len() != u64::from(entry.frame_record_len)
-                        || frame.page_hash != entry.page_hash
-                        || frame.raw_len != commit.page_size
-                    {
-                        if active.trailer.is_none() {
-                            break 'scan;
-                        }
-                        return Err(StoreError::Corrupt(entry.frame_offset));
-                    }
-                    let mut stored = vec![0; frame.stored_len as usize];
-                    read_exact_at(
-                        file,
-                        entry.frame_offset + FRAME_HEADER_SIZE as u64,
-                        &mut stored,
-                    )?;
-                    if let Err(error) = decode_frame_payload(
-                        *frame,
-                        &stored,
-                        &active.dictionaries,
-                        entry.page_no,
-                        commit.txid,
-                        entry.page_hash,
-                        entry.frame_offset,
-                    ) {
-                        if active.trailer.is_none() {
-                            let _ = error;
-                            break 'scan;
-                        }
-                        return Err(error);
-                    }
-                    previous_page = entry.page_no;
-                }
-                if let Some(preserved_pages) = commit.truncate_pages {
-                    locations.retain(|page, _| *page <= preserved_pages);
-                }
-                for entry in entries {
-                    locations.insert(
-                        entry.page_no,
-                        PageLocation {
-                            source: FrameSource::Active,
-                            last_txid: commit.txid,
-                            frame_offset: entry.frame_offset,
-                            frame_record_len: entry.frame_record_len,
-                            page_hash: entry.page_hash,
-                        },
-                    );
-                }
-                locations.retain(|page, _| *page <= max_page);
-                previous_commit = cursor;
-                txid = commit.txid;
-                history = commit.resulting_history;
-                logical_size = commit.logical_size;
-                page_size = commit.page_size;
-                if head.oldest_dirty_unix == 0 {
-                    head.oldest_dirty_unix = commit.commit_unix;
-                }
-                head.last_dirty_unix = commit.commit_unix;
-                transaction_frames.clear();
-                cursor = cursor
-                    .checked_add(u64::from(commit.record_len))
-                    .ok_or(StoreError::Range)?;
-                committed_end = cursor;
-            } else {
-                break;
-            }
-        }
-        if active.trailer.is_some() && (cursor != scan_end || !transaction_frames.is_empty()) {
-            return Err(StoreError::Corrupt(cursor));
-        }
-        head.page_size = page_size;
-        head.logical_size = logical_size;
-        head.txid = txid;
-        head.history = history;
-        head.active_commit_offset = previous_commit;
-        head.active_commit_end = committed_end;
-        if let Some(trailer) = active.trailer
-            && (trailer.database_id != active.header.database_id
-                || trailer.start_txid != header.start_txid
-                || trailer.end_txid != txid
-                || trailer.base_history != header.base_history
-                || trailer.end_history != history
-                || trailer.logical_size != logical_size
-                || trailer.page_size != page_size
-                || trailer.content_root != content_root(locations))
-        {
-            return Err(StoreError::Corrupt(scan_end));
-        }
         Ok(())
     }
 
@@ -1784,33 +1448,200 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn seal_active(&mut self) -> Result<(), StoreError> {
-        if self.active.trailer.is_some() {
-            return self.finish_sealed_rollover();
+        if self.head.txid < self.active.header.start_txid {
+            return Ok(());
         }
-        let active = &self.active.file;
-        let header = self.active.header;
-        let index = self
-            .locations
-            .iter()
-            .filter_map(|(page_no, location)| {
-                (location.source == FrameSource::Active).then_some(SegmentIndexEntry {
-                    page_no: *page_no,
-                    last_txid: location.last_txid,
-                    frame_offset: location.frame_offset,
-                    frame_record_len: location.frame_record_len,
-                    page_hash: location.page_hash,
-                })
-            })
+        let logical_page_count = page_count(self.head.logical_size, self.head.page_size)?;
+        let active_pages = self
+            .active
+            .active_records
+            .keys()
+            .copied()
+            .filter(|page_no| *page_no <= logical_page_count)
             .collect::<Vec<_>>();
-        let index_offset = self.head.active_commit_end;
+        let sample_limit = usize::try_from(self.active.header.policy.dictionary.sample_bytes)
+            .unwrap_or(usize::MAX);
+        let mut sample_bytes = 0_usize;
+        let mut samples = Vec::<Vec<u8>>::new();
+        for page_no in &active_pages {
+            if sample_bytes.saturating_add(self.head.page_size as usize) > sample_limit {
+                break;
+            }
+            let page = self.read_mutable_page(*page_no)?;
+            sample_bytes = sample_bytes.saturating_add(page.len());
+            samples.push(page);
+        }
+        let dictionary_size =
+            usize::try_from(self.active.header.policy.dictionary.dictionary_bytes)
+                .map_err(|_| StoreError::Range)?;
+        let dictionary = if samples.len() >= MIN_TRAINING_PAGES
+            && sample_bytes >= MIN_TRAINING_BYTES
+            && dictionary_size != 0
+        {
+            let borrowed = samples.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            zstd::dict::from_samples(&borrowed, dictionary_size).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut dictionaries = self.segments.last().map_or_else(
+            || Arc::new(Vec::new()),
+            |segment| Arc::clone(&segment.dictionaries),
+        );
+        let mut dictionary_additions = Vec::new();
+        let dictionary_index = if dictionary.is_empty() {
+            dictionaries
+                .len()
+                .checked_sub(1)
+                .map(u16::try_from)
+                .transpose()
+                .map_err(|_| StoreError::Range)?
+        } else {
+            let dictionary_digest = digest(&dictionary);
+            if let Some(index) = dictionaries
+                .iter()
+                .position(|entry| entry.digest == dictionary_digest)
+            {
+                Some(u16::try_from(index).map_err(|_| StoreError::Range)?)
+            } else {
+                // u16::MAX is reserved as the raw-frame selector.
+                if dictionaries.len() >= u16::MAX as usize {
+                    return Err(StoreError::Range);
+                }
+                let index = u16::try_from(dictionaries.len()).map_err(|_| StoreError::Range)?;
+                let entry = DictionaryEntry {
+                    digest: dictionary_digest,
+                    bytes: dictionary,
+                };
+                dictionary_additions.push(entry.clone());
+                Arc::make_mut(&mut dictionaries).push(entry);
+                Some(index)
+            }
+        };
+        let dictionary_bytes = encode_dictionary_table(&dictionary_additions)?;
+        let base_page_count = page_count(
+            self.active.header.base_logical_size,
+            self.active.header.page_size,
+        )?;
+        let base_map = encode_map(&full_page_txid_map(&self.locations, base_page_count)?)?;
+        let dictionary_offset = SEGMENT_HEADER_SIZE as u64;
+        let base_map_offset = dictionary_offset
+            .checked_add(dictionary_bytes.len() as u64)
+            .ok_or(StoreError::Range)?;
+        let records_offset = align_up(
+            base_map_offset
+                .checked_add(base_map.len() as u64)
+                .ok_or(StoreError::Range)?,
+            SECTOR_SIZE as u64,
+        )?;
+        let staging_id = random_bytes()?;
+        let path = active_staging_path(&self.path, staging_id).with_extension("seal");
+        let cleanup = CleanupFile(path.clone());
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let header = SegmentHeader {
+            mutable_snapshot: false,
+            database_id: self.active.header.database_id,
+            page_size: self.head.page_size,
+            start_txid: self.active.header.start_txid,
+            base_history: self.active.header.base_history,
+            parent_physical_digest: self.active.header.parent_physical_digest,
+            base_logical_size: self.active.header.base_logical_size,
+            generation: self.active.header.generation,
+            policy: self.active.header.policy,
+            dictionary_offset,
+            dictionary_len: dictionary_bytes.len() as u64,
+            base_map_offset,
+            base_map_len: base_map.len() as u64,
+            records_offset,
+        };
+        write_all_at(&file, 0, &header.encode())?;
+        write_all_at(&file, dictionary_offset, &dictionary_bytes)?;
+        write_all_at(&file, base_map_offset, &base_map)?;
+
+        let mut compressor = dictionary_index
+            .and_then(|index| dictionaries.get(index as usize))
+            .map(|entry| zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, &entry.bytes))
+            .transpose()
+            .map_err(|error| StoreError::Zstd(error.to_string()))?;
+        let mut cursor = records_offset;
+        let mut index = Vec::with_capacity(active_pages.len());
+        let segment_index = self.segments.len();
+        let mut new_locations = self.locations.clone();
+        if let Some(preserved_pages) = self.active.truncate_pages {
+            new_locations.retain(|page_no, _| *page_no <= preserved_pages);
+        }
+        new_locations.retain(|page_no, _| *page_no <= logical_page_count);
+        for page_no in active_pages {
+            let page = self.read_mutable_page(page_no)?;
+            if page.iter().all(|byte| *byte == 0) {
+                new_locations.remove(&page_no);
+                continue;
+            }
+            let compressed = compressor
+                .as_mut()
+                .map(|compressor| compressor.compress(&page))
+                .transpose()
+                .map_err(|error| StoreError::Zstd(error.to_string()))?;
+            let (codec, frame_dictionary_index, payload) = compressed.map_or_else(
+                || (Codec::Raw, u16::MAX, page.clone()),
+                |compressed| {
+                    if compressed.len().saturating_add(MIN_FRAME_SAVINGS) < page.len() {
+                        (
+                            Codec::Zstd,
+                            dictionary_index.expect("a compressor has a dictionary selector"),
+                            compressed,
+                        )
+                    } else {
+                        (Codec::Raw, u16::MAX, page.clone())
+                    }
+                },
+            );
+            let page_hash = page_hash(self.head.txid, page_no, &page);
+            let stored_len = u32::try_from(payload.len()).map_err(|_| StoreError::Range)?;
+            let frame = FrameHeader {
+                page_no,
+                codec,
+                dictionary_index: frame_dictionary_index,
+                stored_len,
+                raw_len: self.head.page_size,
+            };
+            write_all_at(&file, cursor, &frame.encode())?;
+            write_all_at(&file, cursor + FRAME_HEADER_SIZE as u64, &payload)?;
+            let record_len = u32::try_from(frame.record_len()).map_err(|_| StoreError::Range)?;
+            index.push(SegmentIndexEntry {
+                page_no,
+                last_txid: self.head.txid,
+                frame_offset: cursor,
+                frame_record_len: record_len,
+                page_hash,
+            });
+            new_locations.insert(
+                page_no,
+                PageLocation {
+                    segment_index,
+                    last_txid: self.head.txid,
+                    frame_offset: cursor,
+                    frame_record_len: record_len,
+                    page_hash,
+                },
+            );
+            cursor = cursor
+                .checked_add(frame.record_len())
+                .ok_or(StoreError::Range)?;
+        }
+        let page_map = full_page_txid_map(&new_locations, logical_page_count)?;
         let trailer = finalize_segment(
-            active,
-            index_offset,
+            &file,
+            cursor,
             &index,
-            &self.page_txid_map()?,
+            &page_map,
             SegmentTrailer {
-                database_id: self.active.header.database_id,
+                database_id: header.database_id,
                 start_txid: header.start_txid,
                 end_txid: self.head.txid,
                 base_history: header.base_history,
@@ -1821,70 +1652,39 @@ impl Store {
                 index_len: 0,
                 map_offset: 0,
                 map_len: 0,
-                content_root: content_root(&self.locations),
+                content_root: content_root(&new_locations),
                 physical_digest: [0; 32],
             },
         )?;
-        self.active.trailer = Some(trailer);
-        self.finish_sealed_rollover()?;
-        self.collect_garbage(8)?;
-        Ok(())
-    }
-
-    fn finish_sealed_rollover(&mut self) -> Result<(), StoreError> {
-        let trailer = self.active.trailer.ok_or(StoreError::Corrupt(0))?;
-        let active = &self.active.file;
         let id = SegmentId {
-            start_txid: trailer.start_txid,
-            end_txid: trailer.end_txid,
-            end_history: trailer.end_history,
+            start_txid: header.start_txid,
+            end_txid: self.head.txid,
+            end_history: self.head.history,
             physical_digest: trailer.physical_digest,
         };
-        self.backend.put_segment(&id, &self.path)?;
-        let segment_file = File::open(self.backend.segment_path(&id))?;
-        let segment_index = self.segments.len();
-        let segment = SegmentMeta {
-            id: id.clone(),
-            file: segment_file,
-            file_len: active.metadata()?.len(),
+        self.backend.put_segment(&id, &path)?;
+        let file_len = file.metadata()?.len();
+        let new_segment = SegmentMeta {
+            id,
+            file,
+            file_len,
             trailer,
-            dictionaries: self.active.dictionaries.clone(),
+            dictionaries,
         };
-        let mut dictionary = self
-            .active
-            .dictionaries
-            .first()
-            .map_or_else(Vec::new, |entry| entry.bytes.clone());
-        let policy = self.active.header.policy;
-        let mut promotion = self.active.header.last_dictionary_promotion_unix;
-        if dictionary.is_empty() {
-            let candidate = self.trainer.candidate.take().or_else(|| {
-                self.trainer
-                    .take_training(policy.dictionary.dictionary_bytes as usize)
-                    .and_then(DictionaryTraining::train)
-            });
-            if let Some(candidate) = candidate {
-                dictionary = candidate;
-                promotion = unix_time();
-            }
-        }
-        let next = match self.create_active(id.physical_digest, dictionary, policy, promotion) {
+        verify_segment_physical(&new_segment)?;
+        let parent_physical_digest = new_segment.id.physical_digest;
+        self.segments.push(new_segment);
+        self.locations = new_locations;
+        let next = match self.create_active(parent_physical_digest, self.active.header.policy) {
             Ok(active) => active,
             Err(error) => {
-                // A directory-sync error can occur after rename, while earlier
-                // errors leave the sealed file at `.zsqlite`. Reload whichever
-                // complete pathname state is visible before returning the error.
                 let _ = self.reload();
                 return Err(error);
             }
         };
-        self.segments.push(segment);
-        for location in self.locations.values_mut() {
-            if location.source == FrameSource::Active {
-                location.source = FrameSource::Segment(segment_index);
-            }
-        }
         self.adopt_active(next);
+        drop(cleanup);
+        self.collect_garbage(8)?;
         Ok(())
     }
 
@@ -1898,18 +1698,18 @@ impl Store {
     #[allow(clippy::too_many_lines)]
     fn compact_inner(&mut self) -> Result<(), StoreError> {
         let active_has_commits = self.head.txid >= self.active.header.start_txid;
-        if self.has_pending() || active_has_commits || self.active.trailer.is_some() {
+        if self.has_pending() || active_has_commits {
             self.flush_sidecars()?;
             self.begin_write()?;
-        }
-        if self.head.txid == 0 || self.segments.len() <= 1 {
-            self.release_publication();
-            return Ok(());
         }
         // Never make a corrupt source generation authoritative. This check
         // also covers bytes that are not represented in the logical index.
         for segment in &self.segments {
             verify_segment_physical(segment)?;
+        }
+        if self.head.txid == 0 || self.segments.len() <= 1 {
+            self.release_publication();
+            return Ok(());
         }
         let staging_id = random_bytes()?;
         let path = active_staging_path(&self.path, staging_id).with_extension("compact");
@@ -1927,6 +1727,7 @@ impl Store {
         let records_offset =
             align_up(base_map_offset + empty_map.len() as u64, SECTOR_SIZE as u64)?;
         let header = SegmentHeader {
+            mutable_snapshot: false,
             database_id: self.active.header.database_id,
             page_size: self.head.page_size,
             start_txid: 1,
@@ -1939,7 +1740,6 @@ impl Store {
                 .generation
                 .checked_add(1)
                 .ok_or(StoreError::Range)?,
-            last_dictionary_promotion_unix: self.active.header.last_dictionary_promotion_unix,
             policy: self.active.header.policy,
             dictionary_offset,
             dictionary_len: dictionary_bytes.len() as u64,
@@ -1964,27 +1764,21 @@ impl Store {
         let mut index = Vec::with_capacity(self.locations.len());
         for (page_no, location) in &self.locations {
             let mut encoded = [0; FRAME_HEADER_SIZE];
-            self.read_source(location.source, location.frame_offset, &mut encoded)?;
+            self.read_source(location.segment_index, location.frame_offset, &mut encoded)?;
             let mut frame = FrameHeader::decode(&encoded)?;
             let mut payload = vec![0; frame.stored_len as usize];
             self.read_source(
-                location.source,
+                location.segment_index,
                 location.frame_offset + FRAME_HEADER_SIZE as u64,
                 &mut payload,
             )?;
-            if frame.free
-                || frame.page_no != *page_no
-                || frame.txid != location.last_txid
-                || frame.page_hash != location.page_hash
+            if frame.page_no != *page_no
                 || frame.raw_len != self.head.page_size
                 || frame.record_len() != u64::from(location.frame_record_len)
             {
                 return Err(StoreError::Corrupt(location.frame_offset));
             }
-            let source_dictionaries = match location.source {
-                FrameSource::Active => &self.active.dictionaries,
-                FrameSource::Segment(segment) => &self.segments[segment].dictionaries,
-            };
+            let source_dictionaries = &self.segments[location.segment_index].dictionaries;
             // Validate the exact encoded bytes that will be copied. This is
             // intentionally before selector remapping so the source
             // dictionary identity is still available.
@@ -2005,7 +1799,6 @@ impl Store {
                     .get(&source_dictionary.digest)
                     .ok_or(StoreError::Corrupt(location.frame_offset))?;
             }
-            frame.capacity = frame.stored_len;
             let _ = decode_frame_payload(
                 frame,
                 &payload,
@@ -2062,7 +1855,7 @@ impl Store {
             file,
             file_len,
             trailer,
-            dictionaries,
+            dictionaries: Arc::new(dictionaries),
         };
         verify_segment_physical(&new_segment)?;
         let mut new_locations = BTreeMap::new();
@@ -2070,7 +1863,7 @@ impl Store {
             new_locations.insert(
                 value.page_no,
                 PageLocation {
-                    source: FrameSource::Segment(0),
+                    segment_index: 0,
                     last_txid: value.last_txid,
                     frame_offset: value.frame_offset,
                     frame_record_len: value.frame_record_len,
@@ -2079,17 +1872,7 @@ impl Store {
             );
         }
         let parent_physical_digest = new_segment.id.physical_digest;
-        let dictionary = self
-            .active
-            .dictionaries
-            .first()
-            .map_or_else(Vec::new, |entry| entry.bytes.clone());
-        let next = match self.create_active(
-            parent_physical_digest,
-            dictionary,
-            self.active.header.policy,
-            self.active.header.last_dictionary_promotion_unix,
-        ) {
+        let next = match self.create_active(parent_physical_digest, self.active.header.policy) {
             Ok(active) => active,
             Err(error) => {
                 let _ = self.reload();
@@ -2147,11 +1930,12 @@ impl Store {
                 segment_allocated_bytes.saturating_add(allocated_bytes(&path.metadata()?));
         }
         let file_metadata = self.active.file.metadata()?;
+        let logical_page_count = page_count(self.head.logical_size, self.head.page_size)?;
         Ok(Inspect {
             path: self.path.clone(),
             sidecar_path: self.sidecar_path.clone(),
             page_size: self.head.page_size,
-            page_count: page_count(self.head.logical_size, self.head.page_size)?,
+            page_count: logical_page_count,
             logical_size: self.head.logical_size,
             head_txid: self.head.txid,
             head_history: self.head.history,
@@ -2162,11 +1946,17 @@ impl Store {
             file_allocated_bytes: allocated_bytes(&file_metadata),
             segment_bytes,
             segment_allocated_bytes,
-            indexed_pages: self.locations.len(),
-            dictionary_bytes: self
+            indexed_pages: self
                 .active
-                .dictionaries
-                .first()
+                .active_records
+                .keys()
+                .filter(|page_no| !self.locations.contains_key(page_no))
+                .count()
+                .saturating_add(self.locations.len()),
+            dictionary_bytes: self
+                .segments
+                .last()
+                .and_then(|segment| segment.dictionaries.first())
                 .map_or(0, |entry| entry.bytes.len()),
             policy: StoragePolicy::decode(self.active.header.policy),
         })
@@ -2177,14 +1967,7 @@ impl Store {
         if self.head.txid >= self.active.header.start_txid {
             self.seal_active()?;
         }
-        self.install_active(
-            self.active
-                .dictionaries
-                .first()
-                .map_or_else(Vec::new, |entry| entry.bytes.clone()),
-            policy.encode()?,
-            self.active.header.last_dictionary_promotion_unix,
-        )?;
+        self.install_active(policy.encode()?)?;
         self.release_publication();
         Ok(())
     }
@@ -2192,6 +1975,10 @@ impl Store {
     pub(crate) fn background_flush_due(&self) -> bool {
         if self.has_pending() || self.head.txid < self.active.header.start_txid {
             return false;
+        }
+        let target = self.active.header.policy.target_segment_bytes;
+        if target != 0 && self.head.active_commit_end >= target {
+            return true;
         }
         let now = unix_time();
         now.saturating_sub(self.head.last_dirty_unix)
@@ -2213,20 +2000,18 @@ impl Store {
         self.collect_garbage(8)
     }
 
-    pub(crate) fn take_dictionary_training(&mut self) -> Option<DictionaryTraining> {
-        if !self.active.dictionaries.is_empty() {
-            return None;
+    fn rollover_at_size_target(&mut self) -> Result<(), StoreError> {
+        let target = self.active.header.policy.target_segment_bytes;
+        if target == 0
+            || self.head.txid < self.active.header.start_txid
+            || self.head.active_commit_end < target
+        {
+            return Ok(());
         }
-        self.trainer.take_training(
-            usize::try_from(self.active.header.policy.dictionary.dictionary_bytes)
-                .unwrap_or(usize::MAX),
-        )
-    }
-
-    pub(crate) fn stage_dictionary_candidate(&mut self, candidate: Vec<u8>) {
-        if self.active.dictionaries.is_empty() && !candidate.is_empty() {
-            self.trainer.candidate = Some(candidate);
-        }
+        self.acquire_maintenance()?;
+        let result = self.flush_sidecars();
+        self.release_maintenance();
+        result
     }
 
     pub(crate) fn acquire_maintenance(&mut self) -> Result<(), StoreError> {
@@ -2261,10 +2046,25 @@ impl Store {
     }
 
     fn page_txid_map(&self) -> Result<Vec<u64>, StoreError> {
-        full_page_txid_map(
-            &self.locations,
-            page_count(self.head.logical_size, self.head.page_size)?,
-        )
+        let pages = page_count(self.head.logical_size, self.head.page_size)?;
+        let mut map = full_page_txid_map(&self.locations, pages)?;
+        if let Some(preserved_pages) = self.active.truncate_pages {
+            for txid in map.iter_mut().skip(preserved_pages as usize) {
+                *txid = 0;
+            }
+        }
+        for page_no in self.active.active_records.keys().copied() {
+            if page_no > pages {
+                continue;
+            }
+            let page = self.read_mutable_page(page_no)?;
+            map[page_no as usize - 1] = if page.iter().all(|byte| *byte == 0) {
+                0
+            } else {
+                self.head.txid
+            };
+        }
+        Ok(map)
     }
 
     fn try_lifecycle_exclusive(&self) -> Result<bool, StoreError> {
@@ -2348,6 +2148,9 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
+        if self.has_pending() {
+            self.discard_mutable_pending();
+        }
         if self.publication_owner.is_locked() {
             let _ = unlock_file(&self.publication);
             self.publication_owner = PublicationOwner::None;
@@ -2405,11 +2208,25 @@ fn load_segments(
         {
             return Err(StoreError::Corrupt(0));
         }
-        let dictionaries = read_dictionary_table_file(
+        let dictionary_additions = read_dictionary_table_file(
             &discovered.file,
             header.dictionary_offset,
             header.dictionary_len,
         )?;
+        let mut dictionaries = segments.last().map_or_else(
+            || Arc::new(Vec::new()),
+            |segment| Arc::clone(&segment.dictionaries),
+        );
+        for dictionary in dictionary_additions {
+            if dictionaries.len() >= u16::MAX as usize
+                || dictionaries
+                    .iter()
+                    .any(|existing| existing.digest == dictionary.digest)
+            {
+                return Err(StoreError::Corrupt(header.dictionary_offset));
+            }
+            Arc::make_mut(&mut dictionaries).push(dictionary);
+        }
         let base_page_count = if segment_index == 0 {
             0
         } else {
@@ -2458,7 +2275,7 @@ fn load_segments(
             locations.insert(
                 value.page_no,
                 PageLocation {
-                    source: FrameSource::Segment(segment_index),
+                    segment_index,
                     last_txid: value.last_txid,
                     frame_offset: value.frame_offset,
                     frame_record_len: value.frame_record_len,
@@ -2536,44 +2353,6 @@ fn finalize_segment(
     Ok(trailer)
 }
 
-fn read_commit(
-    file: &File,
-    offset: u64,
-    committed_end: u64,
-) -> Result<(CommitHeader, Vec<CommitEntry>), StoreError> {
-    let mut encoded = [0; COMMIT_HEADER_SIZE];
-    read_exact_at(file, offset, &mut encoded)?;
-    let header = CommitHeader::decode(&encoded)?;
-    let record_end = offset
-        .checked_add(u64::from(header.record_len))
-        .ok_or(StoreError::Range)?;
-    if record_end > committed_end {
-        return Err(StoreError::Corrupt(offset));
-    }
-    let mut entries = Vec::new();
-    entries
-        .try_reserve_exact(header.entry_count as usize)
-        .map_err(|_| StoreError::Range)?;
-    let mut cursor = offset + COMMIT_HEADER_SIZE as u64;
-    for _ in 0..header.entry_count {
-        let mut encoded = [0; COMMIT_ENTRY_SIZE];
-        read_exact_at(file, cursor, &mut encoded)?;
-        entries.push(CommitEntry::decode(&encoded)?);
-        cursor += COMMIT_ENTRY_SIZE as u64;
-    }
-    if cursor < record_end {
-        let padding = read_range_file(file, cursor, record_end - cursor)?;
-        if padding.iter().any(|byte| *byte != 0) {
-            return Err(StoreError::Corrupt(cursor));
-        }
-    }
-    Ok((header, entries))
-}
-
-fn encode_commit_entries(entries: &[CommitEntry]) -> Vec<u8> {
-    entries.iter().flat_map(|entry| entry.encode()).collect()
-}
-
 fn page_hash(txid: u64, page_no: u32, page: &[u8]) -> Digest {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"zsqlite/page/v1\0");
@@ -2619,7 +2398,7 @@ fn transaction_hash(
     logical_size: u64,
     page_size: u32,
     truncate_pages: Option<u32>,
-    entries: &[CommitEntry],
+    entries: &[PageChange],
 ) -> Digest {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"zsqlite/transaction/v1\0");
@@ -2699,7 +2478,10 @@ fn read_range_file(file: &File, offset: u64, length: u64) -> Result<Vec<u8>, Sto
 
 fn union_dictionaries(segments: &[SegmentMeta]) -> Vec<DictionaryEntry> {
     let mut output = BTreeMap::new();
-    for dictionary in segments.iter().flat_map(|segment| &segment.dictionaries) {
+    for dictionary in segments
+        .iter()
+        .flat_map(|segment| segment.dictionaries.iter())
+    {
         output
             .entry(dictionary.digest)
             .or_insert_with(|| dictionary.bytes.clone());
@@ -2757,32 +2539,65 @@ fn read_segment_header(file: &File) -> Result<SegmentHeader, StoreError> {
     SegmentHeader::decode(&encoded).map_err(StoreError::from)
 }
 
-fn read_current_trailer(
+fn active_state_offset(sequence: u64) -> u64 {
+    if sequence.is_multiple_of(2) {
+        ACTIVE_STATE_B_OFFSET
+    } else {
+        ACTIVE_STATE_A_OFFSET
+    }
+}
+
+fn read_active_state(file: &File, database_id: DatabaseId) -> Result<ActiveState, StoreError> {
+    let mut states = Vec::with_capacity(2);
+    for offset in [ACTIVE_STATE_A_OFFSET, ACTIVE_STATE_B_OFFSET] {
+        let mut encoded = [0; ACTIVE_STATE_SIZE];
+        if read_exact_at(file, offset, &mut encoded).is_ok()
+            && let Ok(state) = ActiveState::decode(&encoded)
+            && state.database_id == database_id
+        {
+            states.push(state);
+        }
+    }
+    states
+        .into_iter()
+        .max_by_key(|state| state.sequence)
+        .ok_or(StoreError::Corrupt(ACTIVE_STATE_A_OFFSET))
+}
+
+fn load_active_records(
     file: &File,
-    header: SegmentHeader,
-) -> Result<Option<SegmentTrailer>, StoreError> {
+    records_offset: u64,
+    page_size: u32,
+    record_count: u64,
+) -> Result<(BTreeMap<u32, u64>, u64), StoreError> {
+    if page_size == 0 {
+        if record_count != 0 {
+            return Err(StoreError::Corrupt(records_offset));
+        }
+        return Ok((BTreeMap::new(), records_offset));
+    }
     let file_len = file.metadata()?.len();
-    if file_len < header.records_offset + SEGMENT_TRAILER_SIZE as u64 {
-        return Ok(None);
+    let mut cursor = records_offset;
+    let mut records = BTreeMap::new();
+    for _ in 0..record_count {
+        let mut encoded = [0; FRAME_HEADER_SIZE];
+        read_exact_at(file, cursor, &mut encoded)?;
+        let header = FrameHeader::decode(&encoded)?;
+        let end = cursor
+            .checked_add(header.record_len())
+            .ok_or(StoreError::Range)?;
+        if end > file_len
+            || header.codec != Codec::Raw
+            || header.dictionary_index != u16::MAX
+            || header.stored_len != page_size
+            || header.raw_len != page_size
+            || records.insert(header.page_no, cursor).is_some()
+        {
+            return Err(StoreError::Corrupt(cursor));
+        }
+        cursor = end;
     }
-    let offset = file_len - SEGMENT_TRAILER_SIZE as u64;
-    let mut encoded = [0; SEGMENT_TRAILER_SIZE];
-    read_exact_at(file, offset, &mut encoded)?;
-    if &encoded[..8] != crate::format::TRAILER_MAGIC {
-        return Ok(None);
-    }
-    let Ok(trailer) = SegmentTrailer::decode(&encoded) else {
-        return Ok(None);
-    };
-    if trailer.database_id != header.database_id
-        || trailer.start_txid != header.start_txid
-        || trailer.base_history != header.base_history
-        || trailer.map_offset.checked_add(trailer.map_len) != Some(offset)
-        || !verify_file_physical(file, trailer)?
-    {
-        return Ok(None);
-    }
-    Ok(Some(trailer))
+    Ok((records, cursor))
 }
 
 fn verify_file_physical(file: &File, trailer: SegmentTrailer) -> Result<bool, StoreError> {
@@ -2897,11 +2712,9 @@ fn active_staging_path(path: &Path, id: [u8; 16]) -> PathBuf {
 fn validate_policy(value: StoragePolicyRecord) -> Result<(), StoreError> {
     if value.settle_seconds == 0
         || value.max_stale_seconds < value.settle_seconds
+        || (value.target_segment_bytes != 0 && value.target_segment_bytes < 1024 * 1024)
         || !(8 * 1024..=112 * 1024).contains(&value.dictionary.dictionary_bytes)
         || value.dictionary.sample_bytes < MIN_TRAINING_BYTES as u64
-        || value.dictionary.min_improvement_bps > 10_000
-        || value.dictionary.retrain_churn_bps > 10_000
-        || value.dictionary.promotion_cooldown_seconds == 0
     {
         return Err(StoreError::InvalidConfiguration("invalid storage policy"));
     }
@@ -2994,9 +2807,9 @@ fn lock_existing_for_delete(path: &Path) -> Result<Option<File>, StoreError> {
 }
 
 #[cfg(unix)]
-fn reject_aliased_active(file: &File, header: SegmentHeader) -> Result<(), StoreError> {
+fn reject_aliased_active(file: &File) -> Result<(), StoreError> {
     use std::os::unix::fs::MetadataExt;
-    if file.metadata()?.nlink() == 1 || read_current_trailer(file, header)?.is_some() {
+    if file.metadata()?.nlink() == 1 {
         Ok(())
     } else {
         Err(StoreError::Busy)
@@ -3004,7 +2817,7 @@ fn reject_aliased_active(file: &File, header: SegmentHeader) -> Result<(), Store
 }
 
 #[cfg(not(unix))]
-fn reject_aliased_active(_file: &File, _header: SegmentHeader) -> Result<(), StoreError> {
+fn reject_aliased_active(_file: &File) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -3034,79 +2847,6 @@ pub(crate) fn reject_auxiliary_files(path: &Path) -> Result<(), StoreError> {
         }
     }
     Ok(())
-}
-
-fn zero_range(file: &File, offset: u64, length: usize) -> Result<(), StoreError> {
-    let zeros = [0; 4096];
-    let mut offset = offset;
-    let mut remaining = length;
-    while remaining > 0 {
-        let amount = remaining.min(zeros.len());
-        write_all_at(file, offset, &zeros[..amount])?;
-        offset += amount as u64;
-        remaining -= amount;
-    }
-    Ok(())
-}
-
-fn punch_payload(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
-    let end = offset
-        .checked_add(length)
-        .ok_or_else(|| std::io::Error::from(ErrorKind::InvalidInput))?;
-    let start = offset.saturating_add(4095) / 4096 * 4096;
-    let aligned_end = end / 4096 * 4096;
-    if start >= aligned_end {
-        return Ok(());
-    }
-    punch_aligned(file, start, aligned_end - start)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn punch_aligned(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let offset =
-        libc::off_t::try_from(offset).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
-    let length =
-        libc::off_t::try_from(length).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
-    let result = unsafe {
-        libc::fallocate(
-            file.as_raw_fd(),
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            offset,
-            length,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn punch_aligned(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let offset =
-        libc::off_t::try_from(offset).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
-    let length =
-        libc::off_t::try_from(length).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
-    let mut range = libc::fpunchhole_t {
-        fp_flags: 0,
-        reserved: 0,
-        fp_offset: offset,
-        fp_length: length,
-    };
-    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &raw mut range) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-fn punch_aligned(_file: &File, _offset: u64, _length: u64) -> std::io::Result<()> {
-    Err(std::io::Error::from(ErrorKind::Unsupported))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
@@ -3159,6 +2899,30 @@ mod tests {
         page
     }
 
+    fn dictionary_training_image(page_count: usize) -> Vec<u8> {
+        const PAGE_SIZE: usize = 4096;
+
+        let mut image = vec![0_u8; PAGE_SIZE * page_count];
+        for (page_index, page) in image.chunks_exact_mut(PAGE_SIZE).enumerate() {
+            for (word_index, word) in page.chunks_exact_mut(8).enumerate() {
+                let value = u64::try_from(page_index)
+                    .expect("test page index fits u64")
+                    .wrapping_mul(31)
+                    .wrapping_add(
+                        u64::try_from(word_index).expect("test word index fits u64") % 17,
+                    );
+                word.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        image[..16].copy_from_slice(SQLITE_MAGIC);
+        image[16..18].copy_from_slice(
+            &u16::try_from(PAGE_SIZE)
+                .expect("test page size fits u16")
+                .to_be_bytes(),
+        );
+        image
+    }
+
     #[test]
     fn active_file_is_initialized_with_a_valid_segment_header()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3185,36 +2949,166 @@ mod tests {
     }
 
     #[test]
-    fn dictionary_samples_are_bounded_and_transactional() {
-        let mut trainer = DictionaryTrainer::default();
-        let first = Arc::new(vec![1; 4096]);
-        let second = Arc::new(vec![2; 4096]);
-        let rejected = Arc::new(vec![3; 4096]);
+    fn live_pages_are_raw_and_dictionary_compression_happens_at_seal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PAGE_SIZE: usize = 4096;
+        const PAGE_COUNT: usize = 257;
 
-        trainer.remember_pending(1, Arc::clone(&first), 8192);
-        trainer.remember_pending(2, Arc::clone(&second), 8192);
-        trainer.remember_pending(3, rejected, 8192);
-        assert_eq!(trainer.pending_bytes, 8192);
-        assert!(Arc::ptr_eq(&trainer.pending[&1], &first));
-        trainer.discard_pending();
-        assert!(trainer.pages.is_empty());
-        assert_eq!(trainer.pending_bytes, 0);
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("forward-dictionary.zsqlite");
+        let image = dictionary_training_image(PAGE_COUNT);
 
-        trainer.remember_pending(1, first, 8192);
-        trainer.remember_pending(2, second, 8192);
-        trainer.commit_pending();
-        assert_eq!(trainer.bytes, 8192);
-        assert_eq!(trainer.pages.len(), 2);
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &image)?;
+        store.publish(true)?;
+        assert!(!store.active.active_records.is_empty());
+        assert!(store.segments.is_empty());
+        assert_eq!(
+            store.active.file.metadata()?.len(),
+            store.active.header.records_offset
+                + u64::try_from(PAGE_COUNT)? * u64::try_from(PAGE_SIZE + FRAME_HEADER_SIZE)?
+        );
+        store.verify()?;
+
+        store.flush_sidecars()?;
+        assert!(store.active.active_records.is_empty());
+        assert_eq!(
+            store.active.file.metadata()?.len(),
+            store.active.header.records_offset
+        );
+        assert_eq!(store.segments.len(), 1);
+        assert_eq!(store.segments[0].dictionaries.len(), 1);
+        assert!(store.segments[0].dictionaries[0].bytes.len() <= 64 * 1024);
+        let compressed_pages = store
+            .locations
+            .values()
+            .filter(|location| {
+                let mut encoded = [0; FRAME_HEADER_SIZE];
+                store
+                    .read_source(location.segment_index, location.frame_offset, &mut encoded)
+                    .is_ok()
+                    && FrameHeader::decode(&encoded).is_ok_and(|frame| frame.codec == Codec::Zstd)
+            })
+            .count();
+        assert!(compressed_pages > 0);
+        drop(store);
+
+        let mut store = Store::open_existing(&path)?;
+        assert_eq!(store.segments[0].dictionaries.len(), 1);
+        store.verify()?;
+        Ok(())
     }
 
     #[test]
-    fn dictionary_is_trained_once_and_only_used_by_future_segments()
+    fn small_delta_reuses_inherited_dictionary_without_copying_it()
     -> Result<(), Box<dyn std::error::Error>> {
+        const PAGE_SIZE: usize = 4096;
+        const PAGE_COUNT: usize = 257;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("inherited-dictionary.zsqlite");
+        let image = dictionary_training_image(PAGE_COUNT);
+        let replacement = image[2 * PAGE_SIZE..3 * PAGE_SIZE].to_vec();
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &image)?;
+        store.publish(true)?;
+        store.flush_sidecars()?;
+        assert_eq!(store.segments[0].dictionaries.len(), 1);
+
+        store.write_at(PAGE_SIZE as u64, &replacement)?;
+        store.publish(true)?;
+        store.flush_sidecars()?;
+        assert_eq!(store.segments.len(), 2);
+        let delta = &store.segments[1];
+        assert_eq!(delta.dictionaries.len(), 1);
+        let header = read_segment_header(&delta.file)?;
+        assert!(
+            read_dictionary_table_file(
+                &delta.file,
+                header.dictionary_offset,
+                header.dictionary_len,
+            )?
+            .is_empty()
+        );
+        let index = decode_index(
+            &read_range_file(
+                &delta.file,
+                delta.trailer.index_offset,
+                delta.trailer.index_len,
+            )?,
+            u32::try_from(PAGE_COUNT)?,
+        )?;
+        assert_eq!(index.len(), 1);
+        let mut encoded = [0; FRAME_HEADER_SIZE];
+        read_exact_at(&delta.file, index[0].frame_offset, &mut encoded)?;
+        let frame = FrameHeader::decode(&encoded)?;
+        assert_eq!(frame.codec, Codec::Zstd);
+        assert_eq!(frame.dictionary_index, 0);
+        store.verify()?;
+        drop(store);
+
+        let mut reopened = Store::open_existing(&path)?;
+        let mut output = vec![0; PAGE_SIZE];
+        reopened.read_at(PAGE_SIZE as u64, &mut output)?;
+        assert_eq!(output, replacement);
+        reopened.verify()?;
+        reopened.compact()?;
+        reopened.verify()?;
+        assert_eq!(reopened.segments.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rolling_back_raw_overwrites_restores_the_committed_image()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("raw-rollback.zsqlite");
+        let first = page(3, 4096);
+        let second = page(7, 4096);
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &first)?;
+        store.publish(true)?;
+        store.write_at(0, &second)?;
+        store.discard_pending();
+        let mut output = vec![0; 4096];
+        store.read_at(0, &mut output)?;
+        assert_eq!(output, first);
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_a_store_discards_uncommitted_raw_overwrites()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("raw-drop.zsqlite");
+        let first = page(5, 4096);
+        let second = page(9, 4096);
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &first)?;
+        store.publish(true)?;
+        store.write_at(0, &second)?;
+        drop(store);
+
+        let mut reopened = Store::open_existing(&path)?;
+        let mut output = vec![0; 4096];
+        reopened.read_at(0, &mut output)?;
+        assert_eq!(output, first);
+        Ok(())
+    }
+
+    #[test]
+    fn active_records_seal_at_the_configured_size() -> Result<(), Box<dyn std::error::Error>> {
         const PAGE_SIZE: usize = 4096;
         const PAGE_COUNT: usize = 256;
 
         let directory = tempfile::tempdir()?;
-        let path = directory.path().join("forward-dictionary.zsqlite");
+        let path = directory.path().join("size-rollover.zsqlite");
+        let mut store = Store::open(&path, true)?;
+        store.set_storage_policy(StoragePolicy {
+            target_segment_bytes: 1024 * 1024,
+            ..StoragePolicy::default()
+        })?;
+
         let mut image = vec![0_u8; PAGE_SIZE * PAGE_COUNT];
         for (page_index, page) in image.chunks_exact_mut(PAGE_SIZE).enumerate() {
             for (word_index, word) in page.chunks_exact_mut(8).enumerate() {
@@ -3227,41 +3121,13 @@ mod tests {
         image[..16].copy_from_slice(SQLITE_MAGIC);
         image[16..18].copy_from_slice(&u16::try_from(PAGE_SIZE)?.to_be_bytes());
 
-        let mut store = Store::open(&path, true)?;
         store.write_at(0, &image)?;
         store.publish(true)?;
-        assert!(store.active.dictionaries.is_empty());
-        assert_eq!(store.trainer.bytes, image.len());
 
-        let training = store
-            .take_dictionary_training()
-            .ok_or("dictionary training was not scheduled")?;
-        let candidate = training.train().ok_or("dictionary training failed")?;
-        let dictionary_digest = digest(&candidate);
-        let mut maintenance = Store::open_existing(&path)?;
-        maintenance.stage_dictionary_candidate(candidate);
-        maintenance.flush_sidecars()?;
-        assert!(maintenance.segments[0].dictionaries.is_empty());
-        drop(maintenance);
-
-        store.refresh()?;
-        let dictionary = store
-            .active
-            .dictionaries
-            .first()
-            .ok_or("dictionary was not installed for future writes")?;
-        assert!(!dictionary.bytes.is_empty());
-        assert!(dictionary.bytes.len() <= 64 * 1024);
-        assert!(store.trainer.attempted);
-        assert!(store.trainer.pages.is_empty());
-        assert_eq!(dictionary.digest, dictionary_digest);
-
-        let replacement = page(7, u32::try_from(PAGE_SIZE)?);
-        store.write_at(0, &replacement)?;
-        store.publish(true)?;
-        assert!(store.trainer.pages.is_empty());
-        store.flush_sidecars()?;
-        assert_eq!(store.active.dictionaries[0].digest, dictionary_digest);
+        assert_eq!(store.head.txid, 1);
+        assert_eq!(store.segments.len(), 1);
+        assert_eq!(store.active.header.start_txid, 2);
+        assert!(store.active.active_records.is_empty());
         Ok(())
     }
 
@@ -3341,31 +3207,76 @@ mod tests {
     }
 
     #[test]
-    fn invalid_active_tail_recovers_the_last_valid_commit() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn later_seals_contain_only_changed_active_records() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("incremental-seal.zsqlite");
+        let first = page(7, 4096);
+        let second = vec![9; 4096];
+        let replacement = page(11, 4096);
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &first)?;
+        store.write_at(4096, &second)?;
+        store.publish(true)?;
+        store.flush_sidecars()?;
+        assert_eq!(store.segments.len(), 1);
+
+        store.write_at(0, &replacement)?;
+        store.publish(true)?;
+        assert_eq!(store.active.active_records.len(), 1);
+        store.flush_sidecars()?;
+        assert_eq!(store.segments.len(), 2);
+        let delta = &store.segments[1];
+        let index = decode_index(
+            &read_range_file(
+                &delta.file,
+                delta.trailer.index_offset,
+                delta.trailer.index_len,
+            )?,
+            2,
+        )?;
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].page_no, 1);
+
+        let mut output = vec![0; 8192];
+        store.read_at(0, &mut output)?;
+        assert_eq!(&output[..4096], replacement);
+        assert_eq!(&output[4096..], second);
+        drop(store);
+
+        let mut reopened = Store::open_existing(&path)?;
+        reopened.read_at(0, &mut output)?;
+        assert_eq!(&output[..4096], replacement);
+        assert_eq!(&output[4096..], second);
+        reopened.verify()?;
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_active_state_slot_falls_back_to_the_previous_state()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("fallback.zsqlite");
         let first = page(7, 4096);
-        let second = page(8, 4096);
+        let second = vec![8; 4096];
         let mut store = Store::open(&path, true)?;
         store.write_at(0, &first)?;
         store.publish(true)?;
-        store.write_at(0, &second)?;
+        store.write_at(4096, &second)?;
         store.publish(true)?;
         assert_eq!(store.head.txid, 2);
 
-        let newest = store.locations.get(&1).copied().ok_or(StoreError::Range)?;
+        let newest = active_state_offset(store.active.state_sequence);
         let active = &store.active.file;
-        let payload_offset = newest.frame_offset + FRAME_HEADER_SIZE as u64;
         let mut byte = [0_u8; 1];
-        read_exact_at(active, payload_offset, &mut byte)?;
+        read_exact_at(active, newest + 24, &mut byte)?;
         byte[0] ^= 0xff;
-        write_all_at(active, payload_offset, &byte)?;
+        write_all_at(active, newest + 24, &byte)?;
         active.sync_all()?;
         drop(store);
 
         let mut reopened = Store::open_existing(&path)?;
         assert_eq!(reopened.head.txid, 1);
+        assert_eq!(reopened.logical_size(), 4096);
         let mut output = vec![0; first.len()];
         reopened.read_at(0, &mut output)?;
         assert_eq!(output, first);
@@ -3381,6 +3292,7 @@ mod tests {
         let mut store = Store::open(&path, true)?;
         store.write_at(0, &first)?;
         store.publish(true)?;
+        store.flush_sidecars()?;
         let location = store.locations.get_mut(&1).ok_or(StoreError::Range)?;
         location.frame_record_len = location
             .frame_record_len
@@ -3408,7 +3320,7 @@ mod tests {
         let mut stale_reader = Store::open_existing_read_only(&path)?;
         let selected_before_refresh = stale_reader.head;
 
-        writer.write_at(0, &second)?;
+        writer.write_at(4096, &second)?;
         writer.publish(true)?;
         let commit_offset = writer.head.active_commit_offset;
         let active = &writer.active.file;
@@ -3428,7 +3340,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_uncommitted_tail_can_be_replaced_by_a_new_commit()
+    fn corrupt_latest_state_can_be_replaced_by_a_new_commit()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("nondurable-fallback.zsqlite");
@@ -3438,16 +3350,15 @@ mod tests {
         let mut store = Store::open(&path, true)?;
         store.write_at(0, &first)?;
         store.publish(true)?;
-        store.write_at(0, &second)?;
+        store.write_at(4096, &second)?;
         store.publish(false)?;
 
-        let newest = store.locations.get(&1).copied().ok_or(StoreError::Range)?;
+        let newest = active_state_offset(store.active.state_sequence);
         let active = &store.active.file;
-        let payload_offset = newest.frame_offset + FRAME_HEADER_SIZE as u64;
         let mut byte = [0_u8; 1];
-        read_exact_at(active, payload_offset, &mut byte)?;
+        read_exact_at(active, newest + 24, &mut byte)?;
         byte[0] ^= 0xff;
-        write_all_at(active, payload_offset, &byte)?;
+        write_all_at(active, newest + 24, &byte)?;
         drop(store);
 
         let mut store = Store::open_existing(&path)?;
@@ -3479,9 +3390,9 @@ mod tests {
         store.publish(true)?;
         store.truncate(3 * 4096)?;
         store.publish(true)?;
-        assert_eq!(store.page_txid_map()?, vec![1, 0, 0]);
+        assert_eq!(store.page_txid_map()?, vec![2, 0, 0]);
         store.flush_sidecars()?;
-        assert_eq!(store.page_txid_map()?, vec![1, 0, 0]);
+        assert_eq!(store.page_txid_map()?, vec![2, 0, 0]);
 
         store.write_at(2 * 4096, &third)?;
         store.publish(true)?;
@@ -3498,40 +3409,6 @@ mod tests {
         assert_eq!(&output[..4096], first);
         assert!(output[4096..8192].iter().all(|byte| *byte == 0));
         assert_eq!(&output[8192..], third);
-        Ok(())
-    }
-
-    #[test]
-    fn a_corrupt_last_append_preserves_the_preceding_valid_append()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("durable-pin.zsqlite");
-        let first = page(1, 4096);
-        let second = page(2, 4096);
-        let third = page(3, 4096);
-        let mut store = Store::open(&path, true)?;
-        store.write_at(0, &first)?;
-        store.publish(true)?;
-        store.write_at(0, &second)?;
-        store.publish(false)?;
-        store.write_at(0, &third)?;
-        store.publish(false)?;
-        assert_eq!(store.head.txid, 3);
-
-        let newest = store.locations.get(&1).copied().ok_or(StoreError::Range)?;
-        let active = &store.active.file;
-        let payload_offset = newest.frame_offset + FRAME_HEADER_SIZE as u64;
-        let mut byte = [0_u8; 1];
-        read_exact_at(active, payload_offset, &mut byte)?;
-        byte[0] ^= 0x80;
-        write_all_at(active, payload_offset, &byte)?;
-        drop(store);
-
-        let mut reopened = Store::open_existing(&path)?;
-        assert_eq!(reopened.head.txid, 2);
-        let mut output = vec![0; 4096];
-        reopened.read_at(0, &mut output)?;
-        assert_eq!(output, second);
         Ok(())
     }
 
@@ -3597,32 +3474,34 @@ mod tests {
     }
 
     #[test]
-    fn committed_active_prefix_is_append_only_and_survives_a_stale_reader()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn ordinary_commits_overwrite_the_same_active_inode() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
         let directory = tempfile::tempdir()?;
-        let path = directory.path().join("append-only.zsqlite");
+        let path = directory.path().join("in-place.zsqlite");
         let first = page(1, 4096);
         let second = page(2, 4096);
         let third = page(3, 4096);
         let mut writer = Store::open(&path, true)?;
         writer.write_at(0, &first)?;
         writer.publish(true)?;
-        let committed_end = writer.head.active_commit_end;
-        let mut committed_prefix = vec![0; usize::try_from(committed_end)?];
-        read_exact_at(&writer.active.file, 0, &mut committed_prefix)?;
+        let original = path.metadata()?;
         let mut stale_reader = Store::open_existing_read_only(&path)?;
 
         writer.write_at(0, &second)?;
         writer.publish(true)?;
         writer.write_at(0, &third)?;
         writer.publish(true)?;
-        let mut current_prefix = vec![0; committed_prefix.len()];
-        read_exact_at(&writer.active.file, 0, &mut current_prefix)?;
-        assert_eq!(current_prefix, committed_prefix);
+        let current = path.metadata()?;
+        assert_eq!(current.ino(), original.ino());
+        assert_eq!(current.len(), original.len());
 
+        stale_reader.refresh()?;
+        assert_eq!(stale_reader.head.txid, 3);
         let mut output = vec![0; 4096];
         stale_reader.read_at(0, &mut output)?;
-        assert_eq!(output, first);
+        assert_eq!(output, third);
         Ok(())
     }
 
@@ -3710,6 +3589,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn randomized_store_state_machine_matches_a_byte_vector()
     -> Result<(), Box<dyn std::error::Error>> {
         const PAGE_SIZE: usize = 4096;
@@ -3731,7 +3611,8 @@ mod tests {
         };
 
         for step in 0..240_u32 {
-            match next(&mut random) % 10 {
+            let operation = next(&mut random) % 10;
+            match operation {
                 0 | 1 => {
                     let page_no = 2 + usize::try_from(next(&mut random) % 10)?;
                     let required = page_no * PAGE_SIZE;
@@ -3797,7 +3678,18 @@ mod tests {
             assert_eq!(store.logical_size(), working.len() as u64, "step {step}");
             let mut actual = vec![0xa5; working.len()];
             assert_eq!(store.read_at(0, &mut actual)?, actual.len(), "step {step}");
-            assert_eq!(actual, working, "step {step}");
+            if actual != working {
+                let offset = actual
+                    .iter()
+                    .zip(&working)
+                    .position(|(actual, expected)| actual != expected)
+                    .unwrap_or(actual.len().min(working.len()));
+                panic!(
+                    "step {step} operation {operation}: first mismatch at {offset}, actual {}, expected {}",
+                    actual.get(offset).copied().unwrap_or_default(),
+                    working.get(offset).copied().unwrap_or_default()
+                );
+            }
         }
 
         store.publish(true)?;
