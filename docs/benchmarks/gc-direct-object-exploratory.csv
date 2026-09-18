@@ -1,0 +1,9 @@
+version,trial,cache,pattern,phase,elapsed_ms,batch_calls,range_requests,requested_bytes,remote_gets,remote_blob_gets,remote_read_bytes,local_hit_ranges,local_hit_bytes,remote_heads,root_gets,lists,puts,put_bytes,deletes,cas,latency_rounds,repacked_packs,copied_frames,copied_bytes,decoded_bytes,deleted_objects,deleted_bytes,latency_us,read_concurrency,model,local_root_gets,local_cas,deferred_remote_deletes
+baseline,0,none,fragmented,maintain,36652.021,28396,28396,4693042,28396,28316,4693042,0,0,158,3,2,6,1883422,0,3,28568,4,518,1570610,0,0,0,1000,16,write_through,0,0,0
+baseline,0,none,fragmented,collect,8196.890,6229,6229,1487298,6229,6168,1487298,0,0,138,2,2,2,514,9,1,6383,0,0,0,0,9,6993729,1000,16,write_through,0,0,0
+baseline,0,none,fragmented,noop_maintain,7994.286,6195,6195,338977,6195,6168,338977,0,0,27,1,0,0,0,0,0,6223,0,0,0,0,0,0,1000,16,write_through,0,0,0
+baseline,0,none,fragmented,fully_dead_collect,10297.167,7784,7784,2705828,7784,7704,2705828,0,0,168,2,2,1,168,2,1,7960,0,0,0,0,2,4912885,1000,16,write_through,0,0,0
+optimized,0,none,fragmented,maintain,338.337,84,84,8164746,84,4,8164746,0,0,123,3,2,6,1883626,0,3,221,4,518,1570610,0,0,0,1000,16,write_through,0,0,0
+optimized,0,none,fragmented,collect,251.802,61,61,1157079,61,0,1157079,0,0,103,2,2,2,514,9,1,180,0,0,0,0,9,6993738,1000,16,write_through,0,0,0
+optimized,0,none,fragmented,noop_maintain,70.031,27,27,7738,27,0,7738,0,0,27,1,0,0,0,0,0,55,0,0,0,0,0,0,1000,16,write_through,0,0,0
+optimized,0,none,fragmented,fully_dead_collect,311.520,80,80,2293177,80,0,2293177,0,0,126,2,2,1,168,2,1,214,0,0,0,0,2,4912885,1000,16,write_through,0,0,0

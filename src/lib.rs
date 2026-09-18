@@ -77,7 +77,9 @@ pub fn collect(path: impl AsRef<Path>, deletion_budget: usize) -> Result<GcRepor
     store::Store::open_existing(database_storage_path(path.as_ref())?)?.gc_report(deletion_budget)
 }
 
-/// Repack at most one low-occupancy pack within the configured decoded budget.
+/// Repack a batch of low-occupancy packs with one metadata checkpoint. The
+/// combined decoded size of surviving frames is bounded by the maintenance
+/// budget; intact frames are copied without decoding or recompression.
 /// Pending/active writes are left untouched. The report describes this call.
 pub fn maintain(path: impl AsRef<Path>) -> Result<MaintenanceReport, StoreError> {
     store::Store::open_existing(database_storage_path(path.as_ref())?)?.repack_once()

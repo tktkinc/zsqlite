@@ -49,8 +49,8 @@ namespace. Cache residency neither retains nor authorizes deleting sealed data.
 There is no persistent compressed-object cache or additional authoritative local
 tier. The active pagefile remains authoritative for every unsealed write.
 
-The core deduplicates distinct frame requests and merges only overlapping or
-adjacent ranges in the same blob. Input/output correspondence and exact lengths
+The normal read path deduplicates distinct frame requests and merges only
+overlapping or adjacent ranges in the same blob. Input/output correspondence and exact lengths
 are validated. Batches are bounded to 4096 requests and 64 MiB; the extracted-page
 cache planner uses smaller 256-page / 16 MiB groups. Adapters may execute the
 independent requests concurrently. Core code authenticates frame headers,
@@ -115,8 +115,9 @@ naturally retains its objects in RAM as its storage implementation.
 
 Read batches retain the 64 MiB / 4096-request limits. Frame decoding and catalog
 metadata decoding keep their own bounds. Pack targets may be large; writers also
-rotate at a bounded metadata budget, and maintenance selects only packs within
-its explicit decoded-input budget. These are working-memory and metadata bounds,
+rotate at a bounded metadata budget. Maintenance bounds the total decoded size of
+source frames containing live pages across all selected packs, even when those
+frames can be copied encoded. These are working-memory and metadata bounds,
 not maximum physical object sizes.
 
 ## Writable forks in one object namespace
@@ -248,6 +249,49 @@ Database metadata compaction writes no payload or placement metadata. Flush
 unsealed changes explicitly first; compaction returns Busy while they remain.
 GC is explicit maintenance and can publish endpoint/representation retirements
 before deleting objects.
+
+`Database::maintain()` provides the same bounded repack pass as `maintain(path)`
+for configured backends. It selects multiple packs below 50% estimated live-byte occupancy,
+preferring estimated reclaimed bytes per unit of surviving frame work and
+skipping packs retained by other roots. The total `maintenance_input` budget
+counts each surviving frame's full decoded size, including obsolete slots in
+partially live frames; fully dead frames cost no input. Packs exceeding the
+remaining budget are skipped, while packs at least 50% live await further churn.
+Selection and GC reporting use the resolved live-frame metadata and placement
+lengths without fetching cold payload blobs. Obsolete complete frame spans are
+counted exactly; partial-frame waste is estimated in proportion to obsolete
+pages. The explicit inspection API still reads pack headers for exact inventory.
+
+Fully live frames are copied encoded after record-header and payload-hash
+authentication, preserving frame IDs, codecs and dictionary dependencies. Only
+partially obsolete multi-page frames are decoded and recompressed; default page
+frames require neither operation. Repacking reuses existing dictionaries and
+does not load or retrain the advisory sample reservoir. Reports expose
+`repacked_packs`, `copied_frames`,
+`copied_bytes` (encoded payload only, excluding record headers), `decoded_input`
+(actual partial-frame decoding), and `gc`.
+
+Maintenance groups source records in pack/offset order into up to 8 MiB ranges.
+It may bridge gaps up to 64 KiB while capping total fetched bytes at four times
+the included complete frame records; a single large frame gets its own bounded
+window up to 16 MiB. Only one window is retained at a time. Collection also
+memoizes object lengths within its catalog exclusion, avoiding repeated stat
+requests for the same blob. Inventory remains a full namespace sweep, so the
+deletion budget bounds deletions rather than total scanning work.
+
+The intended local-first asynchronous tiering contract and its separate local
+and remote publication/collection boundaries are described in
+[Tiered storage](tiered-storage.md).
+
+The pass installs one metadata checkpoint and batches all placement updates in
+one catalog registration CAS, followed by the pending and final publication CAS
+operations. Collection can add one retirement CAS. Thus catalog publication work
+is fixed per pass, independent of pack count; the catalog and local active file
+still use the recoverable publication protocol above. The existing endpoint
+index selects the widest checkpoint at the same logical endpoint. No additional
+format or aggregated-pack lookup is required. Exact reader leases retain old
+blobs until readers release them, and whole unreachable blobs remain directly
+collectible without copying.
 
 ## Formats, verification, and deferred work
 

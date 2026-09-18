@@ -3,7 +3,7 @@ use super::view::{PinnedView, load_metadata};
 use crate::StoreError;
 use crate::domain::{DatabaseId, ManifestId, PackId, RetentionId, TransactionId, ViewHash};
 use crate::fs::{ExclusiveLock, sync_dir};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 #[cfg(test)]
@@ -87,6 +87,11 @@ pub struct GcReport {
 #[derive(Clone, Debug)]
 pub struct MaintenanceReport {
     pub repacked_packs: usize,
+    /// Live frames copied byte-for-byte without decompression or compression.
+    pub copied_frames: usize,
+    /// Payload bytes copied unchanged, excluding frame and pack headers.
+    pub copied_bytes: crate::domain::StoredBytes,
+    /// Actual decoded input, limited to partially obsolete multi-page frames.
     pub decoded_input: crate::domain::DecodedBytes,
     pub gc: GcReport,
 }
@@ -94,6 +99,8 @@ impl Default for MaintenanceReport {
     fn default() -> Self {
         Self {
             repacked_packs: 0,
+            copied_frames: 0,
+            copied_bytes: crate::domain::StoredBytes::new(0),
             decoded_input: crate::domain::DecodedBytes::new(0),
             gc: GcReport::default(),
         }
@@ -442,6 +449,18 @@ impl CatalogGuard {
         let (logical, current, named) = self.trace_logical()?;
         let uncertain_heads = self.state().has_pending()?;
         let inventory = self.inventory()?;
+        // Immutable lengths remain stable under catalog exclusion. Reuse each
+        // observation across logical roots, shared representations and reporting
+        // instead of issuing another object-store request for the same object.
+        let mut lengths = BTreeMap::new();
+        let mut stat = |key| -> Result<Option<crate::domain::StoredBytes>, BackendError> {
+            if let Some(length) = lengths.get(&key) {
+                return Ok(*length);
+            }
+            let length = self.storage().backend().stat(key)?;
+            lengths.insert(key, length);
+            Ok(length)
+        };
         let mut physical = self.state().index_objects();
         let mut current_physical = BTreeSet::new();
         let mut named_physical = BTreeSet::new();
@@ -476,11 +495,7 @@ impl CatalogGuard {
                         let placement = self.placement(*pack)?;
                         let extent = placement.preferred().extent;
                         let object = Physical::Blob(extent.blob());
-                        let length = self
-                            .storage()
-                            .backend()
-                            .stat(object)?
-                            .ok_or(BackendError::Missing(object))?;
+                        let length = stat(object)?.ok_or(BackendError::Missing(object))?;
                         if length.get() != extent.blob_length().get() {
                             return Err(StoreError::Corrupt(0));
                         }
@@ -503,7 +518,7 @@ impl CatalogGuard {
         }
         // Validate every exact reader dependency before minting any permit.
         for key in &physical {
-            if !inventory.contains(key) || self.storage().backend().stat(*key)?.is_none() {
+            if !inventory.contains(key) || stat(*key)?.is_none() {
                 return Err(BackendError::Missing(*key).into());
             }
             if let Physical::Index(id) = key
@@ -532,7 +547,7 @@ impl CatalogGuard {
             for representation in &placement.representations {
                 let object = Physical::Blob(representation.extent.blob());
                 if physical.contains(&object)
-                    && self.storage().backend().stat(object)?.is_none_or(|length| {
+                    && stat(object)?.is_none_or(|length| {
                         length.get() != representation.extent.blob_length().get()
                     })
                 {
@@ -555,12 +570,7 @@ impl CatalogGuard {
         }
         let mut deletable = Vec::new();
         for key in &inventory {
-            let length = self
-                .storage()
-                .backend()
-                .stat(*key)?
-                .ok_or(BackendError::Missing(*key))?
-                .get();
+            let length = stat(*key)?.ok_or(BackendError::Missing(*key))?.get();
             if current_physical.contains(key) {
                 report.current_view_bytes += length;
             } else if physical.contains(key) {
@@ -600,10 +610,7 @@ impl CatalogGuard {
                 ManifestId::from_bytes(header.parent_physical_digest)
             };
             let view = self.pin(id)?;
-            report.partially_obsolete_bytes += super::repack::inventory(self, &view)?
-                .iter()
-                .map(super::repack::PackOccupancy::reclaimable_bytes)
-                .sum::<u64>();
+            report.partially_obsolete_bytes += super::repack::estimated_obsolete_bytes(&view)?;
         }
         if deletable.is_empty() {
             return Ok(report);

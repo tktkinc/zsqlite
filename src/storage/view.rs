@@ -1032,6 +1032,19 @@ impl StoredPageRef<'_> {
     pub(super) fn fetch_record(
         &self,
     ) -> Result<(super::frame::EncodedFrame, VerifiedFrame, u64), StoreError> {
+        self.decode_record(&self.read_record()?)
+    }
+    /// Authenticate a fetched record for an unchanged copy without decoding it.
+    pub(super) fn authenticate_record(
+        &self,
+        record: &[u8],
+    ) -> Result<super::frame::EncodedFrame, StoreError> {
+        super::frame::EncodedFrame::authenticated(
+            self.location.metadata.clone(),
+            self.record_payload(record)?.to_vec(),
+        )
+    }
+    fn read_record(&self) -> Result<Vec<u8>, StoreError> {
         let prefix_offset = self
             .location
             .payload
@@ -1046,16 +1059,29 @@ impl StoredPageRef<'_> {
             .get()
             .checked_add(crate::format::FRAME_HEADER_SIZE as u64)
             .ok_or(StoreError::Range)?;
-        let record = self.view.placement.read(
+        self.view.placement.read(
             self.location.pack,
             StoredRange::new(FileOffset::new(prefix_offset), StoredBytes::new(length))?,
-        )?;
-        self.decode_record(&record)
+        )
     }
     pub(super) fn decode_record(
         &self,
         record: &[u8],
     ) -> Result<(super::frame::EncodedFrame, VerifiedFrame, u64), StoreError> {
+        let stored = self.record_payload(record)?.to_vec();
+        let decode_start = std::time::Instant::now();
+        let (encoded, verified) = super::frame::EncodedFrame::verified(
+            self.location.metadata.clone(),
+            stored,
+            &self.view.dictionaries,
+        )?;
+        Ok((
+            encoded,
+            verified,
+            u64::try_from(decode_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        ))
+    }
+    fn record_payload<'a>(&self, record: &'a [u8]) -> Result<&'a [u8], StoreError> {
         let prefix_offset = self
             .location
             .payload
@@ -1074,18 +1100,7 @@ impl StoredPageRef<'_> {
         {
             return Err(StoreError::Corrupt(prefix_offset));
         }
-        let stored = record[crate::format::FRAME_HEADER_SIZE..].to_vec();
-        let decode_start = std::time::Instant::now();
-        let (encoded, verified) = super::frame::EncodedFrame::verified(
-            self.location.metadata.clone(),
-            stored,
-            &self.view.dictionaries,
-        )?;
-        Ok((
-            encoded,
-            verified,
-            u64::try_from(decode_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        ))
+        Ok(&record[crate::format::FRAME_HEADER_SIZE..])
     }
     pub(super) fn extract(&self, frame: &VerifiedFrame) -> Result<Vec<u8>, StoreError> {
         if frame.id() != self.frame_id() {

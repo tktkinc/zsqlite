@@ -203,16 +203,20 @@ impl FrameMetadata {
             pages,
         })
     }
-    pub(super) fn verify_payload(
-        &self,
-        payload: &[u8],
-        dictionaries: &BTreeMap<DictionaryId, DecodingDictionary>,
-    ) -> Result<VerifiedFrame, StoreError> {
+    fn authenticate_payload(&self, payload: &[u8]) -> Result<(), StoreError> {
         if payload.len() as u64 != self.payload_bytes.get()
             || *blake3::hash(payload).as_bytes() != self.payload_hash
         {
             return Err(StoreError::Corrupt(0));
         }
+        Ok(())
+    }
+    pub(super) fn verify_payload(
+        &self,
+        payload: &[u8],
+        dictionaries: &BTreeMap<DictionaryId, DecodingDictionary>,
+    ) -> Result<VerifiedFrame, StoreError> {
+        self.authenticate_payload(payload)?;
         let raw = match self.encoding {
             PayloadEncoding::Raw => payload.to_vec(),
             PayloadEncoding::Zstandard(dictionary) => {
@@ -261,6 +265,8 @@ impl VerifiedFrame {
     }
 }
 
+/// Stored bytes authenticated against their frame metadata. This permits an
+/// unchanged copy; decoding and page-checksum validation require `VerifiedFrame`.
 pub(super) struct EncodedFrame {
     metadata: FrameMetadata,
     payload: Vec<u8>,
@@ -268,6 +274,13 @@ pub(super) struct EncodedFrame {
 impl EncodedFrame {
     pub(super) fn into_parts(self) -> (FrameMetadata, Vec<u8>) {
         (self.metadata, self.payload)
+    }
+    pub(super) fn authenticated(
+        metadata: FrameMetadata,
+        payload: Vec<u8>,
+    ) -> Result<Self, StoreError> {
+        metadata.authenticate_payload(&payload)?;
+        Ok(Self { metadata, payload })
     }
     pub(super) fn verified(
         metadata: FrameMetadata,
@@ -367,4 +380,62 @@ pub(super) fn install_dictionary<'g>(
     let mut builder = guard.build::<Dictionary>()?;
     builder.append(bytes)?;
     builder.finalize()?.install()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_copy_preserves_dictionary_frames_without_decoding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let size = PageSize::new(4096)?;
+        let mut state = 17_u32;
+        let raw: Vec<_> = (0..size.as_usize())
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        let dictionary = DictionaryId::from_bytes(*blake3::hash(&raw).as_bytes());
+        let mut encoder = FrameEncoder::new(3, &BTreeMap::from([(dictionary, raw.clone())]))?;
+        let frame = encoder.build(
+            size,
+            vec![(
+                PageVersion::verified(PageNumber::new(1)?, TransactionId::new(1)?, &raw),
+                raw.clone(),
+            )],
+        )?;
+        let (metadata, payload) = frame.into_parts();
+        assert_eq!(
+            metadata.encoding(),
+            PayloadEncoding::Zstandard(CompressionDictionary::Shared(dictionary))
+        );
+
+        // A copy needs no decoding dictionary, unlike a verified plaintext read.
+        let copied = EncodedFrame::authenticated(metadata.clone(), payload.clone())?;
+        assert_eq!(copied.into_parts(), (metadata.clone(), payload.clone()));
+        assert!(matches!(
+            EncodedFrame::verified(metadata.clone(), payload.clone(), &BTreeMap::new()),
+            Err(StoreError::Corrupt(_))
+        ));
+        let dictionaries = BTreeMap::from([(dictionary, DecodingDictionary::new(raw.clone())?)]);
+        let (_, verified) =
+            EncodedFrame::verified(metadata.clone(), payload.clone(), &dictionaries)?;
+        assert_eq!(verified.bytes(), raw);
+
+        let mut damaged = payload.clone();
+        damaged[0] ^= 1;
+        assert!(matches!(
+            EncodedFrame::authenticated(metadata.clone(), damaged),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            EncodedFrame::authenticated(metadata, payload[..payload.len() - 1].to_vec()),
+            Err(StoreError::Corrupt(_))
+        ));
+        Ok(())
+    }
 }

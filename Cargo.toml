@@ -34,6 +34,11 @@ name = "transcript_replay"
 harness = false
 required-features = ["static"]
 
+[[bench]]
+name = "gc_object_storage"
+harness = false
+required-features = ["static"]
+
 [dependencies]
 blake3 = "1.8.2"
 crc32fast = "1.5.0"

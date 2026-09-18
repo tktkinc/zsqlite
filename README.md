@@ -139,9 +139,21 @@ Dropping a named-pin handle does **not** release its persistent root.
 Wholly unreachable blobs need no copying; dead extents remain until the whole
 blob is collectible. Explicit byte-budgeted relocation can group compatible
 packs while exact reader leases retain old blobs. Missing/corrupt retained metadata
-blocks destructive collection. Routine deletion is budgeted; bounded repacking
-selects at most one pack below 50% live occupancy and at most 64 MiB of decoded
-input and skipping packs retained by forks. `compact()` requires an explicitly
+blocks destructive collection. Routine deletion is budgeted; `maintain()` selects
+multiple packs below 50% estimated live-byte occupancy within one maintenance-input budget
+(64 MiB by default), skipping packs retained by forks or other roots. Fully live
+frames are authenticated and copied in their encoded form; only partially obsolete
+multi-page frames need decoding and recompression. Default page frames therefore
+need no payload decompression or recompression. All replacement packs share one
+metadata checkpoint and batched placement updates; catalog publication work does
+not grow with the number of packs. Selection and collection reports use resolved
+metadata without scanning cold blobs. Maintenance coalesces source reads into
+bounded ranges, and collection reuses each object's length observation.
+See [GC performance measurements](docs/gc-performance.md) for warm/cold local-tier
+results and [tiered storage](docs/tiered-storage.md) for asynchronous publication
+and collection requirements.
+
+`compact()` requires an explicitly
 flushed head and merges its metadata LSM
 runs into an equivalent checkpoint;
 it never reads frame payloads, decompresses them, or rewrites payload packs. `maintain()` is the
@@ -210,13 +222,17 @@ zsqlite::compact("app.db")?;
 let pin = zsqlite::retain("app.db", zsqlite::RetentionName::new("offline-fork")?)?;
 let report = zsqlite::collect("app.db", 0)?; // inspect without deleting
 zsqlite::release_retention("app.db", pin)?;  // explicit durable-root release
-let work = zsqlite::maintain("app.db")?;     // one bounded repack
+let work = zsqlite::maintain("app.db")?;     // one bounded, batched repack pass
 
 zsqlite::convert_to_zsqlite("legacy.db", "app.db")?;
 zsqlite::export_to_sqlite("app.db", "restored.db")?;
 
 # Ok::<(), zsqlite::StoreError>(())
 ```
+
+Configured backend handles provide the same maintenance through
+`Database::maintain()`. The report includes repacked packs, copied frames and
+encoded payload bytes, actual decoded input, and collection work.
 
 A raw bundle copy is not a SQLite online backup. In WAL mode, acknowledged SQL
 transactions can exist only in the host `-wal` file while the `.db.zsqlite` active
@@ -337,3 +353,7 @@ cargo clippy --all-targets --no-default-features --features static -- -D warning
 The suite covers every SQLite page size, rollback modes, WAL checkpoints,
 online backup, concurrent readers and writers, multi-process creation, stale
 writers, sync-off structural commits, and subprocess crash recovery.
+GC coverage includes exhaustive transport failures, process exits during repack
+and deletion, streamed-write failures, and seeded histories checked against an
+independent byte model. Real snapshot restoration also checks the proposed
+asynchronous tier publication protocol. See [coverage and limits](docs/gc-testing.md).

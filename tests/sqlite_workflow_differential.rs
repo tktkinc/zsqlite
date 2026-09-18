@@ -219,7 +219,7 @@ impl Drop for Statement {
 
 /// # Safety
 /// For a nonempty value, pointer addresses length initialized bytes from a live
-/// SQLite row, unaffected by column conversions until this copy completes.
+/// `SQLite` row, unaffected by column conversions until this copy completes.
 unsafe fn column_bytes(pointer: *const u8, length: c_int) -> Result<Vec<u8>, String> {
     let length = usize::try_from(length).map_err(|_| "SQLite returned a negative length")?;
     if length == 0 {

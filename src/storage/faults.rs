@@ -1,7 +1,7 @@
 //! Test-only publication-boundary injection; absent from production builds.
 use std::cell::RefCell;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum Point {
     BootstrapDataSynced,
     BootstrapClaimed,
@@ -17,18 +17,51 @@ pub(crate) enum Point {
     ActiveStateSynced,
     RootRenamed,
     RootDirectorySynced,
+    ObjectRemoved,
+    ObjectDeletionSynced,
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Mode {
     Error,
     Crash,
 }
-thread_local! { static INJECTION: RefCell<Option<(Point, Mode)>> = const { RefCell::new(None) }; }
+thread_local! {
+    static INJECTION: RefCell<Option<(Point, Mode, usize)>> = const { RefCell::new(None) };
+    static RECORDING: RefCell<Option<Vec<Point>>> = const { RefCell::new(None) };
+}
 #[must_use]
 pub(crate) struct Injection;
 pub(crate) fn inject(point: Point, mode: Mode) -> Injection {
-    INJECTION.with(|slot| *slot.borrow_mut() = Some((point, mode)));
+    inject_nth(point, mode, 1)
+}
+pub(crate) fn inject_nth(point: Point, mode: Mode, occurrence: usize) -> Injection {
+    assert!(occurrence > 0);
+    INJECTION.with(|slot| *slot.borrow_mut() = Some((point, mode, occurrence)));
     Injection
+}
+
+/// Discover every occurrence in a real successful operation before crashing
+/// each one. New object writes or publication steps then extend the matrix.
+#[must_use]
+pub(crate) struct Recording;
+pub(crate) fn record() -> Recording {
+    RECORDING.with(|slot| {
+        assert!(slot.borrow().is_none(), "nested fault recording");
+        *slot.borrow_mut() = Some(Vec::new());
+    });
+    Recording
+}
+impl Recording {
+    pub(crate) fn finish(self) -> Vec<Point> {
+        let points = RECORDING.with(|slot| slot.borrow_mut().take().expect("active recording"));
+        drop(self);
+        points
+    }
+}
+impl Drop for Recording {
+    fn drop(&mut self) {
+        RECORDING.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 impl Drop for Injection {
     fn drop(&mut self) {
@@ -36,16 +69,22 @@ impl Drop for Injection {
     }
 }
 pub(crate) fn check(point: Point) -> std::io::Result<()> {
+    RECORDING.with(|slot| {
+        if let Some(points) = slot.borrow_mut().as_mut() {
+            points.push(point);
+        }
+    });
     let mode = INJECTION.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if slot
-            .as_ref()
-            .is_some_and(|(selected, _)| *selected == point)
+        if let Some((selected, _, remaining)) = slot.as_mut()
+            && *selected == point
         {
-            slot.take().map(|(_, mode)| mode)
-        } else {
-            None
+            *remaining -= 1;
+            if *remaining == 0 {
+                return slot.take().map(|(_, mode, _)| mode);
+            }
         }
+        None
     });
     match mode {
         None => Ok(()),

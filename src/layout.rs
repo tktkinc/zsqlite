@@ -157,6 +157,10 @@ impl LayoutPolicy {
         self
     }
 
+    /// Bound each repack pass by the combined decoded size of source frames
+    /// containing live pages. Intact frames are copied encoded but still count
+    /// against this work budget. Zero disables repacking. Deletions independently
+    /// limit the number of unreachable objects removed by a collection pass.
     pub fn with_maintenance(
         mut self,
         input: DecodedBytes,

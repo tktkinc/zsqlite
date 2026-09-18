@@ -1,0 +1,7 @@
+model,cache,pattern,phase,elapsed_ms,batch_calls,range_requests,requested_bytes,remote_gets,remote_blob_gets,remote_read_bytes,local_hit_ranges,local_hit_bytes,remote_heads,root_gets,lists,puts,put_bytes,deletes,cas,latency_rounds,repacked_packs,copied_frames,copied_bytes,decoded_bytes,deleted_objects,deleted_bytes,latency_us,read_concurrency,local_root_gets,local_cas,deferred_remote_deletes
+local_async,cold,fragmented,maintain,388.924,88,88,33556295,8,8,26291852,80,7325194,0,0,0,0,0,0,0,8,8,2067,6273277,0,0,0,1000,16,3,3,0
+local_async,cold,fragmented,collect,104.752,61,61,5233614,0,0,0,61,5233614,0,0,0,0,0,0,0,0,0,0,0,0,13,27937676,1000,16,2,1,13
+local_async,cold,fragmented,sync_gc,15.065,0,0,0,0,0,0,0,0,0,0,0,9,7651446,0,1,10,0,0,0,0,0,0,1000,16,0,0,0
+local_async,cold,fragmented,noop_maintain,1.774,27,27,8846,0,0,0,27,8846,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1000,16,1,0,0
+local_async,cold,fragmented,fully_dead_collect,177.516,80,80,10412582,0,0,0,80,10412582,0,0,0,0,0,0,0,0,0,0,0,0,5,19650072,1000,16,2,1,5
+local_async,cold,fragmented,sync_dead,26.861,0,0,0,0,0,0,0,0,0,0,0,13,27236748,0,1,14,0,0,0,0,0,0,1000,16,0,0,0

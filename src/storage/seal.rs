@@ -116,7 +116,7 @@ pub(crate) fn seal<'g>(
         pages,
         read,
         policy,
-        Vec::new(),
+        std::iter::empty(),
         mode,
     )
 }
@@ -129,7 +129,7 @@ pub(super) fn seal_with_copies<'g>(
     pages: &[(PageNumber, TransactionId)],
     mut read: impl FnMut(PageNumber) -> Result<Vec<u8>, StoreError>,
     policy: LayoutPolicy,
-    copied: Vec<EncodedFrame>,
+    copied: impl IntoIterator<Item = Result<EncodedFrame, StoreError>>,
     mode: ManifestMode,
 ) -> Result<super::view::DurableView<'g>, StoreError> {
     let mut metadata = source.map_or_else(
@@ -195,7 +195,6 @@ pub(super) fn seal_with_copies<'g>(
         let _advisory_result = reservoir.persist(guard);
     }
     dictionaries.retain(|id, _| metadata.preferred.contains(id));
-    let mut encoder = FrameEncoder::new(policy.level(), &dictionaries)?;
     let mut versions = Vec::new();
     for (page, txid) in pages {
         if page.get() <= endpoint.size.pages() {
@@ -206,40 +205,43 @@ pub(super) fn seal_with_copies<'g>(
     let mut pack_receipts = Vec::new();
     let mut writer = PackWriter::new(guard)?;
     for frame in copied {
-        writer.append(frame)?;
+        writer.append(frame?)?;
         if writer.offset >= policy.pack_target().get() || writer.metadata_bytes >= 8 * 1024 * 1024 {
             pack_receipts.push(writer.finish(&mut metadata)?);
             writer = PackWriter::new(guard)?;
         }
     }
-    let mut frame_pages = Vec::new();
-    let frame_cap = policy.frame_bytes(endpoint.size.page_size());
-    for (page, txid) in versions {
-        let bytes = read(page)?;
-        if bytes.len() != endpoint.size.page_size().as_usize() {
-            return Err(StoreError::Range);
-        }
-        if bytes.iter().all(|byte| *byte == 0) {
-            metadata.remove(page);
-            continue;
-        }
-        if !frame_pages.is_empty()
-            && (frame_pages.len() + 1) * endpoint.size.page_size().as_usize() > frame_cap
-        {
-            writer.append(
-                encoder.build(endpoint.size.page_size(), std::mem::take(&mut frame_pages))?,
-            )?;
-            if writer.offset >= policy.pack_target().get()
-                || writer.metadata_bytes >= 8 * 1024 * 1024
-            {
-                pack_receipts.push(writer.finish(&mut metadata)?);
-                writer = PackWriter::new(guard)?;
+    if !versions.is_empty() {
+        let mut encoder = FrameEncoder::new(policy.level(), &dictionaries)?;
+        let mut frame_pages = Vec::new();
+        let frame_cap = policy.frame_bytes(endpoint.size.page_size());
+        for (page, txid) in versions {
+            let bytes = read(page)?;
+            if bytes.len() != endpoint.size.page_size().as_usize() {
+                return Err(StoreError::Range);
             }
+            if bytes.iter().all(|byte| *byte == 0) {
+                metadata.remove(page);
+                continue;
+            }
+            if !frame_pages.is_empty()
+                && (frame_pages.len() + 1) * endpoint.size.page_size().as_usize() > frame_cap
+            {
+                writer.append(
+                    encoder.build(endpoint.size.page_size(), std::mem::take(&mut frame_pages))?,
+                )?;
+                if writer.offset >= policy.pack_target().get()
+                    || writer.metadata_bytes >= 8 * 1024 * 1024
+                {
+                    pack_receipts.push(writer.finish(&mut metadata)?);
+                    writer = PackWriter::new(guard)?;
+                }
+            }
+            frame_pages.push((PageVersion::verified(page, txid, &bytes), bytes));
         }
-        frame_pages.push((PageVersion::verified(page, txid, &bytes), bytes));
-    }
-    if !frame_pages.is_empty() {
-        writer.append(encoder.build(endpoint.size.page_size(), frame_pages)?)?;
+        if !frame_pages.is_empty() {
+            writer.append(encoder.build(endpoint.size.page_size(), frame_pages)?)?;
+        }
     }
     // Payload packs and metadata runs are independent immutable objects. Even a
     // tiny seal installs its final pack before building the metadata segment.

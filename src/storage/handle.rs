@@ -450,6 +450,11 @@ impl Database {
     pub fn collect(&self, budget: usize) -> Result<super::GcReport, StoreError> {
         self.store()?.gc_report(budget)
     }
+    /// Repack a bounded batch with one metadata checkpoint, then collect
+    /// unreachable objects within the configured deletion budget.
+    pub fn maintain(&self) -> Result<super::MaintenanceReport, StoreError> {
+        self.store()?.repack_once()
+    }
     pub fn relocate(
         &self,
         packs: &[PackId],

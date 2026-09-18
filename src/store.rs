@@ -1970,12 +1970,12 @@ impl Store {
         {
             let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
             let guard = catalog.lock()?;
-            if crate::storage::eligible_pack(
+            if crate::storage::eligible_packs(
                 &guard,
                 self.view.as_ref().ok_or(StoreError::Corrupt(0))?,
                 self.layout,
             )?
-            .is_none()
+            .is_empty()
             {
                 return Ok(crate::storage::MaintenanceReport::default());
             }
@@ -1995,16 +1995,12 @@ impl Store {
             else {
                 return Ok(crate::storage::MaintenanceReport::default());
             };
-            let (durable, copied) =
+            let (durable, mut report) =
                 candidate.revalidate(self.view.as_ref().ok_or(StoreError::Corrupt(0))?)?;
             let publication = self.prepare_view_publication(&guard, durable)?;
             let mut guard = self.finish_view_publication(guard, publication)?;
-            let gc = guard.collect(self.layout.deletion_budget())?;
-            Ok(crate::storage::MaintenanceReport {
-                repacked_packs: 1,
-                decoded_input: copied,
-                gc,
-            })
+            report.gc = guard.collect(self.layout.deletion_budget())?;
+            Ok(report)
         })();
         self.release_maintenance();
         result

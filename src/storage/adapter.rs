@@ -500,7 +500,12 @@ impl StorageBackend for FilesystemBackend {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        sync_dir(&self.root.join("objects")).map_err(storage_io)
+        #[cfg(test)]
+        super::faults::check(super::faults::Point::ObjectRemoved)?;
+        sync_dir(&self.root.join("objects")).map_err(storage_io)?;
+        #[cfg(test)]
+        super::faults::check(super::faults::Point::ObjectDeletionSynced)?;
+        Ok(())
     }
 }
 
@@ -659,10 +664,18 @@ pub enum Fault {
 }
 #[derive(Clone, Debug, Default)]
 pub struct BackendStatistics {
+    /// Begun streams, including streams abandoned without installing an object.
+    pub write_starts: u64,
     pub puts: u64,
     pub reads: u64,
     pub batches: u64,
     pub read_bytes: u64,
+    pub blob_reads: u64,
+    pub blob_read_bytes: u64,
+    pub stat_calls: u64,
+    pub blob_stat_calls: u64,
+    pub root_reads: u64,
+    pub inventory_calls: u64,
     pub written_bytes: u64,
     pub publications: u64,
     pub deletes: u64,
@@ -749,9 +762,14 @@ impl StorageBackend for FaultBackend {
     }
     fn begin_write(&self) -> Result<Box<dyn ObjectWriter + '_>, BackendError> {
         self.check(Operation::Put)?;
+        let inner = self.inner.begin_write()?;
+        self.statistics
+            .lock()
+            .map_err(|_| BackendError::InvalidData)?
+            .write_starts += 1;
         Ok(Box::new(FaultWriter {
             backend: self,
-            inner: self.inner.begin_write()?,
+            inner,
         }))
     }
     fn read_ranges(&self, requests: &[ObjectRange]) -> Result<Vec<Vec<u8>>, BackendError> {
@@ -764,6 +782,12 @@ impl StorageBackend for FaultBackend {
         statistics.reads += requests.len() as u64;
         statistics.batches += 1;
         statistics.read_bytes += result.iter().map(|bytes| bytes.len() as u64).sum::<u64>();
+        for (request, bytes) in requests.iter().zip(&result) {
+            if matches!(request.key(), ObjectKey::Blob(_)) {
+                statistics.blob_reads += 1;
+                statistics.blob_read_bytes += bytes.len() as u64;
+            }
+        }
         match fault {
             Some(Fault::CorruptRead) => {
                 if let Some(byte) = result.first_mut().and_then(|bytes| bytes.first_mut()) {
@@ -781,10 +805,21 @@ impl StorageBackend for FaultBackend {
     }
     fn stat(&self, key: ObjectKey) -> Result<Option<StoredBytes>, BackendError> {
         self.check(Operation::Stat)?;
+        let mut statistics = self
+            .statistics
+            .lock()
+            .map_err(|_| BackendError::InvalidData)?;
+        statistics.stat_calls += 1;
+        statistics.blob_stat_calls += u64::from(matches!(key, ObjectKey::Blob(_)));
+        drop(statistics);
         self.inner.stat(key)
     }
     fn read_root(&self) -> Result<Option<RootRecord>, BackendError> {
         self.check(Operation::RootRead)?;
+        self.statistics
+            .lock()
+            .map_err(|_| BackendError::InvalidData)?
+            .root_reads += 1;
         self.inner.read_root()
     }
     fn compare_exchange_root(
@@ -809,6 +844,10 @@ impl StorageBackend for FaultBackend {
         limit: usize,
     ) -> Result<Vec<ObjectKey>, BackendError> {
         self.check(Operation::Inventory)?;
+        self.statistics
+            .lock()
+            .map_err(|_| BackendError::InvalidData)?
+            .inventory_calls += 1;
         self.inner.inventory(after, limit)
     }
     fn delete(&self, permit: DeletePermit<'_>) -> Result<(), BackendError> {

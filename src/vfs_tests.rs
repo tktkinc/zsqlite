@@ -611,7 +611,7 @@ impl Drop for Connection {
 }
 
 /// # Safety
-/// statement is a live SQLite statement on a current row, column is in range,
+/// statement is a live `SQLite` statement on a current row, column is in range,
 /// and no step, conversion or finalize invalidates its bytes during this copy.
 unsafe fn column_value(statement: *mut ffi::sqlite3_stmt, column: c_int) -> Result<Value, String> {
     // SAFETY: The statement is positioned on SQLITE_ROW and column is

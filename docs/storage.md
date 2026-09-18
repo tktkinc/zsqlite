@@ -99,8 +99,8 @@ logical head. An already-flat view is a `compact()` no-op, even if compression
 policy changed. Database compaction does not run payload/placement collection.
 A rollup earns preference by wider txid coverage, not by being newer. Whole
 unreachable blobs are directly deleted; partial dead extents remain.
-`maintain()` may rewrite one partially live pack under the configured
-decoded-input budget.
+`maintain()` can repack several partially live packs into one checkpoint under
+the configured total maintenance-input budget.
 
 ## Layout policy
 
@@ -236,9 +236,46 @@ Partial-obsolescence estimates use live-page occupancy; compressed pages need no
 contribute equal physical bytes. Retained forks still prevent GC-driven copying
 when their owners would keep the original pack anyway.
 
-`maintain(path)` reports one bounded repack, decoded input and resulting GC work.
-Fully live frames copy their encoded payload unchanged; partial frames drop dead
-slots and recompress. Source comparison precedes head installation. The local
+`maintain(path)` and `Database::maintain()` select packs below 50% estimated live-byte
+occupancy, greedily preferring estimated reclaimed bytes per unit of surviving
+frame work. Packs retained by forks or other roots are skipped. The configured
+`maintenance_input` budget applies to the entire pass: it counts the decoded
+size of every source frame containing a live page, including the full shape of
+partially obsolete frames, and excludes fully dead frames. A pack whose surviving
+frame input exceeds the remaining budget is skipped. Packs at or above 50% live
+byte occupancy remain eligible for later passes only after further churn.
+
+Selection and collection reporting derive occupancy from authenticated live-frame
+metadata and placement lengths, without reading payload blobs. Whole obsolete
+frame spans contribute exact stored bytes; wasted space inside a partially live
+frame is a proportional estimate. This intentionally differs from page-count
+occupancy when pages have different compression ratios. Explicit inspection still
+scans pack headers to report exact page/frame inventory.
+
+Fully live frames copy their encoded payload unchanged after authenticating the
+record header and payload hash, preserving frame IDs, codecs and dictionary
+dependencies. Only partially obsolete multi-page frames decode, drop dead slots
+and recompress. With the default page frames, payload repacking needs no
+decompression or recompression. `repacked_packs`, `copied_frames`, and
+`copied_bytes` report the selected pack count and unchanged frame payload copied
+(excluding record headers); `decoded_input` counts actual decoded bytes from
+partial frames, and `gc` reports the resulting collection work.
+
+Source reads run in pack/offset order. Neighboring frame records share up to
+8 MiB read windows, with gaps no larger than 64 KiB and total fetched bytes no
+larger than four times the selected complete frame records. A single large
+frame may use a separate window up to 16 MiB. This bounds remote request count
+and extra transfer without decompressing copied frames.
+
+All replacements publish through one checkpoint and batched placement updates.
+Publication uses one catalog CAS to register the manifest and placements, one
+pending-head CAS, and one final-head CAS; collection can add one retirement CAS.
+This fixed protocol is independent of the pack count, but is not a single atomic
+update spanning the backend catalog and local active file. The existing endpoint
+index selects the widest checkpoint at the exact logical endpoint, so repacking
+requires no new format or lookup layer.
+
+Source comparison precedes head installation. The local
 implementation currently builds while publication/catalogue locks remain held;
 it does not promise nonblocking background compression. `compact()`
 only merges metadata runs and preserves every payload location.
