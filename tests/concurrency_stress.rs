@@ -55,6 +55,8 @@ impl Connection {
             message: error.to_string(),
         })?;
         let mut raw = null_mut();
+        // SAFETY: The path/VFS C strings outlive this call and the output slot is
+        // exclusive. SQLite initializes the owned handle even when opening fails.
         let rc = unsafe {
             ffi::sqlite3_open_v2(
                 path.as_ptr(),
@@ -79,6 +81,8 @@ impl Connection {
     }
 
     fn busy_timeout(&self, milliseconds: i32) -> Result<(), SqlError> {
+        // SAFETY: The owned connection is live, with no concurrent access;
+        // this synchronous configuration call retains no Rust pointers.
         let rc = unsafe { ffi::sqlite3_busy_timeout(self.0.as_ptr(), milliseconds) };
         if rc == ffi::SQLITE_OK {
             Ok(())
@@ -93,6 +97,9 @@ impl Connection {
             message: error.to_string(),
         })?;
         let mut error = null_mut();
+        // SAFETY: The owned connection is live on this thread and sql is a
+        // terminated CString. Any error output is an exclusive local pointer slot;
+        // SQLite copies SQL and retains no Rust callback or buffer.
         let rc = unsafe {
             ffi::sqlite3_exec(
                 self.0.as_ptr(),
@@ -108,9 +115,13 @@ impl Connection {
         let message = if error.is_null() {
             self.error(rc).message
         } else {
+            // SAFETY: SQLite returned this non-null, terminated error allocation.
+            // Copy its message while it is live, before sqlite3_free releases it.
             let message = unsafe { CStr::from_ptr(error) }
                 .to_string_lossy()
                 .into_owned();
+            // SAFETY: SQLite allocated this error string; it has been copied and
+            // this is its sole release, using the matching SQLite allocator.
             unsafe { ffi::sqlite3_free(error.cast()) };
             message
         };
@@ -133,6 +144,9 @@ impl Connection {
             message: error.to_string(),
         })?;
         let mut statement = null_mut();
+        // SAFETY: The connection and terminated SQL string remain live. SQLite
+        // writes the statement to an exclusive local slot; its owner finalizes it
+        // before the connection is closed.
         let rc = unsafe {
             ffi::sqlite3_prepare_v2(
                 self.0.as_ptr(),
@@ -148,6 +162,8 @@ impl Connection {
         let result = (|| {
             let mut values = Vec::new();
             loop {
+                // SAFETY: The prepared statement and its connection remain live and
+                // exclusive to this thread; prior column borrows have ended before stepping.
                 let step = unsafe { ffi::sqlite3_step(statement) };
                 if step == ffi::SQLITE_DONE {
                     return Ok(values);
@@ -155,7 +171,11 @@ impl Connection {
                 if step != ffi::SQLITE_ROW {
                     return Err(self.error(step));
                 }
+                // SAFETY: The prepared statement remains live; querying its column
+                // count borrows it synchronously and retains no Rust memory.
                 if unsafe { ffi::sqlite3_column_count(statement) } != 1
+                    // SAFETY: The statement is positioned on SQLITE_ROW and column is
+                    // within its result columns; it has not been stepped or finalized.
                     || unsafe { ffi::sqlite3_column_type(statement, 0) } != ffi::SQLITE_INTEGER
                 {
                     return Err(SqlError {
@@ -163,9 +183,13 @@ impl Connection {
                         message: "query did not return exactly one integer column".into(),
                     });
                 }
+                // SAFETY: The live statement is positioned on SQLITE_ROW with this
+                // column in range. SQLite returns the scalar by value without retaining data.
                 values.push(unsafe { ffi::sqlite3_column_int64(statement, 0) });
             }
         })();
+        // SAFETY: This owner releases the prepared statement exactly once,
+        // while its connection is still live and all column borrows have ended.
         let finalize = unsafe { ffi::sqlite3_finalize(statement) };
         if finalize != ffi::SQLITE_OK {
             return Err(self.error(finalize));
@@ -176,6 +200,8 @@ impl Connection {
     fn error(&self, code: i32) -> SqlError {
         SqlError {
             code,
+            // SAFETY: The owned connection is live and accessed on this thread only.
+            // SQLite returns a terminated message, copied before another SQLite call.
             message: unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0.as_ptr())) }
                 .to_string_lossy()
                 .into_owned(),
@@ -185,6 +211,8 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // SAFETY: This owner consumes its live SQLite connection exactly once;
+        // no statement or buffer is used after the close.
         let _ = unsafe { ffi::sqlite3_close(self.0.as_ptr()) };
     }
 }
@@ -372,11 +400,15 @@ fn lock_holder_worker() -> TestResult {
     let stop = PathBuf::from(std::env::var_os(WORKER_STOP).ok_or("missing stop marker")?);
     let lock_path = append_suffix(&database, ".d/locks/publication.lock");
     let lock = OpenOptions::new().read(true).write(true).open(lock_path)?;
+    // SAFETY: The owned File keeps the descriptor open throughout this
+    // lock/unlock syscall, which retains no Rust memory pointers.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     std::fs::write(&ready, b"locked")?;
     wait_for_start(&stop, Instant::now() + Duration::from_secs(15))?;
+    // SAFETY: The owned File keeps the descriptor open throughout this
+    // lock/unlock syscall, which retains no Rust memory pointers.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }

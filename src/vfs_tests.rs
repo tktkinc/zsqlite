@@ -1,7 +1,10 @@
+use super::runtime::{canonical_key, get_store, registry_entry, sqlite_result};
 use super::*;
+use crate::store::Store;
 use std::ffi::{CStr, CString};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
@@ -10,7 +13,6 @@ use std::time::{Duration, Instant};
 const ZSQLITE_VFS: &CStr = c"zsqlite";
 
 #[test]
-#[allow(clippy::used_underscore_binding)] // Inspect the filename retained solely for parent ownership.
 fn coordination_filename_preserves_sqlite_framing_and_uri_parameters()
 -> Result<(), Box<dyn std::error::Error>> {
     register()?;
@@ -24,6 +26,9 @@ fn coordination_filename_preserves_sqlite_framing_and_uri_parameters()
     )?;
     let mut file: *mut ffi::sqlite3_file = null_mut();
     assert_eq!(
+        // SAFETY: The connection and schema string remain live on this thread.
+        // The output allocation has the type and size required by this file-control
+        // opcode and remains exclusively accessible during the synchronous call.
         unsafe {
             ffi::sqlite3_file_control(
                 connection.0,
@@ -36,27 +41,32 @@ fn coordination_filename_preserves_sqlite_framing_and_uri_parameters()
     );
     // Check the retained parent filename after xOpen has returned, using the
     // same SQLite filename APIs that the native WAL shared-memory code uses.
+    // SAFETY: FILE_POINTER returned our initialized ZFile for this live
+    // connection. The test has exclusive access and reads its boxed owner before close.
     let state = unsafe { &*(*file.cast::<ZFile>()).state };
-    let filename = state._parent_name.as_ref().expect("coordination filename");
+    let filename = state.parent.filename().expect("coordination filename");
     assert_eq!(
-        unsafe { ffi::sqlite3_filename_database(filename.as_ptr()) },
-        filename.as_ptr()
+        // SAFETY: The retained name was created with sqlite3_create_filename
+        // and is still owned by this open parent file; SQLite may inspect its framing.
+        unsafe { ffi::sqlite3_filename_database(filename) },
+        filename
     );
     assert_eq!(
-        unsafe {
-            CStr::from_ptr(ffi::sqlite3_uri_parameter(
-                filename.as_ptr(),
-                c"training".as_ptr(),
-            ))
-        },
+        // SAFETY: The retained framed SQLite filename remains alive; the
+        // static key is terminated and the returned value is inspected before close.
+        unsafe { CStr::from_ptr(ffi::sqlite3_uri_parameter(filename, c"training".as_ptr(),)) },
         c"example"
     );
     assert_eq!(
-        unsafe { ffi::sqlite3_uri_boolean(filename.as_ptr(), c"psow".as_ptr(), 1) },
+        // SAFETY: The retained framed SQLite filename and static terminated
+        // key remain alive; SQLite reads its URI fields synchronously.
+        unsafe { ffi::sqlite3_uri_boolean(filename, c"psow".as_ptr(), 1) },
         0
     );
     assert_eq!(
-        unsafe { ffi::sqlite3_uri_boolean(filename.as_ptr(), c"missing".as_ptr(), 1) },
+        // SAFETY: The retained framed SQLite filename and static terminated
+        // key remain alive; SQLite reads its URI fields synchronously.
+        unsafe { ffi::sqlite3_uri_boolean(filename, c"missing".as_ptr(), 1) },
         1
     );
     connection.execute("PRAGMA journal_mode=WAL; CREATE TABLE data(value); INSERT INTO data VALUES(42); PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -76,9 +86,13 @@ fn scoped_statistics_work() -> Result<(), Box<dyn std::error::Error>> {
     crate::flush(&path)?;
     let connection = Connection::open(&path)?;
     connection.integer("SELECT sum(length(hex(body))) FROM data")?;
+    // SAFETY: This thread exclusively uses the live connection, linked
+    // against the same SQLite ABI; the schema is a static terminated string.
     let first = unsafe { crate::statistics::connection_statistics(connection.0, c"main") }
         .map_err(|code| format!("stats {code}"))?;
     connection.integer("SELECT sum(length(hex(body))) FROM data")?;
+    // SAFETY: This thread exclusively uses the live connection, linked
+    // against the same SQLite ABI; the schema is a static terminated string.
     let second = unsafe { crate::statistics::connection_statistics(connection.0, c"main") }
         .map_err(|code| format!("stats {code}"))?;
     assert!(first.handle.requested_bytes > 0);
@@ -90,6 +104,9 @@ fn scoped_statistics_work() -> Result<(), Box<dyn std::error::Error>> {
         size: 8,
     };
     assert_eq!(
+        // SAFETY: The connection and schema string remain live on this thread.
+        // The output allocation has the type and size required by this file-control
+        // opcode and remains exclusively accessible during the synchronous call.
         unsafe {
             ffi::sqlite3_file_control(
                 connection.0,
@@ -140,6 +157,9 @@ fn record_parent_context(vfs: *mut ffi::sqlite3_vfs, callback: usize) -> bool {
     true
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_open(
     vfs: *mut ffi::sqlite3_vfs,
     _name: *const c_char,
@@ -154,6 +174,9 @@ unsafe extern "C" fn context_checking_open(
     }
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_delete(
     vfs: *mut ffi::sqlite3_vfs,
     _name: *const c_char,
@@ -166,6 +189,9 @@ unsafe extern "C" fn context_checking_delete(
     }
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_access(
     vfs: *mut ffi::sqlite3_vfs,
     _name: *const c_char,
@@ -179,6 +205,9 @@ unsafe extern "C" fn context_checking_access(
     }
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_full_pathname(
     vfs: *mut ffi::sqlite3_vfs,
     _name: *const c_char,
@@ -192,6 +221,9 @@ unsafe extern "C" fn context_checking_full_pathname(
     }
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_dl_open(
     vfs: *mut ffi::sqlite3_vfs,
     _filename: *const c_char,
@@ -203,6 +235,9 @@ unsafe extern "C" fn context_checking_dl_open(
     }
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_dl_error(
     vfs: *mut ffi::sqlite3_vfs,
     _output_size: c_int,
@@ -211,6 +246,9 @@ unsafe extern "C" fn context_checking_dl_error(
     record_parent_context(vfs, PARENT_DL_ERROR);
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_dl_entry(
     _vfs: *mut ffi::sqlite3_vfs,
     _handle: *mut c_void,
@@ -218,6 +256,9 @@ unsafe extern "C" fn context_checking_dl_entry(
 ) {
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_dl_sym(
     vfs: *mut ffi::sqlite3_vfs,
     _handle: *mut c_void,
@@ -226,10 +267,16 @@ unsafe extern "C" fn context_checking_dl_sym(
     record_parent_context(vfs, PARENT_DL_SYM).then_some(context_checking_dl_entry)
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_dl_close(vfs: *mut ffi::sqlite3_vfs, _handle: *mut c_void) {
     record_parent_context(vfs, PARENT_DL_CLOSE);
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_randomness(
     vfs: *mut ffi::sqlite3_vfs,
     _amount: c_int,
@@ -242,6 +289,9 @@ unsafe extern "C" fn context_checking_randomness(
     }
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_sleep(
     vfs: *mut ffi::sqlite3_vfs,
     microseconds: c_int,
@@ -253,6 +303,9 @@ unsafe extern "C" fn context_checking_sleep(
     }
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_current_time(
     vfs: *mut ffi::sqlite3_vfs,
     output: *mut f64,
@@ -260,12 +313,17 @@ unsafe extern "C" fn context_checking_current_time(
     if !record_parent_context(vfs, PARENT_CURRENT_TIME) {
         return ffi::SQLITE_MISUSE;
     }
+    // SAFETY: The test callback receives either null or an aligned
+    // exclusive output reference to the initialized local owned by its caller.
     if let Some(output) = unsafe { output.as_mut() } {
         *output = 17.0;
     }
     ffi::SQLITE_OK
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_last_error(
     vfs: *mut ffi::sqlite3_vfs,
     _output_size: c_int,
@@ -278,6 +336,9 @@ unsafe extern "C" fn context_checking_last_error(
     }
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_current_time_i64(
     vfs: *mut ffi::sqlite3_vfs,
     output: *mut ffi::sqlite3_int64,
@@ -285,14 +346,22 @@ unsafe extern "C" fn context_checking_current_time_i64(
     if !record_parent_context(vfs, PARENT_CURRENT_TIME_I64) {
         return ffi::SQLITE_MISUSE;
     }
+    // SAFETY: The test callback receives either null or an aligned
+    // exclusive output reference to the initialized local owned by its caller.
     if let Some(output) = unsafe { output.as_mut() } {
         *output = 23;
     }
     ffi::SQLITE_OK
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_system_call() {}
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_set_system_call(
     vfs: *mut ffi::sqlite3_vfs,
     _name: *const c_char,
@@ -305,6 +374,9 @@ unsafe extern "C" fn context_checking_set_system_call(
     }
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_get_system_call(
     vfs: *mut ffi::sqlite3_vfs,
     _name: *const c_char,
@@ -312,6 +384,9 @@ unsafe extern "C" fn context_checking_get_system_call(
     record_parent_context(vfs, PARENT_GET_SYSTEM_CALL).then_some(context_checking_system_call)
 }
 
+/// # Safety
+/// The fixture's local VFS and context remain live through the call. Any used
+/// output points to the caller's aligned writable local; unused inputs may be null.
 unsafe extern "C" fn context_checking_next_system_call(
     vfs: *mut ffi::sqlite3_vfs,
     _name: *const c_char,
@@ -369,9 +444,13 @@ impl Connection {
     ) -> Result<Self, String> {
         let mut database = null_mut();
         let rc =
+            // SAFETY: The path/VFS C strings outlive this call and the output slot is
+            // exclusive. SQLite initializes the owned handle even when opening fails.
             unsafe { ffi::sqlite3_open_v2(path.as_ptr(), &raw mut database, flags, vfs.as_ptr()) };
         if rc == ffi::SQLITE_OK {
             let connection = Self(database);
+            // SAFETY: The owned connection is live, with no concurrent access;
+            // this synchronous configuration call retains no Rust pointers.
             let timeout_rc = unsafe { ffi::sqlite3_busy_timeout(connection.0, 10_000) };
             if timeout_rc != ffi::SQLITE_OK {
                 return Err(connection.error("setting busy timeout", timeout_rc));
@@ -381,11 +460,15 @@ impl Connection {
             let message = if database.is_null() {
                 "open failed".into()
             } else {
+                // SAFETY: The owned connection is live and accessed on this thread only.
+                // SQLite returns a terminated message, copied before another SQLite call.
                 unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(database)) }
                     .to_string_lossy()
                     .into_owned()
             };
             if !database.is_null() {
+                // SAFETY: This owner consumes its live SQLite connection exactly once;
+                // no statement or buffer is used after the close.
                 unsafe { ffi::sqlite3_close(database) };
             }
             Err(format!("SQLite error {rc}: {message}"))
@@ -401,18 +484,27 @@ impl Connection {
         let sql = CString::new(sql).map_err(|error| (-1, error.to_string()))?;
         let mut error = null_mut();
         let rc =
+            // SAFETY: The owned connection is live on this thread and sql is a
+            // terminated CString. Any error output is an exclusive local pointer slot;
+            // SQLite copies SQL and retains no Rust callback or buffer.
             unsafe { ffi::sqlite3_exec(self.0, sql.as_ptr(), None, null_mut(), &raw mut error) };
         if rc == ffi::SQLITE_OK {
             Ok(())
         } else {
             let message = if error.is_null() {
+                // SAFETY: The owned connection is live and accessed on this thread only.
+                // SQLite returns a terminated message, copied before another SQLite call.
                 unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0)) }
                     .to_string_lossy()
                     .into_owned()
             } else {
+                // SAFETY: SQLite returned this non-null, terminated error allocation.
+                // Copy its message while it is live, before sqlite3_free releases it.
                 let message = unsafe { CStr::from_ptr(error) }
                     .to_string_lossy()
                     .into_owned();
+                // SAFETY: SQLite allocated this error string; it has been copied and
+                // this is its sole release, using the matching SQLite allocator.
                 unsafe { ffi::sqlite3_free(error.cast()) };
                 message
             };
@@ -421,6 +513,8 @@ impl Connection {
     }
 
     fn busy_timeout(&self, milliseconds: c_int) -> Result<(), String> {
+        // SAFETY: The owned connection is live, with no concurrent access;
+        // this synchronous configuration call retains no Rust pointers.
         let rc = unsafe { ffi::sqlite3_busy_timeout(self.0, milliseconds) };
         if rc == ffi::SQLITE_OK {
             Ok(())
@@ -455,6 +549,9 @@ impl Connection {
     fn rows(&self, sql: &str) -> Result<Vec<Vec<Value>>, String> {
         let sql = CString::new(sql).map_err(|e| e.to_string())?;
         let mut statement = null_mut();
+        // SAFETY: The connection and terminated SQL string remain live. SQLite
+        // writes the statement to an exclusive local slot; its owner finalizes it
+        // before the connection is closed.
         let rc = unsafe {
             ffi::sqlite3_prepare_v2(self.0, sql.as_ptr(), -1, &raw mut statement, null_mut())
         };
@@ -464,6 +561,8 @@ impl Connection {
         let result = (|| {
             let mut rows = Vec::new();
             loop {
+                // SAFETY: The prepared statement and its connection remain live and
+                // exclusive to this thread; prior column borrows have ended before stepping.
                 let rc = unsafe { ffi::sqlite3_step(statement) };
                 if rc == ffi::SQLITE_DONE {
                     return Ok(rows);
@@ -471,16 +570,22 @@ impl Connection {
                 if rc != ffi::SQLITE_ROW {
                     return Err(self.error("step", rc));
                 }
+                // SAFETY: The prepared statement remains live; querying its column
+                // count borrows it synchronously and retains no Rust memory.
                 let columns = unsafe { ffi::sqlite3_column_count(statement) };
                 let capacity = usize::try_from(columns)
                     .map_err(|_| "SQLite returned a negative column count")?;
                 let mut row = Vec::with_capacity(capacity);
                 for column in 0..columns {
+                    // SAFETY: The live statement is on SQLITE_ROW; column is within
+                    // column_count and column_value copies bytes before the next step/finalize.
                     row.push(unsafe { column_value(statement, column) }?);
                 }
                 rows.push(row);
             }
         })();
+        // SAFETY: This owner releases the prepared statement exactly once,
+        // while its connection is still live and all column borrows have ended.
         let finalize_rc = unsafe { ffi::sqlite3_finalize(statement) };
         if finalize_rc != ffi::SQLITE_OK {
             return Err(self.error("finalize", finalize_rc));
@@ -489,6 +594,8 @@ impl Connection {
     }
 
     fn error(&self, operation: &str, rc: c_int) -> String {
+        // SAFETY: The owned connection is live and accessed on this thread only.
+        // SQLite returns a terminated message, copied before another SQLite call.
         let message = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0)) }.to_string_lossy();
         format!("{operation} failed with SQLite error {rc}: {message}")
     }
@@ -496,22 +603,37 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // SAFETY: This owner consumes its live SQLite connection exactly once;
+        // no statement or buffer is used after the close.
         let rc = unsafe { ffi::sqlite3_close(self.0) };
         assert_eq!(rc, ffi::SQLITE_OK);
     }
 }
 
+/// # Safety
+/// statement is a live SQLite statement on a current row, column is in range,
+/// and no step, conversion or finalize invalidates its bytes during this copy.
 unsafe fn column_value(statement: *mut ffi::sqlite3_stmt, column: c_int) -> Result<Value, String> {
+    // SAFETY: The statement is positioned on SQLITE_ROW and column is
+    // within its result columns; it has not been stepped or finalized.
     match unsafe { ffi::sqlite3_column_type(statement, column) } {
         ffi::SQLITE_NULL => Ok(Value::Null),
+        // SAFETY: The live statement is positioned on SQLITE_ROW with this
+        // column in range. SQLite returns the scalar by value without retaining data.
         ffi::SQLITE_INTEGER => Ok(Value::Integer(unsafe {
             ffi::sqlite3_column_int64(statement, column)
         })),
         ffi::SQLITE_FLOAT => Ok(Value::Float(
+            // SAFETY: The live statement is positioned on SQLITE_ROW with this
+            // column in range. SQLite returns the scalar by value without retaining data.
             unsafe { ffi::sqlite3_column_double(statement, column) }.to_bits(),
         )),
         ffi::SQLITE_TEXT | ffi::SQLITE_BLOB => {
+            // SAFETY: The statement is positioned on SQLITE_ROW and column is
+            // within its result columns; it has not been stepped or finalized.
             let kind = unsafe { ffi::sqlite3_column_type(statement, column) };
+            // SAFETY: The statement is live on its current row and the column is
+            // in range; the resulting byte length is consumed before stepping/finalizing.
             let length = unsafe { ffi::sqlite3_column_bytes(statement, column) };
             if length < 0 {
                 return Err("SQLite returned a negative column length".into());
@@ -520,8 +642,14 @@ unsafe fn column_value(statement: *mut ffi::sqlite3_stmt, column: c_int) -> Resu
                 Vec::new()
             } else {
                 let pointer = if kind == ffi::SQLITE_TEXT {
+                    // SAFETY: The statement is on a live row and the column is in range.
+                    // SQLite owns the returned bytes, consumed before conversion, step or finalize
+                    // can invalidate them; null/empty results are checked by the buffer reader.
                     unsafe { ffi::sqlite3_column_text(statement, column) }.cast::<u8>()
                 } else {
+                    // SAFETY: The statement is on a live row and the column is in range.
+                    // SQLite owns the returned bytes, consumed before conversion, step or finalize
+                    // can invalidate them; null/empty results are checked by the buffer reader.
                     unsafe { ffi::sqlite3_column_blob(statement, column) }.cast::<u8>()
                 };
                 if pointer.is_null() {
@@ -529,6 +657,9 @@ unsafe fn column_value(statement: *mut ffi::sqlite3_stmt, column: c_int) -> Resu
                 }
                 let length = usize::try_from(length)
                     .map_err(|_| "SQLite returned a negative column length")?;
+                // SAFETY: The caller obtained pointer and length from the same live
+                // SQLite column, checked null/empty cases, and consumes these bytes before
+                // stepping, conversion or finalization can invalidate the allocation.
                 unsafe { slice::from_raw_parts(pointer, length) }.to_vec()
             };
             if kind == ffi::SQLITE_TEXT {
@@ -546,13 +677,27 @@ fn register() -> Result<(), String> {
 }
 
 fn native_vfs_name() -> Result<CString, String> {
+    // SAFETY: SQLite is initialized; the optional VFS name is terminated.
+    // The test/benchmark retains registrations while using the returned pointer.
     let zsqlite = unsafe { ffi::sqlite3_vfs_find(VFS_NAME.as_ptr().cast()) };
+    // SAFETY: Registration succeeded for our VFS name; its permanent
+    // allocation contains this shim's AppData and is not unregistered by the test.
     if let Some(app) = unsafe { app_data(&*zsqlite) } {
+        // SAFETY: This pointer identifies a live registered VFS retained by
+        // the test. Null is handled without dereferencing; the borrow ends here.
         let parent = unsafe { app.parent.as_ref() }.ok_or("zsqlite parent VFS is null")?;
+        // SAFETY: The registered VFS remains live for this call and owns a
+        // terminated name, which is copied before releasing the registration borrow.
         return Ok(unsafe { CStr::from_ptr(parent.zName) }.to_owned());
     }
+    // SAFETY: SQLite is initialized; the optional VFS name is terminated.
+    // The test/benchmark retains registrations while using the returned pointer.
     let default = unsafe { ffi::sqlite3_vfs_find(null()) };
+    // SAFETY: This pointer identifies a live registered VFS retained by
+    // the test. Null is handled without dereferencing; the borrow ends here.
     let default = unsafe { default.as_ref() }.ok_or("no default SQLite VFS")?;
+    // SAFETY: The registered VFS remains live for this call and owns a
+    // terminated name, which is copied before releasing the registration borrow.
     Ok(unsafe { CStr::from_ptr(default.zName) }.to_owned())
 }
 
@@ -679,10 +824,19 @@ fn deleting_a_logical_db_removes_its_notice_and_bundle() -> Result<(), Box<dyn s
     let sidecar = append_suffix(&storage, ".d");
     Connection::open(&logical)?.execute("CREATE TABLE payload(value)")?;
 
+    // SAFETY: SQLite is initialized; the optional VFS name is terminated.
+    // The test/benchmark retains registrations while using the returned pointer.
     let vfs = unsafe { ffi::sqlite3_vfs_find(VFS_NAME.as_ptr().cast()) };
-    let vfs = unsafe { vfs.as_mut() }.ok_or("zsqlite VFS is not registered")?;
+    // SAFETY: This pointer identifies a live registered VFS retained by
+    // the test. Null is handled without dereferencing; the borrow ends here.
+    let vfs_pointer = vfs;
+    // SAFETY: The permanent registration remains live; inspect it through a
+    // shared borrow since other test connections can use it concurrently.
+    let vfs = unsafe { vfs_pointer.as_ref() }.ok_or("zsqlite VFS is not registered")?;
     let encoded = CString::new(logical.as_os_str().as_bytes())?;
-    let rc = unsafe { vfs.xDelete.expect("xDelete")(&raw mut *vfs, encoded.as_ptr(), 1) };
+    // SAFETY: The registered VFS remains live and the owned CString
+    // keeps the pathname terminated throughout the synchronous delete callback.
+    let rc = unsafe { vfs.xDelete.expect("xDelete")(vfs_pointer, encoded.as_ptr(), 1) };
     assert_eq!(rc, ffi::SQLITE_OK);
     assert!(!logical.exists());
     assert!(!storage.exists());
@@ -823,6 +977,8 @@ fn moving_the_active_path_rejects_a_write() -> Result<(), Box<dyn std::error::Er
 
     std::fs::rename(&path, &moved)?;
     let result = connection.execute_with_code("INSERT INTO events VALUES(1)");
+    // SAFETY: The connection is live and used only on this thread;
+    // querying the numeric error code retains no Rust pointers.
     let extended = unsafe { ffi::sqlite3_extended_errcode(connection.0) };
     std::fs::rename(&moved, &path)?;
     assert!(result.is_err());
@@ -875,8 +1031,12 @@ fn registration_is_idempotent_under_concurrency() -> Result<(), Box<dyn std::err
             .join()
             .map_err(|_| "registration thread panicked")??;
     }
+    // SAFETY: SQLite is initialized; the optional VFS name is terminated.
+    // The test/benchmark retains registrations while using the returned pointer.
     let registered = unsafe { ffi::sqlite3_vfs_find(VFS_NAME.as_ptr().cast()) };
     assert!(!registered.is_null());
+    // SAFETY: SQLite is initialized; the optional VFS name is terminated.
+    // The test/benchmark retains registrations while using the returned pointer.
     let default = unsafe { ffi::sqlite3_vfs_find(null()) };
     assert_ne!(registered, default);
     Ok(())
@@ -925,6 +1085,9 @@ fn inherited_parent_vfs_callbacks_receive_the_parent_context() {
 
     let mut file = std::mem::MaybeUninit::<ZFile>::uninit();
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe {
             shim.xOpen.expect("open")(
                 &raw mut shim,
@@ -937,42 +1100,78 @@ fn inherited_parent_vfs_callbacks_receive_the_parent_context() {
         ffi::SQLITE_CANTOPEN
     );
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe { shim.xDelete.expect("delete")(&raw mut shim, null(), 0) },
         ffi::SQLITE_OK
     );
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe { shim.xAccess.expect("access")(&raw mut shim, null(), 0, null_mut()) },
         ffi::SQLITE_OK
     );
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe { shim.xFullPathname.expect("full pathname")(&raw mut shim, null(), 0, null_mut()) },
         ffi::SQLITE_OK
     );
+    // SAFETY: The local shim, AppData and parent fixture outlive this call.
+    // The fake parent accepts these test arguments (including ignored nulls);
+    // any actual output points to a live local allocation of the required type.
     let handle = unsafe { shim.xDlOpen.expect("dl open")(&raw mut shim, null()) };
     assert!(!handle.is_null());
+    // SAFETY: The local shim, AppData and parent fixture outlive this call.
+    // The fake parent accepts these test arguments (including ignored nulls);
+    // any actual output points to a live local allocation of the required type.
     unsafe { shim.xDlError.expect("dl error")(&raw mut shim, 0, null_mut()) };
+    // SAFETY: The local shim, AppData and parent fixture outlive this call.
+    // The fake parent accepts these test arguments (including ignored nulls);
+    // any actual output points to a live local allocation of the required type.
     assert!(unsafe { shim.xDlSym.expect("dl sym")(&raw mut shim, handle, null()) }.is_some());
+    // SAFETY: The local shim, AppData and parent fixture outlive this call.
+    // The fake parent accepts these test arguments (including ignored nulls);
+    // any actual output points to a live local allocation of the required type.
     unsafe { shim.xDlClose.expect("dl close")(&raw mut shim, handle) };
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe { shim.xRandomness.expect("randomness")(&raw mut shim, 0, null_mut()) },
         7,
     );
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe { shim.xSleep.expect("sleep")(&raw mut shim, 31) },
         31
     );
     let mut current_time = 0.0;
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe { shim.xCurrentTime.expect("current time")(&raw mut shim, &raw mut current_time) },
         ffi::SQLITE_OK
     );
     assert_eq!(current_time.to_bits(), 17.0_f64.to_bits());
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe { shim.xGetLastError.expect("last error")(&raw mut shim, 0, null_mut()) },
         19
     );
     let mut current_time_i64 = 0;
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe {
             shim.xCurrentTimeInt64.expect("current time i64")(
                 &raw mut shim,
@@ -983,13 +1182,22 @@ fn inherited_parent_vfs_callbacks_receive_the_parent_context() {
     );
     assert_eq!(current_time_i64, 23);
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe { shim.xSetSystemCall.expect("set system call")(&raw mut shim, null(), None) },
         29
     );
     assert!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe { shim.xGetSystemCall.expect("get system call")(&raw mut shim, null()) }.is_some()
     );
     assert_eq!(
+        // SAFETY: The local shim, AppData and parent fixture outlive this call.
+        // The fake parent accepts these test arguments (including ignored nulls);
+        // any actual output points to a live local allocation of the required type.
         unsafe { shim.xNextSystemCall.expect("next system call")(&raw mut shim, null()) },
         c"next".as_ptr()
     );
@@ -1238,18 +1446,26 @@ fn vfs_delete_removes_database_and_sidecar_for_unusual_path()
     assert!(sidecar.exists());
 
     let path_string = CString::new(path.to_string_lossy().as_bytes())?;
+    // SAFETY: SQLite is initialized; the optional VFS name is terminated.
+    // The test/benchmark retains registrations while using the returned pointer.
     let vfs = unsafe { ffi::sqlite3_vfs_find(VFS_NAME.as_ptr().cast()) };
+    // SAFETY: This pointer identifies a live registered VFS retained by
+    // the test. Null is handled without dereferencing; the borrow ends here.
     let delete = unsafe { vfs.as_ref() }
         .and_then(|registered| registered.xDelete)
         .ok_or("registered VFS has no xDelete")?;
     let active = Connection::open(&path)?;
     assert_eq!(
+        // SAFETY: The registered VFS remains live and the owned CString
+        // keeps the pathname terminated throughout the synchronous delete callback.
         unsafe { delete(vfs, path_string.as_ptr(), 1) },
         ffi::SQLITE_BUSY
     );
     assert_eq!(active.integer("SELECT count(*) FROM messages")?, 1);
     drop(active);
     assert_eq!(
+        // SAFETY: The registered VFS remains live and the owned CString
+        // keeps the pathname terminated throughout the synchronous delete callback.
         unsafe { delete(vfs, path_string.as_ptr(), 1) },
         ffi::SQLITE_OK
     );
@@ -1512,16 +1728,22 @@ fn online_backup_tracks_a_wal_commit_between_batches() -> Result<(), Box<dyn std
          SELECT x, printf('{\"id\":%d,\"text\":\"%.*c\"}', x, 1800+x%200, 'x') FROM n;",
     )?;
     let destination = Connection::open(&destination_path)?;
+    // SAFETY: Source and destination are distinct live connections and
+    // both schema names are terminated. Both connections outlive backup_finish.
     let backup = unsafe {
         ffi::sqlite3_backup_init(destination.0, c"main".as_ptr(), source.0, c"main".as_ptr())
     };
     if backup.is_null() {
         return Err(destination
+            // SAFETY: The connection remains live even after the failed backup;
+            // this synchronous error query retains no Rust pointers.
             .error("backup init", unsafe {
                 ffi::sqlite3_errcode(destination.0)
             })
             .into());
     }
+    // SAFETY: backup is the live, non-null handle returned by backup_init;
+    // its source and destination remain open and it has not been finished.
     let first_rc = unsafe { ffi::sqlite3_backup_step(backup, 17) };
     assert_eq!(
         first_rc,
@@ -1543,6 +1765,8 @@ fn online_backup_tracks_a_wal_commit_between_batches() -> Result<(), Box<dyn std
     .map_err(|_| "source writer panicked")??;
 
     let step_rc = loop {
+        // SAFETY: backup is the live, non-null handle returned by backup_init;
+        // its source and destination remain open and it has not been finished.
         let rc = unsafe { ffi::sqlite3_backup_step(backup, 17) };
         match rc {
             ffi::SQLITE_OK => {}
@@ -1550,6 +1774,8 @@ fn online_backup_tracks_a_wal_commit_between_batches() -> Result<(), Box<dyn std
             _ => break rc,
         }
     };
+    // SAFETY: This is the sole release of backup_init's non-null handle;
+    // both connections remain open and the backup is not used afterward.
     let finish_rc = unsafe { ffi::sqlite3_backup_finish(backup) };
     assert_eq!(step_rc, ffi::SQLITE_DONE);
     assert_eq!(finish_rc, ffi::SQLITE_OK);
@@ -1569,15 +1795,23 @@ fn online_backup_tracks_a_wal_commit_between_batches() -> Result<(), Box<dyn std
 }
 
 fn backup(source: &Connection, destination: &Connection) -> Result<(), String> {
+    // SAFETY: Source and destination are distinct live connections and
+    // both schema names are terminated. Both connections outlive backup_finish.
     let backup = unsafe {
         ffi::sqlite3_backup_init(destination.0, c"main".as_ptr(), source.0, c"main".as_ptr())
     };
     if backup.is_null() {
+        // SAFETY: The connection remains live even after the failed backup;
+        // this synchronous error query retains no Rust pointers.
         return Err(destination.error("backup init", unsafe {
             ffi::sqlite3_errcode(destination.0)
         }));
     }
+    // SAFETY: backup is the live, non-null handle returned by backup_init;
+    // its source and destination remain open and it has not been finished.
     let step_rc = unsafe { ffi::sqlite3_backup_step(backup, -1) };
+    // SAFETY: This is the sole release of backup_init's non-null handle;
+    // both connections remain open and the backup is not used afterward.
     let finish_rc = unsafe { ffi::sqlite3_backup_finish(backup) };
     if step_rc != ffi::SQLITE_DONE {
         return Err(destination.error("backup step", step_rc));
@@ -1593,15 +1827,21 @@ fn backup_incremental(
     destination: &Connection,
     pages_per_step: c_int,
 ) -> Result<(), String> {
+    // SAFETY: Source and destination are distinct live connections and
+    // both schema names are terminated. Both connections outlive backup_finish.
     let backup = unsafe {
         ffi::sqlite3_backup_init(destination.0, c"main".as_ptr(), source.0, c"main".as_ptr())
     };
     if backup.is_null() {
+        // SAFETY: The connection remains live even after the failed backup;
+        // this synchronous error query retains no Rust pointers.
         return Err(destination.error("backup init", unsafe {
             ffi::sqlite3_errcode(destination.0)
         }));
     }
     let step_rc = loop {
+        // SAFETY: backup is the live, non-null handle returned by backup_init;
+        // its source and destination remain open and it has not been finished.
         let rc = unsafe { ffi::sqlite3_backup_step(backup, pages_per_step) };
         match rc {
             ffi::SQLITE_OK => {}
@@ -1609,6 +1849,8 @@ fn backup_incremental(
             _ => break rc,
         }
     };
+    // SAFETY: This is the sole release of backup_init's non-null handle;
+    // both connections remain open and the backup is not used afterward.
     let finish_rc = unsafe { ffi::sqlite3_backup_finish(backup) };
     if step_rc != ffi::SQLITE_DONE {
         return Err(destination.error("incremental backup step", step_rc));
@@ -3084,6 +3326,48 @@ fn crash_writer_worker() -> Result<(), Box<dyn std::error::Error>> {
              COMMIT;",
             1000 + sequence % 500
         ))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn callback_read_initializes_short_reads_and_checks_numeric_arguments()
+-> Result<(), Box<dyn std::error::Error>> {
+    register()?;
+    let directory = tempfile::tempdir()?;
+    let connection = Connection::open(&directory.path().join("read-boundary.zsqlite"))?;
+    connection.execute("CREATE TABLE data(value); INSERT INTO data VALUES(42);")?;
+    let mut file: *mut ffi::sqlite3_file = null_mut();
+    assert_eq!(
+        // SAFETY: connection owns a live database on this thread; FILE_POINTER
+        // takes this aligned writable pointer slot and the static schema name.
+        unsafe {
+            ffi::sqlite3_file_control(
+                connection.0,
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_FILE_POINTER,
+                (&raw mut file).cast(),
+            )
+        },
+        ffi::SQLITE_OK
+    );
+    assert!(!file.is_null());
+    let mut output = MaybeUninit::<[u8; 32]>::uninit();
+    // SAFETY: file is our live file, exclusively used on this thread. output is
+    // an aligned writable 32-byte allocation; xRead must initialize short reads.
+    let rc = unsafe { x_read(file, output.as_mut_ptr().cast(), 32, 1_i64 << 40) };
+    assert_eq!(rc, ffi::SQLITE_IOERR_SHORT_READ);
+    // SAFETY: xRead initialized all 32 bytes even though the logical read was short.
+    assert_eq!(unsafe { output.assume_init() }, [0; 32]);
+    // SAFETY: The file remains live and exclusive; a zero-length read accepts
+    // null output and negative lengths/offsets are rejected before buffer access.
+    unsafe {
+        assert_eq!(x_read(file, null_mut(), 0, 0), ffi::SQLITE_OK);
+        assert_eq!(x_read(file, null_mut(), -1, 0), ffi::SQLITE_IOERR_READ);
+        assert_eq!(x_read(file, null_mut(), 1, -1), ffi::SQLITE_IOERR_READ);
+        assert_eq!(x_write(file, null(), -1, 0), ffi::SQLITE_IOERR_WRITE);
+        assert_eq!(x_write(file, null(), 1, -1), ffi::SQLITE_IOERR_WRITE);
+        assert_eq!(x_truncate(file, -1), ffi::SQLITE_IOERR_TRUNCATE);
     }
     Ok(())
 }

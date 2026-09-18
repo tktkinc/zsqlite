@@ -382,6 +382,8 @@ pub(crate) fn install_pagefile(
     let result =
         unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
     #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: Both CStrings own terminated path bytes through the syscall;
+    // renameat2 borrows them synchronously and retains no Rust pointers.
     let result = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,

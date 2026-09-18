@@ -20,6 +20,8 @@ impl Connection {
     fn open(path: &Path, vfs: &CStr) -> Result<Self, String> {
         let path = CString::new(path.as_os_str().as_bytes()).map_err(|error| error.to_string())?;
         let mut database = null_mut();
+        // SAFETY: The path/VFS C strings outlive this call and the output slot is
+        // exclusive. SQLite initializes the owned handle even when opening fails.
         let rc = unsafe {
             ffi::sqlite3_open_v2(
                 path.as_ptr(),
@@ -32,16 +34,22 @@ impl Connection {
             let message = if database.is_null() {
                 "open returned a null handle".into()
             } else {
+                // SAFETY: The owned connection is live and accessed on this thread only.
+                // SQLite returns a terminated message, copied before another SQLite call.
                 unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(database)) }
                     .to_string_lossy()
                     .into_owned()
             };
             if !database.is_null() {
+                // SAFETY: This owner consumes its live SQLite connection exactly once;
+                // no statement or buffer is used after the close.
                 let _ = unsafe { ffi::sqlite3_close(database) };
             }
             return Err(format!("SQLite open failed with {rc}: {message}"));
         }
         let connection = Self(database);
+        // SAFETY: The owned connection is live, with no concurrent access;
+        // this synchronous configuration call retains no Rust pointers.
         let timeout_rc = unsafe { ffi::sqlite3_busy_timeout(connection.0, 10_000) };
         if timeout_rc != ffi::SQLITE_OK {
             return Err(connection.error("setting busy timeout", timeout_rc));
@@ -53,18 +61,27 @@ impl Connection {
         let sql = CString::new(sql).map_err(|error| error.to_string())?;
         let mut error = null_mut();
         let rc =
+            // SAFETY: The owned connection is live on this thread and sql is a
+            // terminated CString. Any error output is an exclusive local pointer slot;
+            // SQLite copies SQL and retains no Rust callback or buffer.
             unsafe { ffi::sqlite3_exec(self.0, sql.as_ptr(), None, null_mut(), &raw mut error) };
         if rc == ffi::SQLITE_OK {
             return Ok(());
         }
         let message = if error.is_null() {
+            // SAFETY: The owned connection is live and accessed on this thread only.
+            // SQLite returns a terminated message, copied before another SQLite call.
             unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0)) }
                 .to_string_lossy()
                 .into_owned()
         } else {
+            // SAFETY: SQLite returned this non-null, terminated error allocation.
+            // Copy its message while it is live, before sqlite3_free releases it.
             let message = unsafe { CStr::from_ptr(error) }
                 .to_string_lossy()
                 .into_owned();
+            // SAFETY: SQLite allocated this error string; it has been copied and
+            // this is its sole release, using the matching SQLite allocator.
             unsafe { ffi::sqlite3_free(error.cast()) };
             message
         };
@@ -73,13 +90,19 @@ impl Connection {
 
     fn integer(&self, sql: &str) -> Result<i64, String> {
         let mut statement = self.prepare(sql)?;
+        // SAFETY: The prepared statement and its connection remain live and
+        // exclusive to this thread; prior column borrows have ended before stepping.
         let step = unsafe { ffi::sqlite3_step(statement.0) };
         if step != ffi::SQLITE_ROW {
             return Err(self.error("stepping integer query", step));
         }
+        // SAFETY: The statement is positioned on SQLITE_ROW and column is
+        // within its result columns; it has not been stepped or finalized.
         if unsafe { ffi::sqlite3_column_type(statement.0, 0) } != ffi::SQLITE_INTEGER {
             return Err(format!("integer query returned a non-integer: {sql}"));
         }
+        // SAFETY: The live statement is positioned on SQLITE_ROW with this
+        // column in range. SQLite returns the scalar by value without retaining data.
         let value = unsafe { ffi::sqlite3_column_int64(statement.0, 0) };
         statement.finish(self)?;
         Ok(value)
@@ -87,13 +110,22 @@ impl Connection {
 
     fn text(&self, sql: &str) -> Result<String, String> {
         let mut statement = self.prepare(sql)?;
+        // SAFETY: The prepared statement and its connection remain live and
+        // exclusive to this thread; prior column borrows have ended before stepping.
         let step = unsafe { ffi::sqlite3_step(statement.0) };
         if step != ffi::SQLITE_ROW {
             return Err(self.error("stepping text query", step));
         }
+        // SAFETY: The statement is live on its current row and the column is
+        // in range; the resulting byte length is consumed before stepping/finalizing.
         let length = unsafe { ffi::sqlite3_column_bytes(statement.0, 0) };
+        // SAFETY: The statement is on a live row and the column is in range.
+        // SQLite owns the returned bytes, consumed before conversion, step or finalize
+        // can invalidate them; null/empty results are checked by the buffer reader.
         let pointer = unsafe { ffi::sqlite3_column_text(statement.0, 0) };
-        let bytes = column_bytes(pointer, length)?;
+        // SAFETY: The live statement owns this column buffer and is not
+        // stepped, converted or finalized until the copy completes.
+        let bytes = unsafe { column_bytes(pointer, length) }?;
         let value = String::from_utf8(bytes).map_err(|error| error.to_string())?;
         statement.finish(self)?;
         Ok(value)
@@ -130,6 +162,9 @@ impl Connection {
     fn prepare(&self, sql: &str) -> Result<Statement, String> {
         let sql = CString::new(sql).map_err(|error| error.to_string())?;
         let mut statement = null_mut();
+        // SAFETY: The connection and terminated SQL string remain live. SQLite
+        // writes the statement to an exclusive local slot; its owner finalizes it
+        // before the connection is closed.
         let rc = unsafe {
             ffi::sqlite3_prepare_v2(self.0, sql.as_ptr(), -1, &raw mut statement, null_mut())
         };
@@ -141,6 +176,8 @@ impl Connection {
     }
 
     fn error(&self, operation: &str, rc: c_int) -> String {
+        // SAFETY: The owned connection is live and accessed on this thread only.
+        // SQLite returns a terminated message, copied before another SQLite call.
         let message = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0)) }.to_string_lossy();
         format!("{operation} failed with SQLite error {rc}: {message}")
     }
@@ -148,6 +185,8 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // SAFETY: This owner consumes its live SQLite connection exactly once;
+        // no statement or buffer is used after the close.
         let _ = unsafe { ffi::sqlite3_close(self.0) };
     }
 }
@@ -157,6 +196,8 @@ struct Statement(*mut ffi::sqlite3_stmt);
 impl Statement {
     fn finish(&mut self, connection: &Connection) -> Result<(), String> {
         let statement = std::mem::replace(&mut self.0, null_mut());
+        // SAFETY: This owner releases the prepared statement exactly once,
+        // while its connection is still live and all column borrows have ended.
         let rc = unsafe { ffi::sqlite3_finalize(statement) };
         if rc == ffi::SQLITE_OK {
             Ok(())
@@ -169,12 +210,17 @@ impl Statement {
 impl Drop for Statement {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: This owner releases the prepared statement exactly once,
+            // while its connection is still live and all column borrows have ended.
             let _ = unsafe { ffi::sqlite3_finalize(self.0) };
         }
     }
 }
 
-fn column_bytes(pointer: *const u8, length: c_int) -> Result<Vec<u8>, String> {
+/// # Safety
+/// For a nonempty value, pointer addresses length initialized bytes from a live
+/// SQLite row, unaffected by column conversions until this copy completes.
+unsafe fn column_bytes(pointer: *const u8, length: c_int) -> Result<Vec<u8>, String> {
     let length = usize::try_from(length).map_err(|_| "SQLite returned a negative length")?;
     if length == 0 {
         return Ok(Vec::new());
@@ -182,6 +228,9 @@ fn column_bytes(pointer: *const u8, length: c_int) -> Result<Vec<u8>, String> {
     if pointer.is_null() {
         return Err("SQLite returned a null pointer for nonempty data".into());
     }
+    // SAFETY: The caller obtained pointer and length from the same live
+    // SQLite column, checked null/empty cases, and consumes these bytes before
+    // stepping, conversion or finalization can invalidate the allocation.
     Ok(unsafe { slice::from_raw_parts(pointer, length) }.to_vec())
 }
 
@@ -190,6 +239,8 @@ fn hash_query(connection: &Connection, query: &str, hasher: &mut Hasher) -> Resu
     hasher.update(query.as_bytes());
     let mut statement = connection.prepare(query)?;
     loop {
+        // SAFETY: The prepared statement and its connection remain live and
+        // exclusive to this thread; prior column borrows have ended before stepping.
         let step = unsafe { ffi::sqlite3_step(statement.0) };
         if step == ffi::SQLITE_DONE {
             break;
@@ -198,35 +249,57 @@ fn hash_query(connection: &Connection, query: &str, hasher: &mut Hasher) -> Resu
             return Err(connection.error("stepping digest query", step));
         }
         hasher.update(b"row\0");
+        // SAFETY: The prepared statement remains live; querying its column
+        // count borrows it synchronously and retains no Rust memory.
         let columns = unsafe { ffi::sqlite3_column_count(statement.0) };
         for column in 0..columns {
+            // SAFETY: The statement is positioned on SQLITE_ROW and column is
+            // within its result columns; it has not been stepped or finalized.
             let kind = unsafe { ffi::sqlite3_column_type(statement.0, column) };
             hasher.update(&kind.to_le_bytes());
             match kind {
                 ffi::SQLITE_NULL => {}
                 ffi::SQLITE_INTEGER => {
                     hasher.update(
+                        // SAFETY: The live statement is positioned on SQLITE_ROW with this
+                        // column in range. SQLite returns the scalar by value without retaining data.
                         &unsafe { ffi::sqlite3_column_int64(statement.0, column) }.to_le_bytes(),
                     );
                 }
                 ffi::SQLITE_FLOAT => {
                     hasher.update(
+                        // SAFETY: The live statement is positioned on SQLITE_ROW with this
+                        // column in range. SQLite returns the scalar by value without retaining data.
                         &unsafe { ffi::sqlite3_column_double(statement.0, column) }
                             .to_bits()
                             .to_le_bytes(),
                     );
                 }
                 ffi::SQLITE_TEXT => {
+                    // SAFETY: The statement is live on its current row and the column is
+                    // in range; the resulting byte length is consumed before stepping/finalizing.
                     let length = unsafe { ffi::sqlite3_column_bytes(statement.0, column) };
+                    // SAFETY: The statement is on a live row and the column is in range.
+                    // SQLite owns the returned bytes, consumed before conversion, step or finalize
+                    // can invalidate them; null/empty results are checked by the buffer reader.
                     let pointer = unsafe { ffi::sqlite3_column_text(statement.0, column) };
-                    let value = column_bytes(pointer, length)?;
+                    // SAFETY: These bytes belong to the current row; no column
+                    // conversion, step or finalization intervenes before copying.
+                    let value = unsafe { column_bytes(pointer, length) }?;
                     hasher.update(&(value.len() as u64).to_le_bytes());
                     hasher.update(&value);
                 }
                 ffi::SQLITE_BLOB => {
+                    // SAFETY: The statement is live on its current row and the column is
+                    // in range; the resulting byte length is consumed before stepping/finalizing.
                     let length = unsafe { ffi::sqlite3_column_bytes(statement.0, column) };
+                    // SAFETY: The statement is on a live row and the column is in range.
+                    // SQLite owns the returned bytes, consumed before conversion, step or finalize
+                    // can invalidate them; null/empty results are checked by the buffer reader.
                     let pointer = unsafe { ffi::sqlite3_column_blob(statement.0, column) }.cast();
-                    let value = column_bytes(pointer, length)?;
+                    // SAFETY: These bytes belong to the current row; no column
+                    // conversion, step or finalization intervenes before copying.
+                    let value = unsafe { column_bytes(pointer, length) }?;
                     hasher.update(&(value.len() as u64).to_le_bytes());
                     hasher.update(&value);
                 }
@@ -238,8 +311,14 @@ fn hash_query(connection: &Connection, query: &str, hasher: &mut Hasher) -> Resu
 }
 
 fn native_vfs_name() -> TestResult<CString> {
+    // SAFETY: SQLite is initialized; the optional VFS name is terminated.
+    // The test/benchmark retains registrations while using the returned pointer.
     let vfs = unsafe { ffi::sqlite3_vfs_find(null()) };
+    // SAFETY: This pointer identifies a live registered VFS retained by
+    // the test. Null is handled without dereferencing; the borrow ends here.
     let vfs = unsafe { vfs.as_ref() }.ok_or("SQLite has no default VFS")?;
+    // SAFETY: The registered VFS remains live for this call and owns a
+    // terminated name, which is copied before releasing the registration borrow.
     Ok(unsafe { CStr::from_ptr(vfs.zName) }.to_owned())
 }
 

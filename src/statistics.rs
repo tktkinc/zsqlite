@@ -138,6 +138,9 @@ pub unsafe fn connection_statistics(
         return Err(ffi::SQLITE_MISUSE);
     }
     let mut wire = FileControlStatsV1::default();
+    // SAFETY: The caller guarantees a live, exclusive connection with this ABI.
+    // schema is a terminated C string; wire is the initialized, correctly sized
+    // V1 output required by our custom opcode and lives through the call.
     let result = unsafe {
         ffi::sqlite3_file_control(
             connection,
@@ -152,6 +155,8 @@ pub unsafe fn connection_statistics(
     let counter = |operation| {
         let mut current = 0;
         let mut highwater = 0;
+        // SAFETY: The caller retains exclusive access to the live connection;
+        // db_status writes only the two aligned c_int locals for this call.
         let result = unsafe {
             ffi::sqlite3_db_status(
                 connection,

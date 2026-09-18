@@ -357,7 +357,9 @@ mod benchmark {
         let payload = payload(config.payload_bytes);
         let mut insert =
             connection.prepare("INSERT INTO records(id, revision, body) VALUES(?1, ?2, ?3)")?;
-        insert.bind_blob(3, &payload)?;
+        // SAFETY: payload is declared before insert and is not modified; it
+        // outlives finalization of insert on both success and every error path.
+        unsafe { insert.bind_blob(3, &payload) }?;
         let started = Instant::now();
         for row in 0..config.rows {
             if row % config.batch_size == 0 {
@@ -731,10 +733,16 @@ mod benchmark {
                 Engine::Zsqlite => ZSQLITE_VFS.as_ptr(),
             };
             let flags = ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_URI;
+            // SAFETY: The path/VFS C strings outlive this call and the output slot is
+            // exclusive. SQLite initializes the owned handle even when opening fails.
             let code = unsafe { ffi::sqlite3_open_v2(path.as_ptr(), &raw mut raw, flags, vfs) };
             if code != ffi::SQLITE_OK {
-                let message = sqlite_message(raw);
+                // SAFETY: open_v2 returned this live connection (or null on
+                // allocation failure); cleanup follows after copying the message.
+                let message = unsafe { sqlite_message(raw) };
                 if !raw.is_null() {
+                    // SAFETY: This owner consumes its live SQLite connection exactly once;
+                    // no statement or buffer is used after the close.
                     unsafe { ffi::sqlite3_close(raw) };
                 }
                 return Err(format!(
@@ -744,6 +752,8 @@ mod benchmark {
                 .into());
             }
             let connection = Self { raw };
+            // SAFETY: The owned connection is live, with no concurrent access;
+            // this synchronous configuration call retains no Rust pointers.
             let code = unsafe { ffi::sqlite3_busy_timeout(connection.raw, 30_000) };
             connection.check(code, "setting busy timeout")?;
             Ok(connection)
@@ -752,6 +762,9 @@ mod benchmark {
         fn execute(&self, sql: &str) -> Result<()> {
             let sql = CString::new(sql)?;
             let mut error = null_mut();
+            // SAFETY: The owned connection is live on this thread and sql is a
+            // terminated CString. Any error output is an exclusive local pointer slot;
+            // SQLite copies SQL and retains no Rust callback or buffer.
             let code = unsafe {
                 ffi::sqlite3_exec(self.raw, sql.as_ptr(), None, null_mut(), &raw mut error)
             };
@@ -759,11 +772,16 @@ mod benchmark {
                 return Ok(());
             }
             let message = if error.is_null() {
-                sqlite_message(self.raw)
+                // SAFETY: self owns the live connection and uses it on this thread.
+                unsafe { sqlite_message(self.raw) }
             } else {
+                // SAFETY: SQLite returned this non-null, terminated error allocation.
+                // Copy its message while it is live, before sqlite3_free releases it.
                 let message = unsafe { CStr::from_ptr(error) }
                     .to_string_lossy()
                     .into_owned();
+                // SAFETY: SQLite allocated this error string; it has been copied and
+                // this is its sole release, using the matching SQLite allocator.
                 unsafe { ffi::sqlite3_free(error.cast()) };
                 message
             };
@@ -773,6 +791,9 @@ mod benchmark {
         fn prepare<'connection>(&'connection self, sql: &str) -> Result<Statement<'connection>> {
             let sql = CString::new(sql)?;
             let mut raw = null_mut();
+            // SAFETY: The connection and terminated SQL string remain live. SQLite
+            // writes the statement to an exclusive local slot; its owner finalizes it
+            // before the connection is closed.
             let code = unsafe {
                 ffi::sqlite3_prepare_v2(self.raw, sql.as_ptr(), -1, &raw mut raw, null_mut())
             };
@@ -786,10 +807,14 @@ mod benchmark {
         fn aggregate(&self) -> Result<(i64, i64, i64)> {
             let mut statement =
                 self.prepare("SELECT count(*), sum(revision), sum(length(body)) FROM records")?;
+            // SAFETY: The prepared statement and its connection remain live and
+            // exclusive to this thread; prior column borrows have ended before stepping.
             let code = unsafe { ffi::sqlite3_step(statement.raw) };
             if code != ffi::SQLITE_ROW {
                 return Err(self.error(code, "reading aggregate"));
             }
+            // SAFETY: The live statement is positioned on SQLITE_ROW with this
+            // column in range. SQLite returns the scalar by value without retaining data.
             let values = unsafe {
                 (
                     ffi::sqlite3_column_int64(statement.raw, 0),
@@ -804,10 +829,14 @@ mod benchmark {
         fn warm_page_cache(&self) -> Result<()> {
             let mut statement =
                 self.prepare("SELECT sum(length(body)) FROM records NOT INDEXED")?;
+            // SAFETY: The prepared statement and its connection remain live and
+            // exclusive to this thread; prior column borrows have ended before stepping.
             let code = unsafe { ffi::sqlite3_step(statement.raw) };
             if code != ffi::SQLITE_ROW {
                 return Err(self.error(code, "warming SQLite page cache"));
             }
+            // SAFETY: The live statement is positioned on SQLITE_ROW with this
+            // column in range. SQLite returns the scalar by value without retaining data.
             let payload_bytes = unsafe { ffi::sqlite3_column_int64(statement.raw, 0) };
             if payload_bytes <= 0 {
                 return Err("page-cache warmup returned an invalid payload size".into());
@@ -841,6 +870,8 @@ mod benchmark {
         fn cache_status(&self, operation: c_int, reset: bool) -> Result<u64> {
             let mut current = 0;
             let mut highwater = 0;
+            // SAFETY: The connection is live on this thread; both output counters
+            // are aligned, exclusive c_int locals valid for the synchronous call.
             let code = unsafe {
                 ffi::sqlite3_db_status(
                     self.raw,
@@ -855,6 +886,8 @@ mod benchmark {
         }
 
         fn close(mut self) -> Result<()> {
+            // SAFETY: This owner consumes its live SQLite connection exactly once;
+            // no statement or buffer is used after the close.
             let code = unsafe { ffi::sqlite3_close(self.raw) };
             if code != ffi::SQLITE_OK {
                 return Err(self.error(code, "closing database"));
@@ -872,13 +905,17 @@ mod benchmark {
         }
 
         fn error(&self, code: c_int, operation: &str) -> Box<dyn Error> {
-            format!("{operation} failed ({code}): {}", sqlite_message(self.raw)).into()
+            // SAFETY: self owns the live connection and uses it on this thread.
+            let message = unsafe { sqlite_message(self.raw) };
+            format!("{operation} failed ({code}): {message}").into()
         }
     }
 
     impl Drop for Connection {
         fn drop(&mut self) {
             if !self.raw.is_null() {
+                // SAFETY: This owner consumes its live SQLite connection exactly once;
+                // no statement or buffer is used after the close.
                 let code = unsafe { ffi::sqlite3_close(self.raw) };
                 assert_eq!(code, ffi::SQLITE_OK, "closing benchmark database failed");
             }
@@ -892,11 +929,19 @@ mod benchmark {
 
     impl Statement<'_> {
         fn bind_integer(&mut self, index: c_int, value: i64) -> Result<()> {
+            // SAFETY: The owned prepared statement and connection are live on this
+            // thread; SQLite copies the scalar and reports invalid indices as errors.
             let code = unsafe { ffi::sqlite3_bind_int64(self.raw, index, value) };
             self.connection.check(code, "binding integer")
         }
 
-        fn bind_blob(&mut self, index: c_int, value: &[u8]) -> Result<()> {
+        /// # Safety
+        /// `value` must remain alive and unchanged until this binding is replaced
+        /// or the statement is finalized, including error and unwinding paths.
+        unsafe fn bind_blob(&mut self, index: c_int, value: &[u8]) -> Result<()> {
+            // SAFETY: The caller retains this byte slice until the statement is
+            // finalized or rebound. Its length matches the accessible allocation;
+            // SQLITE_STATIC retains the pointer, so the caller must preserve that lifetime.
             let code = unsafe {
                 ffi::sqlite3_bind_blob64(
                     self.raw,
@@ -910,6 +955,8 @@ mod benchmark {
         }
 
         fn execute(&mut self) -> Result<()> {
+            // SAFETY: The prepared statement and its connection remain live and
+            // exclusive to this thread; prior column borrows have ended before stepping.
             let code = unsafe { ffi::sqlite3_step(self.raw) };
             if code != ffi::SQLITE_DONE {
                 return Err(self.connection.error(code, "executing statement"));
@@ -918,10 +965,14 @@ mod benchmark {
         }
 
         fn query_pair(&mut self) -> Result<(i64, i64)> {
+            // SAFETY: The prepared statement and its connection remain live and
+            // exclusive to this thread; prior column borrows have ended before stepping.
             let code = unsafe { ffi::sqlite3_step(self.raw) };
             if code != ffi::SQLITE_ROW {
                 return Err(self.connection.error(code, "reading point query"));
             }
+            // SAFETY: The live statement is positioned on SQLITE_ROW with this
+            // column in range. SQLite returns the scalar by value without retaining data.
             let values = unsafe {
                 (
                     ffi::sqlite3_column_int64(self.raw, 0),
@@ -934,6 +985,8 @@ mod benchmark {
         }
 
         fn expect_done(&mut self) -> Result<()> {
+            // SAFETY: The prepared statement and its connection remain live and
+            // exclusive to this thread; prior column borrows have ended before stepping.
             let code = unsafe { ffi::sqlite3_step(self.raw) };
             if code == ffi::SQLITE_DONE {
                 Ok(())
@@ -943,6 +996,8 @@ mod benchmark {
         }
 
         fn reset(&mut self) -> Result<()> {
+            // SAFETY: The owned statement and connection remain live; all column
+            // borrows have ended before reset invalidates row storage.
             let code = unsafe { ffi::sqlite3_reset(self.raw) };
             self.connection.check(code, "resetting statement")
         }
@@ -950,6 +1005,8 @@ mod benchmark {
 
     impl Drop for Statement<'_> {
         fn drop(&mut self) {
+            // SAFETY: This owner releases the prepared statement exactly once,
+            // while its connection is still live and all column borrows have ended.
             let code = unsafe { ffi::sqlite3_finalize(self.raw) };
             assert_eq!(
                 code,
@@ -959,10 +1016,14 @@ mod benchmark {
         }
     }
 
-    fn sqlite_message(database: *mut ffi::sqlite3) -> String {
+    /// # Safety
+    /// A non-null `database` must be a live connection exclusive to this thread.
+    unsafe fn sqlite_message(database: *mut ffi::sqlite3) -> String {
         if database.is_null() {
             return "SQLite did not return a database handle".into();
         }
+        // SAFETY: The owned connection is live and accessed on this thread only.
+        // SQLite returns a terminated message, copied before another SQLite call.
         unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(database)) }
             .to_string_lossy()
             .into_owned()

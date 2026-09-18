@@ -143,6 +143,8 @@ mod sqlite {
             let path = CString::new(path.to_str().ok_or("path")?)?;
             let vfs = CString::new(vfs)?;
             let mut database = std::ptr::null_mut();
+            // SAFETY: The path/VFS C strings outlive this call and the output slot is
+            // exclusive. SQLite initializes the owned handle even when opening fails.
             let rc = unsafe {
                 ffi::sqlite3_open_v2(
                     path.as_ptr(),
@@ -158,12 +160,17 @@ mod sqlite {
             Ok(connection)
         }
         fn error(&self) -> String {
+            // SAFETY: The owned connection is live and accessed on this thread only.
+            // SQLite returns a terminated message, copied before another SQLite call.
             unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0)) }
                 .to_string_lossy()
                 .into_owned()
         }
         fn exec(&self, sql: &str) -> TestResult {
             let sql = CString::new(sql)?;
+            // SAFETY: The owned connection is live on this thread and sql is a
+            // terminated CString. Any error output is an exclusive local pointer slot;
+            // SQLite copies SQL and retains no Rust callback or buffer.
             let rc = unsafe {
                 ffi::sqlite3_exec(
                     self.0,
@@ -181,6 +188,9 @@ mod sqlite {
         fn integer(&self, sql: &str) -> Result<i64, Box<dyn std::error::Error>> {
             let sql = CString::new(sql)?;
             let mut statement = std::ptr::null_mut();
+            // SAFETY: The connection and terminated SQL string remain live. SQLite
+            // writes the statement to an exclusive local slot; its owner finalizes it
+            // before the connection is closed.
             let rc = unsafe {
                 ffi::sqlite3_prepare_v2(
                     self.0,
@@ -193,8 +203,18 @@ mod sqlite {
             if rc != ffi::SQLITE_OK {
                 return Err(self.error().into());
             }
+            // SAFETY: The prepared statement and its connection remain live and
+            // exclusive to this thread; prior column borrows have ended before stepping.
             let rc = unsafe { ffi::sqlite3_step(statement) };
-            let value = unsafe { ffi::sqlite3_column_int64(statement, 0) };
+            let value = if rc == ffi::SQLITE_ROW {
+                // SAFETY: This test's scalar query has a first column, and step
+                // returned ROW. The statement remains live until finalize below.
+                unsafe { ffi::sqlite3_column_int64(statement, 0) }
+            } else {
+                0
+            };
+            // SAFETY: This owner releases the prepared statement exactly once,
+            // while its connection is still live and all column borrows have ended.
             unsafe {
                 ffi::sqlite3_finalize(statement);
             }
@@ -206,6 +226,8 @@ mod sqlite {
     }
     impl Drop for Connection {
         fn drop(&mut self) {
+            // SAFETY: This owner consumes its live SQLite connection exactly once;
+            // no statement or buffer is used after the close.
             unsafe {
                 ffi::sqlite3_close(self.0);
             }

@@ -123,6 +123,8 @@ impl Connection {
             } else {
                 ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE
             };
+        // SAFETY: The path/VFS C strings outlive this call and the output slot is
+        // exclusive. SQLite initializes the owned handle even when opening fails.
         let code = unsafe {
             ffi::sqlite3_open_v2(
                 name.as_ptr(),
@@ -145,12 +147,17 @@ impl Connection {
         }
         Err(format!(
             "SQLite {code}: {}",
+            // SAFETY: The owned connection is live and accessed on this thread only.
+            // SQLite returns a terminated message, copied before another SQLite call.
             unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0)) }.to_string_lossy()
         )
         .into())
     }
     pub fn execute(&self, sql: &str) -> Result<()> {
         let sql = CString::new(sql)?;
+        // SAFETY: The owned connection is live on this thread and sql is a
+        // terminated CString. Any error output is an exclusive local pointer slot;
+        // SQLite copies SQL and retains no Rust callback or buffer.
         self.check(unsafe { ffi::sqlite3_exec(self.0, sql.as_ptr(), None, null_mut(), null_mut()) })
     }
     pub fn rows(&self, sql: &str) -> Result<Vec<Vec<String>>> {
@@ -172,6 +179,8 @@ impl Connection {
         while statement.next()? {
             let mut row = Vec::new();
             for column in 0..statement.columns() {
+                // SAFETY: The statement is positioned on SQLITE_ROW and column is
+                // within its result columns; it has not been stepped or finalized.
                 let kind = unsafe { ffi::sqlite3_column_type(statement.raw, column) };
                 row.push((kind, statement.bytes(column)?.to_vec()));
             }
@@ -198,6 +207,8 @@ impl Connection {
         while statement.next()? {
             let mut row = Vec::new();
             for column in 0..statement.columns() {
+                // SAFETY: The statement is positioned on SQLITE_ROW and column is
+                // within its result columns; it has not been stepped or finalized.
                 let kind = unsafe { ffi::sqlite3_column_type(statement.raw, column) };
                 row.push((kind, statement.bytes(column)?.to_vec()));
             }
@@ -213,6 +224,8 @@ impl Connection {
     }
     pub fn execute_params_changes(&self, sql: &str, parameters: &[Value]) -> Result<u64> {
         self.execute_params(sql, parameters)?;
+        // SAFETY: The owned connection is live and exclusive to this thread;
+        // the call returns a scalar and retains no Rust memory.
         Ok(u64::try_from(unsafe { ffi::sqlite3_changes64(self.0) })?)
     }
     pub fn replay(
@@ -222,6 +235,9 @@ impl Connection {
     ) -> Result<(Vec<u64>, zsqlite::statistics::ConnectionStatistics)> {
         self.execute("PRAGMA cache_size=-2048; BEGIN; SELECT count(*) FROM sqlite_schema;")?;
         let mut file: *mut ffi::sqlite3_file = null_mut();
+        // SAFETY: The connection and schema string remain live on this thread.
+        // The output allocation has the type and size required by this file-control
+        // opcode and remains exclusively accessible during the synchronous call.
         let code = unsafe {
             ffi::sqlite3_file_control(
                 self.0,
@@ -233,7 +249,11 @@ impl Connection {
         if code != ffi::SQLITE_OK || file.is_null() {
             return Err("no main-file handle".into());
         }
+        // SAFETY: FILE_POINTER returned this live main file inside an active
+        // transaction; its method table remains valid until connection close.
         let read = unsafe { (*(*file).pMethods).xRead }.ok_or("no xRead")?;
+        // SAFETY: This thread exclusively uses the live connection, linked
+        // against the same SQLite ABI; the schema is a static terminated string.
         let before = unsafe { zsqlite::statistics::connection_statistics(self.0, c"main") }
             .map_err(|code| format!("stats: {code}"))?;
         let mut buffer = vec![0; size as usize];
@@ -241,6 +261,9 @@ impl Connection {
         for page in pages {
             let offset = i64::from(page - 1) * i64::from(size);
             let start = Instant::now();
+            // SAFETY: The active transaction retains the file and its method
+            // table. buffer owns size initialized writable bytes and this thread is the
+            // sole user of the connection during the synchronous xRead call.
             let code = unsafe {
                 read(
                     file,
@@ -255,6 +278,8 @@ impl Connection {
             }
             std::hint::black_box(&buffer);
         }
+        // SAFETY: This thread exclusively uses the live connection, linked
+        // against the same SQLite ABI; the schema is a static terminated string.
         let mut after = unsafe { zsqlite::statistics::connection_statistics(self.0, c"main") }
             .map_err(|code| format!("stats: {code}"))?;
         after.handle.requested_bytes -= before.handle.requested_bytes;
@@ -304,6 +329,8 @@ impl Connection {
             rows += 1;
             hash.update(&statement.columns().to_le_bytes());
             for column in 0..statement.columns() {
+                // SAFETY: The statement is positioned on SQLITE_ROW and column is
+                // within its result columns; it has not been stepped or finalized.
                 let kind = unsafe { ffi::sqlite3_column_type(statement.raw, column) };
                 let value = statement.bytes(column)?;
                 hash.update(&kind.to_le_bytes());
@@ -322,6 +349,9 @@ impl Connection {
         let sql = CString::new(sql)?;
         let mut raw = null_mut();
         let code =
+            // SAFETY: The connection and terminated SQL string remain live. SQLite
+            // writes the statement to an exclusive local slot; its owner finalizes it
+            // before the connection is closed.
             unsafe { ffi::sqlite3_prepare_v2(self.0, sql.as_ptr(), -1, &raw mut raw, null_mut()) };
         let statement = Statement {
             connection: self,
@@ -335,6 +365,8 @@ impl Connection {
     }
     pub fn stats(&self, managed: bool) -> Result<Stats> {
         if managed {
+            // SAFETY: This thread exclusively uses the live connection, linked
+            // against the same SQLite ABI; the schema is a static terminated string.
             let stats = unsafe { zsqlite::statistics::connection_statistics(self.0, c"main") }
                 .map_err(|code| format!("VFS statistics: {code}"))?;
             return Ok(Stats {
@@ -346,6 +378,8 @@ impl Connection {
         let counter = |operation| -> Result<u64> {
             let mut value = 0;
             let mut high = 0;
+            // SAFETY: The connection is live on this thread; both output counters
+            // are aligned, exclusive c_int locals valid for the synchronous call.
             self.check(unsafe {
                 ffi::sqlite3_db_status(self.0, operation, &raw mut value, &raw mut high, 0)
             })?;
@@ -373,6 +407,8 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: This owner consumes its live SQLite connection exactly once;
+            // no statement or buffer is used after the close.
             unsafe {
                 ffi::sqlite3_close(self.0);
             }
@@ -385,12 +421,17 @@ struct Statement<'connection> {
 }
 impl Statement<'_> {
     fn bind(&mut self, values: &[Value]) -> Result<()> {
+        // SAFETY: The prepared statement and its connection remain live;
+        // this metadata query is synchronous and does not retain any Rust pointers.
         if usize::try_from(unsafe { ffi::sqlite3_bind_parameter_count(self.raw) })? != values.len()
         {
             return Err("parameter count mismatch".into());
         }
         for (offset, value) in values.iter().enumerate() {
             let index = i32::try_from(offset + 1)?;
+            // SAFETY: The statement is live and parameter indices were bounded by
+            // bind_parameter_count. Scalar values are copied; text/blob lengths match
+            // their slices and SQLITE_TRANSIENT makes SQLite copy bytes before returning.
             let code = unsafe {
                 match value {
                     Value::Null => ffi::sqlite3_bind_null(self.raw, index),
@@ -418,6 +459,8 @@ impl Statement<'_> {
         Ok(())
     }
     fn next(&mut self) -> Result<bool> {
+        // SAFETY: The prepared statement and its connection remain live and
+        // exclusive to this thread; prior column borrows have ended before stepping.
         match unsafe { ffi::sqlite3_step(self.raw) } {
             ffi::SQLITE_ROW => Ok(true),
             ffi::SQLITE_DONE => Ok(false),
@@ -428,10 +471,17 @@ impl Statement<'_> {
         }
     }
     fn columns(&self) -> i32 {
+        // SAFETY: The prepared statement remains live; querying its column
+        // count borrows it synchronously and retains no Rust memory.
         unsafe { ffi::sqlite3_column_count(self.raw) }
     }
     fn bytes(&self, column: i32) -> Result<&[u8]> {
+        // SAFETY: The statement is on a live row and the column is in range.
+        // SQLite owns the returned bytes, consumed before conversion, step or finalize
+        // can invalidate them; null/empty results are checked by the buffer reader.
         let pointer = unsafe { ffi::sqlite3_column_blob(self.raw, column) };
+        // SAFETY: The statement is live on its current row and the column is
+        // in range; the resulting byte length is consumed before stepping/finalizing.
         let length = usize::try_from(unsafe { ffi::sqlite3_column_bytes(self.raw, column) })?;
         if length == 0 {
             return Ok(&[]);
@@ -439,16 +489,25 @@ impl Statement<'_> {
         if pointer.is_null() {
             return Err("SQLite column allocation failed".into());
         }
+        // SAFETY: The caller obtained pointer and length from the same live
+        // SQLite column, checked null/empty cases, and consumes these bytes before
+        // stepping, conversion or finalization can invalidate the allocation.
         Ok(unsafe { std::slice::from_raw_parts(pointer.cast(), length) })
     }
     fn value(&self, column: i32) -> Result<Value> {
         Ok(
+            // SAFETY: The statement is positioned on SQLITE_ROW and column is
+            // within its result columns; it has not been stepped or finalized.
             match unsafe { ffi::sqlite3_column_type(self.raw, column) } {
                 ffi::SQLITE_NULL => Value::Null,
                 ffi::SQLITE_INTEGER => {
+                    // SAFETY: The live statement is positioned on SQLITE_ROW with this
+                    // column in range. SQLite returns the scalar by value without retaining data.
                     Value::Integer(unsafe { ffi::sqlite3_column_int64(self.raw, column) })
                 }
                 ffi::SQLITE_FLOAT => {
+                    // SAFETY: The live statement is positioned on SQLITE_ROW with this
+                    // column in range. SQLite returns the scalar by value without retaining data.
                     Value::Real(unsafe { ffi::sqlite3_column_double(self.raw, column) })
                 }
                 ffi::SQLITE_TEXT => Value::Text(self.bytes(column)?.to_vec()),
@@ -460,6 +519,8 @@ impl Statement<'_> {
 }
 impl Drop for Statement<'_> {
     fn drop(&mut self) {
+        // SAFETY: This owner releases the prepared statement exactly once,
+        // while its connection is still live and all column borrows have ended.
         unsafe {
             ffi::sqlite3_finalize(self.raw);
         }
@@ -494,10 +555,14 @@ pub fn uri(path: &Path) -> String {
     uri
 }
 pub fn native_vfs() -> Result<String> {
+    // SAFETY: SQLite is initialized; the optional VFS name is terminated.
+    // The test/benchmark retains registrations while using the returned pointer.
     let vfs = unsafe { ffi::sqlite3_vfs_find(null()) };
     if vfs.is_null() {
         return Err("no native VFS".into());
     }
+    // SAFETY: The registered VFS remains live for this call and owns a
+    // terminated name, which is copied before releasing the registration borrow.
     Ok(unsafe { CStr::from_ptr((*vfs).zName) }.to_str()?.to_owned())
 }
 
@@ -506,9 +571,13 @@ pub fn peak_rss_bytes() -> Option<u64> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: usage is an aligned writable rusage allocation. getrusage
+        // initializes it on success and retains no pointer into Rust memory.
         if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
             return None;
         }
+        // SAFETY: The immediately preceding getrusage call succeeded and
+        // initialized every field of this aligned rusage output allocation.
         let usage = unsafe { usage.assume_init() };
         let value = u64::try_from(usage.ru_maxrss).ok()?;
         #[cfg(target_os = "linux")]

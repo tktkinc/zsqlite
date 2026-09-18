@@ -35,6 +35,8 @@ impl Connection {
     fn open(path: &Path, vfs: *const std::ffi::c_char) -> Result<Self, String> {
         let path = CString::new(path.as_os_str().as_bytes()).map_err(|error| error.to_string())?;
         let mut database = null_mut();
+        // SAFETY: The path/VFS C strings outlive this call and the output slot is
+        // exclusive. SQLite initializes the owned handle even when opening fails.
         let rc = unsafe {
             ffi::sqlite3_open_v2(
                 path.as_ptr(),
@@ -47,16 +49,22 @@ impl Connection {
             let message = if database.is_null() {
                 "open returned a null database handle".into()
             } else {
+                // SAFETY: The owned connection is live and accessed on this thread only.
+                // SQLite returns a terminated message, copied before another SQLite call.
                 unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(database)) }
                     .to_string_lossy()
                     .into_owned()
             };
             if !database.is_null() {
+                // SAFETY: This owner consumes its live SQLite connection exactly once;
+                // no statement or buffer is used after the close.
                 let _ = unsafe { ffi::sqlite3_close(database) };
             }
             return Err(format!("SQLite error {rc}: {message}"));
         }
         let connection = Self(database);
+        // SAFETY: The owned connection is live, with no concurrent access;
+        // this synchronous configuration call retains no Rust pointers.
         let timeout = unsafe { ffi::sqlite3_busy_timeout(connection.0, 5_000) };
         if timeout != ffi::SQLITE_OK {
             return Err(connection.error(timeout));
@@ -68,6 +76,9 @@ impl Connection {
         let sql = CString::new(sql).map_err(|error| error.to_string())?;
         let mut error = null_mut();
         let rc =
+            // SAFETY: The owned connection is live on this thread and sql is a
+            // terminated CString. Any error output is an exclusive local pointer slot;
+            // SQLite copies SQL and retains no Rust callback or buffer.
             unsafe { ffi::sqlite3_exec(self.0, sql.as_ptr(), None, null_mut(), &raw mut error) };
         if rc == ffi::SQLITE_OK {
             return Ok(());
@@ -75,9 +86,13 @@ impl Connection {
         let message = if error.is_null() {
             self.error(rc)
         } else {
+            // SAFETY: SQLite returned this non-null, terminated error allocation.
+            // Copy its message while it is live, before sqlite3_free releases it.
             let message = unsafe { CStr::from_ptr(error) }
                 .to_string_lossy()
                 .into_owned();
+            // SAFETY: SQLite allocated this error string; it has been copied and
+            // this is its sole release, using the matching SQLite allocator.
             unsafe { ffi::sqlite3_free(error.cast()) };
             message
         };
@@ -87,18 +102,27 @@ impl Connection {
     fn integer(&self, sql: &str) -> Result<i64, String> {
         let sql = CString::new(sql).map_err(|error| error.to_string())?;
         let mut statement = null_mut();
+        // SAFETY: The connection and terminated SQL string remain live. SQLite
+        // writes the statement to an exclusive local slot; its owner finalizes it
+        // before the connection is closed.
         let rc = unsafe {
             ffi::sqlite3_prepare_v2(self.0, sql.as_ptr(), -1, &raw mut statement, null_mut())
         };
         if rc != ffi::SQLITE_OK {
             return Err(self.error(rc));
         }
+        // SAFETY: The prepared statement and its connection remain live and
+        // exclusive to this thread; prior column borrows have ended before stepping.
         let step = unsafe { ffi::sqlite3_step(statement) };
         let result = if step == ffi::SQLITE_ROW {
+            // SAFETY: The live statement is positioned on SQLITE_ROW with this
+            // column in range. SQLite returns the scalar by value without retaining data.
             Ok(unsafe { ffi::sqlite3_column_int64(statement, 0) })
         } else {
             Err(self.error(step))
         };
+        // SAFETY: This owner releases the prepared statement exactly once,
+        // while its connection is still live and all column borrows have ended.
         let finalize = unsafe { ffi::sqlite3_finalize(statement) };
         if finalize != ffi::SQLITE_OK {
             return Err(self.error(finalize));
@@ -107,6 +131,8 @@ impl Connection {
     }
 
     fn error(&self, code: i32) -> String {
+        // SAFETY: The owned connection is live and accessed on this thread only.
+        // SQLite returns a terminated message, copied before another SQLite call.
         let message = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0)) }.to_string_lossy();
         format!("SQLite error {code}: {message}")
     }
@@ -114,6 +140,8 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // SAFETY: This owner consumes its live SQLite connection exactly once;
+        // no statement or buffer is used after the close.
         let rc = unsafe { ffi::sqlite3_close(self.0) };
         assert_eq!(rc, ffi::SQLITE_OK);
     }
@@ -181,10 +209,16 @@ fn create_native(path: &Path) -> TestResult {
 fn managed_delete(path: &Path) -> TestResult<i32> {
     zsqlite::register_static_vfs()
         .map_err(|code| format!("VFS registration failed with SQLite code {code}"))?;
+    // SAFETY: SQLite is initialized; the optional VFS name is terminated.
+    // The test/benchmark retains registrations while using the returned pointer.
     let vfs_pointer = unsafe { ffi::sqlite3_vfs_find(VFS.as_ptr()) };
+    // SAFETY: This pointer identifies a live registered VFS retained by
+    // the test. Null is handled without dereferencing; the borrow ends here.
     let vfs = unsafe { vfs_pointer.as_ref() }.ok_or("registered VFS was not found")?;
     let delete = vfs.xDelete.ok_or("registered VFS has no xDelete")?;
     let path = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: The registered VFS remains live and the owned CString
+    // keeps the pathname terminated throughout the synchronous delete callback.
     Ok(unsafe { delete(vfs_pointer, path.as_ptr(), 1) })
 }
 
