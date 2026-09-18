@@ -527,11 +527,7 @@ mod benchmark {
         );
         let stored_bytes = median_storage(compressed, |value| value.stored_bytes);
         let objects = median_storage(compressed, |value| value.objects);
-        let average = if objects == 0 {
-            0
-        } else {
-            stored_bytes / objects
-        };
+        let average = stored_bytes.checked_div(objects).unwrap_or(0);
         println!(
             "zsqlite stored bytes: {} across {} packs/active files, {} average",
             bytes(stored_bytes),

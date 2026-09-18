@@ -94,8 +94,8 @@ pub struct StoragePolicy {
 impl Default for StoragePolicy {
     fn default() -> Self {
         Self {
-            settle: Duration::from_secs(5 * 60),
-            max_stale: Duration::from_secs(60 * 60),
+            settle: Duration::from_mins(5),
+            max_stale: Duration::from_hours(1),
             rollover_bytes: 0,
             dictionary: DictionaryPolicy::default(),
             layout: crate::layout::LayoutPolicy::default(),
@@ -2351,8 +2351,8 @@ mod tests {
         const PAGE_SIZE: usize = 4096;
 
         let mut image = vec![0_u8; PAGE_SIZE * page_count];
-        for (page_index, page) in image.chunks_exact_mut(PAGE_SIZE).enumerate() {
-            for (word_index, word) in page.chunks_exact_mut(8).enumerate() {
+        for (page_index, page) in image.as_chunks_mut::<PAGE_SIZE>().0.iter_mut().enumerate() {
+            for (word_index, word) in page.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 let value = u64::try_from(page_index)
                     .expect("test page index fits u64")
                     .wrapping_mul(31)
@@ -2494,8 +2494,8 @@ mod tests {
         })?;
 
         let mut image = vec![0_u8; PAGE_SIZE * PAGE_COUNT];
-        for (page_index, page) in image.chunks_exact_mut(PAGE_SIZE).enumerate() {
-            for (word_index, word) in page.chunks_exact_mut(8).enumerate() {
+        for (page_index, page) in image.as_chunks_mut::<PAGE_SIZE>().0.iter_mut().enumerate() {
+            for (word_index, word) in page.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 let value = u64::try_from(page_index)?
                     .wrapping_mul(31)
                     .wrapping_add(u64::try_from(word_index)? % 17);

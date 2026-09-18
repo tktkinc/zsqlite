@@ -201,7 +201,7 @@ mod replay {
         };
         Ok(zsqlite::StoragePolicy::default()
             .with_layout(layout)
-            .with_timing(Duration::from_secs(86400), Duration::from_secs(86400))?
+            .with_timing(Duration::from_hours(24), Duration::from_hours(24))?
             .with_rollover(None)?)
     }
     fn connect(path: &Path, profile: &str, source: &Path, vfs: &str) -> Result<Connection> {
