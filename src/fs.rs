@@ -13,6 +13,13 @@ pub(crate) struct CacheFile {
 impl CacheFile {
     pub(crate) fn new() -> std::io::Result<Self> {
         let file = tempfile::tempfile()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Unnamed temporary files can inherit a broader mode on Linux.
+            // Restrict access before storing any decoded database pages.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         // Block geometry improves slot reclamation, and free space bounds
         // automatic sizing. If either is unavailable, cache I/O still fails
         // safely into normal verified reads.
