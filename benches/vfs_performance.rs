@@ -1,12 +1,3 @@
-#[cfg(not(feature = "static"))]
-fn main() {
-    eprintln!(
-        "vfs_performance requires the statically linked SQLite feature; run:\n\
-         cargo bench --no-default-features --features static --bench vfs_performance"
-    );
-    std::process::exit(2);
-}
-
 #[cfg(feature = "static")]
 fn main() {
     if let Err(error) = benchmark::run() {
@@ -246,8 +237,8 @@ mod benchmark {
     struct Storage {
         logical: u64,
         allocated: u64,
-        segment_bytes: u64,
-        segments: u64,
+        stored_bytes: u64,
+        objects: u64,
     }
 
     #[derive(Clone, Copy)]
@@ -387,7 +378,7 @@ mod benchmark {
             measure(|| connection.execute("PRAGMA wal_checkpoint(TRUNCATE)"))?;
         timings[Phase::CloseAfterLoad.index()] = measure(|| connection.close())?;
         if engine == Engine::Zsqlite {
-            // Seal the active segment so reopen and random reads exercise
+            // Seal the active file so reopen and random reads exercise
             // immutable per-page frames.
             zsqlite::flush(path)?;
         }
@@ -534,17 +525,17 @@ mod benchmark {
             compressed_logical as f64 / native_logical as f64,
             compressed_allocated as f64 / native_allocated as f64
         );
-        let segment_bytes = median_storage(compressed, |value| value.segment_bytes);
-        let segments = median_storage(compressed, |value| value.segments);
-        let average = if segments == 0 {
+        let stored_bytes = median_storage(compressed, |value| value.stored_bytes);
+        let objects = median_storage(compressed, |value| value.objects);
+        let average = if objects == 0 {
             0
         } else {
-            segment_bytes / segments
+            stored_bytes / objects
         };
         println!(
-            "zsqlite segment bytes: {} across {} segments, {} average",
-            bytes(segment_bytes),
-            segments,
+            "zsqlite stored bytes: {} across {} packs/active files, {} average",
+            bytes(stored_bytes),
+            objects,
             bytes(average)
         );
         let native_cache = median_cache_stats(native);
@@ -678,15 +669,15 @@ mod benchmark {
                 Err(error) => return Err(error.into()),
             }
         }
-        let (segment_bytes, segments) = if engine == Engine::Zsqlite {
+        let (stored_bytes, objects) = if engine == Engine::Zsqlite {
             let info = zsqlite::inspect(path)?;
             // The ordinary path walk already counted the active `.zsqlite`
-            // file. Only sealed segment files live in the sidecar.
-            logical = logical.saturating_add(info.segment_bytes);
-            allocated = allocated.saturating_add(info.segment_allocated_bytes);
+            // file. Add only its sealed backend objects here.
+            logical = logical.saturating_add(info.sealed_object_bytes);
+            allocated = allocated.saturating_add(info.sealed_object_allocated_bytes);
             (
-                info.segment_bytes.saturating_add(info.file_bytes),
-                u64::try_from(info.sealed_segments)? + u64::from(info.active),
+                info.sealed_object_bytes.saturating_add(info.file_bytes),
+                u64::try_from(info.pack_count)? + u64::from(info.active),
             )
         } else {
             (0, 0)
@@ -694,8 +685,8 @@ mod benchmark {
         Ok(Storage {
             logical,
             allocated,
-            segment_bytes,
-            segments,
+            stored_bytes,
+            objects,
         })
     }
 

@@ -17,7 +17,7 @@ const NOTICE_VIEW: &str = "zsqlite_extension_required";
 const NOTICE_SQL: &str = "CREATE VIEW zsqlite_extension_required AS SELECT 'This database uses zsqlite storage. Load the zsqlite extension and reopen with vfs=zsqlite.' AS message";
 static NOTICE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Maps the supported logical facade name to its active-segment pathname.
+/// Maps the supported logical facade name to its active-file pathname.
 pub(crate) fn vfs_storage_path(path: &Path) -> PathBuf {
     if path.extension().is_some_and(|extension| extension == "db") {
         append_suffix(path, ".zsqlite")
@@ -31,7 +31,7 @@ pub(crate) fn storage_path(path: &Path) -> PathBuf {
     vfs_storage_path(path)
 }
 
-/// Returns the logical `.db` facade belonging to a physical active segment.
+/// Returns the logical `.db` facade belonging to a physical active file.
 pub(crate) fn notice_path(storage: &Path) -> Option<PathBuf> {
     if storage
         .extension()

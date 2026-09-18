@@ -1,5 +1,7 @@
 #![cfg(all(feature = "static", unix))]
 
+use zsqlite::storage::adapter::{Publication, StorageBackend};
+
 use libsqlite3_sys as ffi;
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
@@ -130,12 +132,12 @@ fn wal_path(path: &Path) -> PathBuf {
 }
 
 fn segment_paths(path: &Path) -> TestResult<Vec<PathBuf>> {
-    let mut paths = std::fs::read_dir(sidecar(path).join("segments"))?
+    let mut paths = std::fs::read_dir(sidecar(path).join("objects"))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
             path.extension()
-                .is_some_and(|extension| extension == "zseg")
+                .is_some_and(|extension| extension == "view" || extension == "segment")
         })
         .collect::<Vec<_>>();
     paths.sort();
@@ -336,6 +338,13 @@ fn complete_conversion_is_openable_if_crash_leaves_staging_file() -> TestResult 
     std::fs::copy(&staging_file, &install_file)?;
     std::fs::hard_link(&install_file, &destination)?;
     std::fs::remove_file(&install_file)?;
+    // The installer updates the local attachment reservation before publishing
+    // the relocated coordination directory.
+    let reservation = sidecar(&staging_file).join("active-location");
+    let mut record = std::fs::read(&reservation)?;
+    record.truncate(64);
+    record.extend(destination.canonicalize()?.as_os_str().as_encoded_bytes());
+    std::fs::write(reservation, record)?;
     std::fs::rename(sidecar(&staging_file), sidecar(&destination))?;
 
     #[cfg(unix)]
@@ -386,8 +395,8 @@ fn interrupted_sidecar_first_delete_can_be_retried_idempotently() -> TestResult 
         connection.execute("CREATE TABLE events(id INTEGER PRIMARY KEY)")?;
     }
 
-    // delete_bundle() removes the sidecar tree before the database file. This is the
-    // exact persistent state left if the deleting process dies between them.
+    // Missing all local sidecar data leaves only a recognizable local pagefile.
+    // Finishing its cleanup must not require reconstructing a deleted catalog.
     std::fs::remove_dir_all(sidecar(&database))?;
     let rc = managed_delete(&database)?;
     assert_eq!(
@@ -415,9 +424,18 @@ fn interrupted_recursive_sidecar_delete_can_be_retried_idempotently() -> TestRes
     }
     zsqlite::flush(&database)?;
 
-    // remove_dir_all() is not atomic. Model a crash after one required
-    // subdirectory has gone but before the sidecar tree itself is unlinked.
-    std::fs::remove_dir_all(sidecar(&database).join("segments"))?;
+    // Deletion first CAS-publishes an empty catalog. Model a crash after that
+    // commit and object removal, before the remaining local files are unlinked.
+    let backend = zsqlite::FilesystemBackend::open(sidecar(&database))?;
+    let root = backend.read_root()?.ok_or("missing catalog")?;
+    let mut empty = b"ZCAT0001".to_vec();
+    empty.extend([0; 6]);
+    empty.extend(blake3::hash(&empty).as_bytes());
+    assert!(matches!(
+        backend.compare_exchange_root(Some(root.revision()), &empty)?,
+        Publication::Applied(_)
+    ));
+    std::fs::remove_dir_all(sidecar(&database).join("objects"))?;
     assert_eq!(managed_delete(&database)?, ffi::SQLITE_OK);
     assert!(!database.exists());
     assert!(!sidecar(&database).exists());
@@ -425,23 +443,23 @@ fn interrupted_recursive_sidecar_delete_can_be_retried_idempotently() -> TestRes
 }
 
 #[test]
-fn partial_sidecar_delete_still_respects_an_existing_lifecycle_lease() -> TestResult {
+fn missing_catalog_objects_respect_leases_and_block_deletion() -> TestResult {
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("partial-delete-with-reader.zsqlite");
     let connection = Connection::open_zsqlite(&database)?;
     connection.execute("CREATE TABLE events(id INTEGER PRIMARY KEY)")?;
 
-    // Required sidecar structure can be partially absent after an interrupted
-    // recursive delete, but the surviving lock files must still protect an
-    // already-open generation from a second deleter.
-    std::fs::remove_dir_all(sidecar(&database).join("segments"))?;
+    // Lost catalog objects cannot prove which fork heads still exist. Local
+    // leases take precedence while a connection is open; after it closes,
+    // missing required metadata must still block deletion.
+    std::fs::remove_dir_all(sidecar(&database).join("objects"))?;
     assert_eq!(managed_delete(&database)?, ffi::SQLITE_BUSY);
     assert!(database.exists());
 
     drop(connection);
-    assert_eq!(managed_delete(&database)?, ffi::SQLITE_OK);
-    assert!(!database.exists());
-    assert!(!sidecar(&database).exists());
+    assert_ne!(managed_delete(&database)?, ffi::SQLITE_OK);
+    assert!(database.exists());
+    assert!(sidecar(&database).exists());
     Ok(())
 }
 
@@ -576,13 +594,13 @@ fn gc_holder_worker() -> TestResult {
 }
 
 #[test]
-fn gc_preserves_a_leased_generation_then_reclaims_it_after_release() -> TestResult {
+fn gc_preserves_a_leased_manifest_then_reclaims_it_after_release() -> TestResult {
     if std::env::var_os(GC_HOLDER_DB).is_some() {
         return gc_holder_worker();
     }
 
     let directory = tempfile::tempdir()?;
-    let database = directory.path().join("leased-generation.zsqlite");
+    let database = directory.path().join("leased-manifest.zsqlite");
     {
         let connection = Connection::open_zsqlite(&database)?;
         connection.execute(
@@ -600,7 +618,7 @@ fn gc_preserves_a_leased_generation_then_reclaims_it_after_release() -> TestResu
     let release = directory.path().join("holder-release");
     let mut holder = Command::new(std::env::current_exe()?)
         .arg("--exact")
-        .arg("gc_preserves_a_leased_generation_then_reclaims_it_after_release")
+        .arg("gc_preserves_a_leased_manifest_then_reclaims_it_after_release")
         .arg("--nocapture")
         .env(GC_HOLDER_DB, &database)
         .env(GC_HOLDER_READY, &ready)

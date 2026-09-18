@@ -3,14 +3,85 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 mod backend;
+pub mod dictionary;
+pub mod domain;
 mod facade;
 pub mod format;
 mod fs;
-mod segment_codec;
+pub mod layout;
+pub mod statistics;
+pub mod storage;
 mod store;
 mod vfs;
 
-pub use store::{DictionaryPolicy, Inspect, StoragePolicy, StoreError};
+pub use dictionary::DictionaryPolicy;
+pub use storage::{
+    Database, DurablePin, FilesystemBackend, GcReport, MaintenanceReport, MemoryBackend,
+    PinnedView, RetentionName, Storage, StorageBackend,
+};
+pub use store::{Inspect, StoragePolicy, StoreError};
+
+/// Persistently retain a sealed logical hash, not a particular physical file.
+/// A wider rollup ending at the same hash may replace its original segments.
+/// Dropping the handle does not release retention.
+pub fn retain(path: impl AsRef<Path>, name: RetentionName) -> Result<DurablePin, StoreError> {
+    store::Store::open_existing(database_storage_path(path.as_ref())?)?.retain_view(name, false)
+}
+
+/// Validate the current view before atomically replacing a named root.
+pub fn advance_retention(
+    path: impl AsRef<Path>,
+    name: RetentionName,
+) -> Result<DurablePin, StoreError> {
+    store::Store::open_existing(database_storage_path(path.as_ref())?)?.retain_view(name, true)
+}
+
+/// Explicit release. Stale handles cannot release an advanced or recreated root,
+/// even when it retains the same logical hash.
+pub fn release_retention(path: impl AsRef<Path>, pin: DurablePin) -> Result<(), StoreError> {
+    store::Store::open_existing(database_storage_path(path.as_ref())?)?.release_view(pin)
+}
+
+/// Reload an offline owner's durable retention handle without changing its root.
+pub fn retention(path: impl AsRef<Path>, name: &RetentionName) -> Result<DurablePin, StoreError> {
+    let storage_path = database_storage_path(path.as_ref())?;
+    let _store = store::Store::open_existing_read_only(&storage_path)?;
+    let catalog = storage::Catalog::open(&backend::sidecar_dir(&storage_path), false)?;
+    catalog.lock()?.read_root(name)
+}
+
+/// Read a retained logical image through its widest available validated rollup.
+/// The returned reader leases its exact physical dependencies until it drops.
+/// ```no_run
+/// use zsqlite::{RetentionName, retain, open_retained, release_retention};
+/// use zsqlite::domain::PageNumber;
+/// let name = RetentionName::new("fork")?;
+/// let pin = retain("closed.db", name.clone())?;
+/// let reader = open_retained("closed.db", &name)?;
+/// let page = reader.resolve(PageNumber::new(1)?)?;
+/// let bytes = page.read()?;
+/// release_retention("closed.db", pin)?;
+/// // The temporary reader still owns its lease until it drops.
+/// # Ok::<(), zsqlite::StoreError>(())
+/// ```
+pub fn open_retained(
+    path: impl AsRef<Path>,
+    name: &RetentionName,
+) -> Result<PinnedView, StoreError> {
+    store::Store::open_existing_read_only(database_storage_path(path.as_ref())?)?
+        .retained_view(name)
+}
+
+/// Collect at most the given number of objects; zero only reports retention.
+pub fn collect(path: impl AsRef<Path>, deletion_budget: usize) -> Result<GcReport, StoreError> {
+    store::Store::open_existing(database_storage_path(path.as_ref())?)?.gc_report(deletion_budget)
+}
+
+/// Repack at most one low-occupancy pack within the configured decoded budget.
+/// Pending/active writes are left untouched. The report describes this call.
+pub fn maintain(path: impl AsRef<Path>) -> Result<MaintenanceReport, StoreError> {
+    store::Store::open_existing(database_storage_path(path.as_ref())?)?.repack_once()
+}
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -22,7 +93,7 @@ use crate::fs::{absolute_path, read_exact_at, sync_parent_dir};
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Returns metadata for an existing V6 database without modifying it.
+/// Returns metadata for an existing database without modifying it.
 /// A logical `name.db` resolves to `name.db.zsqlite`; direct `.zsqlite` paths
 /// remain supported.
 pub fn inspect(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
@@ -38,7 +109,7 @@ pub fn verify(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
     database.inspect()
 }
 
-/// Seals the current active segment, if any.
+/// Seals the current active file, if it contains committed changes.
 pub fn flush(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
     let mut database = store::Store::open_existing(database_storage_path(path.as_ref())?)?;
     database.acquire_maintenance()?;
@@ -48,7 +119,9 @@ pub fn flush(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
     database.inspect()
 }
 
-/// Replaces all sealed segments with one endpoint-equivalent checkpoint segment.
+/// Merges the sealed metadata runs into one endpoint-equivalent checkpoint.
+/// Immutable payload and placement data are not rewritten. Unsealed changes
+/// must be flushed explicitly first; otherwise this returns `StoreError::Busy`.
 pub fn compact(path: impl AsRef<Path>) -> Result<Inspect, StoreError> {
     let mut database = store::Store::open_existing(database_storage_path(path.as_ref())?)?;
     database.compact()?;
@@ -65,12 +138,22 @@ pub fn configure(path: impl AsRef<Path>, policy: StoragePolicy) -> Result<Inspec
     database.inspect()
 }
 
-/// Converts a closed ordinary `SQLite` database into a distinct V6 zsqlite bundle.
+/// Converts a closed ordinary `SQLite` database using the default storage policy.
 /// A `.db` destination gets a read-only notice at that path and stores the
-/// active segment at the corresponding `.db.zsqlite` path.
+/// active file at the corresponding `.db.zsqlite` path.
 pub fn convert_to_zsqlite(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
+) -> Result<Inspect, StoreError> {
+    convert_to_zsqlite_with_policy(source, destination, StoragePolicy::default())
+}
+
+/// Converts a closed ordinary `SQLite` database with its intended compression
+/// and layout from the first seal; no same-range recompression pass is needed.
+pub fn convert_to_zsqlite_with_policy(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    policy: StoragePolicy,
 ) -> Result<Inspect, StoreError> {
     let source = absolute_path(source.as_ref())?;
     let logical_destination = absolute_path(destination.as_ref())?;
@@ -94,6 +177,7 @@ pub fn convert_to_zsqlite(
     let staging = unused_staging_path(&destination, "convert")?;
     let mut cleanup = CleanupPaths::new(bundle_paths(&staging).to_vec());
     let mut converted = store::Store::open(&staging, true)?;
+    converted.set_storage_policy(policy)?;
     let mut page = vec![0; page_size as usize];
     let mut offset = 0_u64;
     while offset < length {
@@ -122,7 +206,7 @@ pub fn convert_to_zsqlite(
     installed.inspect()
 }
 
-/// Exports a V6 zsqlite database as an ordinary `SQLite` file.
+/// Exports a zsqlite database as an ordinary `SQLite` file.
 pub fn export_to_sqlite(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
@@ -236,6 +320,12 @@ fn install_staged_bundle(staging: &Path, destination: &Path) -> Result<(), Store
     file_cleanup.disarm();
     sync_parent_dir(destination)?;
 
+    // The namespace moves as a unit; its machine-local attachment reservation
+    // must describe the destination before the sidecar becomes visible.
+    let staging_catalog = storage::Catalog::open(&staging_paths[1], false)?;
+    let staging_guard = staging_catalog.lock()?;
+    staging_guard.relocate_local_attachment(destination)?;
+    drop(staging_guard);
     std::fs::rename(&staging_paths[1], &destination_paths[1])?;
     installed.paths.push(destination_paths[1].clone());
 
@@ -335,6 +425,45 @@ mod tests {
     }
 
     #[test]
+    fn conversion_applies_layout_before_the_first_seal() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.sqlite");
+        let bytes = (1..=4).flat_map(sqlite_page).collect::<Vec<_>>();
+        std::fs::write(&source, &bytes)?;
+        for (name, layout, expected_frames) in [
+            ("page", layout::LayoutPolicy::default(), 4),
+            (
+                "grouped",
+                layout::LayoutPolicy::default()
+                    .fixed(domain::DecodedBytes::new(65536))?
+                    .with_level(9)?,
+                1,
+            ),
+        ] {
+            let destination = directory.path().join(format!("{name}.db"));
+            let policy = StoragePolicy::default()
+                .with_layout(layout)
+                .with_dictionary(DictionaryPolicy::new(0, 1024 * 1024)?);
+            let info = convert_to_zsqlite_with_policy(&source, &destination, policy)?;
+            assert_eq!(info.policy, policy);
+            assert_eq!(
+                info.frame_distribution
+                    .iter()
+                    .map(|bin| bin.frames)
+                    .sum::<u64>(),
+                expected_frames
+            );
+            let manifest = info.manifest.unwrap();
+            assert_eq!(compact(&destination)?.manifest.unwrap().id(), manifest.id());
+            let output = directory.path().join(format!("{name}-export.sqlite"));
+            export_to_sqlite(&destination, &output)?;
+            assert_eq!(std::fs::read(output)?, bytes);
+        }
+        assert_eq!(std::fs::read(source)?, bytes);
+        Ok(())
+    }
+
+    #[test]
     fn conversion_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let source = directory.path().join("source.db");
@@ -345,7 +474,7 @@ mod tests {
         convert_to_zsqlite(&source, &destination)?;
         export_to_sqlite(&destination, &output)?;
         assert_eq!(&std::fs::read(&destination)?[..16], SQLITE_MAGIC);
-        assert_eq!(&std::fs::read(&storage)?[..8], format::SEGMENT_MAGIC);
+        assert_eq!(&std::fs::read(&storage)?[..8], format::ACTIVE_MAGIC);
         assert_eq!(std::fs::read(source)?, std::fs::read(output)?);
         Ok(())
     }

@@ -27,3 +27,6 @@
 *.dll
 kiwix-data/
 *.zim
+
+# Local import tools and raw benchmark archives; summaries stay in docs/.
+/experiments/

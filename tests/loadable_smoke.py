@@ -64,7 +64,7 @@ def main() -> None:
         notice.close()
 
         active = storage.read_bytes()
-        assert len(active) >= 4_096 and active.startswith(b"ZSQLSE06")
+        assert len(active) >= 4_096 and active.startswith(b"ZSQLAC01")
         assert database.read_bytes().startswith(b"SQLite format 3\x00")
         sidecar = Path(f"{storage}.d")
         assert sidecar.is_dir()
@@ -85,7 +85,9 @@ def main() -> None:
         if args.cli is not None:
             subprocess.run([args.cli, "verify", database], check=True)
             subprocess.run([args.cli, "flush", database], check=True)
-            assert any((sidecar / "segments").glob("*.zseg"))
+            assert any((sidecar / "objects").glob("*.blob"))
+            assert any((sidecar / "objects").glob("*.segment"))
+            assert (sidecar / "catalog-head").is_file()
             result = subprocess.run(
                 [args.cli, "inspect", database],
                 check=True,
@@ -93,7 +95,7 @@ def main() -> None:
                 stdout=subprocess.PIPE,
             )
             assert "page_size: 8192" in result.stdout
-            assert "format: V6 active-segment" in result.stdout
+            assert "format: V1 active + sealed metadata + catalog + blobs" in result.stdout
 
             exported = Path(directory) / "exported.db"
             subprocess.run([args.cli, "export", database, exported], check=True)

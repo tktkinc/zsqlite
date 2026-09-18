@@ -1,8 +1,8 @@
 use std::fmt::Debug;
 
 use zsqlite::format::{
-    ACTIVE_STATE_SIZE, ActiveState, Codec, DictionaryPolicyRecord, FormatError, FrameHeader,
-    SEGMENT_HEADER_SIZE, SegmentHeader, SegmentTrailer, StoragePolicyRecord,
+    ACTIVE_HEADER_SIZE, ACTIVE_STATE_SIZE, ActiveHeader, ActiveState, Codec,
+    DictionaryPolicyRecord, FormatError, FrameHeader, StoragePolicyRecord,
 };
 
 fn assert_all_single_bit_mutations_rejected<const N: usize, T>(
@@ -60,60 +60,34 @@ fn storage_policy() -> StoragePolicyRecord {
     StoragePolicyRecord {
         settle_seconds: 300,
         max_stale_seconds: 3_600,
-        target_segment_bytes: 64 * 1024 * 1024,
+        rollover_bytes: 64 * 1024 * 1024,
         dictionary: DictionaryPolicyRecord {
             dictionary_bytes: 65_536,
-            sample_bytes: 32 * 1024 * 1024,
+            sample_bytes: 8 * 1024 * 1024,
         },
     }
 }
 
 #[test]
-fn segment_header_and_trailer_reject_every_single_bit_mutation() {
-    let header = SegmentHeader {
-        mutable_snapshot: false,
+fn active_header_rejects_every_single_bit_mutation() {
+    let header = ActiveHeader {
+        attachment_id: [1; 32],
+        layout: zsqlite::layout::LayoutPolicy::default(),
         database_id: [0x51; 32],
         page_size: 4_096,
         start_txid: 7,
         base_history: [0x53; 32],
         parent_physical_digest: [0x54; 32],
         base_logical_size: 6 * 4_096,
-        generation: 3,
         policy: storage_policy(),
-        dictionary_offset: SEGMENT_HEADER_SIZE as u64,
-        dictionary_len: 8_192,
-        base_map_offset: SEGMENT_HEADER_SIZE as u64 + 8_192,
-        base_map_len: 1_024,
-        records_offset: 16_384,
     };
     assert_all_single_bit_mutations_rejected(
-        "segment header",
+        "active header",
         header.encode(),
         &header,
-        SegmentHeader::decode,
+        ActiveHeader::decode,
     );
-
-    let trailer = SegmentTrailer {
-        database_id: header.database_id,
-        start_txid: header.start_txid,
-        end_txid: 19,
-        base_history: header.base_history,
-        end_history: [0x61; 32],
-        logical_size: 23 * 4_096,
-        page_size: header.page_size,
-        index_offset: 32_768,
-        index_len: 1_200,
-        map_offset: 36_864,
-        map_len: 2_048,
-        content_root: [0x62; 32],
-        physical_digest: [0x63; 32],
-    };
-    assert_all_single_bit_mutations_rejected(
-        "segment trailer",
-        trailer.encode(true),
-        &trailer,
-        SegmentTrailer::decode,
-    );
+    assert_eq!(header.encode().len(), ACTIVE_HEADER_SIZE);
 }
 
 #[test]

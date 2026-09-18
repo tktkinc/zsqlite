@@ -9,6 +9,100 @@ use std::time::{Duration, Instant};
 
 const ZSQLITE_VFS: &CStr = c"zsqlite";
 
+#[test]
+#[allow(clippy::used_underscore_binding)] // Inspect the filename retained solely for parent ownership.
+fn coordination_filename_preserves_sqlite_framing_and_uri_parameters()
+-> Result<(), Box<dyn std::error::Error>> {
+    register()?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("filename.zsqlite");
+    let uri = CString::new(format!("file:{}?psow=0&training=example", path.display()))?;
+    let connection = Connection::open_filename_with_vfs_and_flags(
+        &uri,
+        ZSQLITE_VFS,
+        ffi::SQLITE_OPEN_URI | ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
+    )?;
+    let mut file: *mut ffi::sqlite3_file = null_mut();
+    assert_eq!(
+        unsafe {
+            ffi::sqlite3_file_control(
+                connection.0,
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_FILE_POINTER,
+                (&raw mut file).cast(),
+            )
+        },
+        ffi::SQLITE_OK
+    );
+    // Check the retained parent filename after xOpen has returned, using the
+    // same SQLite filename APIs that the native WAL shared-memory code uses.
+    let state = unsafe { &*(*file.cast::<ZFile>()).state };
+    let filename = state._parent_name.as_ref().expect("coordination filename");
+    assert_eq!(
+        unsafe { ffi::sqlite3_filename_database(filename.as_ptr()) },
+        filename.as_ptr()
+    );
+    assert_eq!(
+        unsafe {
+            CStr::from_ptr(ffi::sqlite3_uri_parameter(
+                filename.as_ptr(),
+                c"training".as_ptr(),
+            ))
+        },
+        c"example"
+    );
+    assert_eq!(
+        unsafe { ffi::sqlite3_uri_boolean(filename.as_ptr(), c"psow".as_ptr(), 1) },
+        0
+    );
+    assert_eq!(
+        unsafe { ffi::sqlite3_uri_boolean(filename.as_ptr(), c"missing".as_ptr(), 1) },
+        1
+    );
+    connection.execute("PRAGMA journal_mode=WAL; CREATE TABLE data(value); INSERT INTO data VALUES(42); PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_eq!(connection.integer("SELECT value FROM data")?, 42);
+    Ok(())
+}
+
+#[test]
+fn scoped_statistics_work() -> Result<(), Box<dyn std::error::Error>> {
+    register()?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("statistics.zsqlite");
+    {
+        let connection = Connection::open(&path)?;
+        connection.execute("CREATE TABLE data(body BLOB); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<32) INSERT INTO data SELECT randomblob(4096) FROM n;")?;
+    }
+    crate::flush(&path)?;
+    let connection = Connection::open(&path)?;
+    connection.integer("SELECT sum(length(hex(body))) FROM data")?;
+    let first = unsafe { crate::statistics::connection_statistics(connection.0, c"main") }
+        .map_err(|code| format!("stats {code}"))?;
+    connection.integer("SELECT sum(length(hex(body))) FROM data")?;
+    let second = unsafe { crate::statistics::connection_statistics(connection.0, c"main") }
+        .map_err(|code| format!("stats {code}"))?;
+    assert!(first.handle.requested_bytes > 0);
+    assert!(first.handle.fetched_bytes > 0);
+    assert!(second.sqlite.hits > first.sqlite.hits);
+    assert!(second.handle.requested_bytes >= first.handle.requested_bytes);
+    let mut bad_header = crate::statistics::StatsHeader {
+        version: 1,
+        size: 8,
+    };
+    assert_eq!(
+        unsafe {
+            ffi::sqlite3_file_control(
+                connection.0,
+                c"main".as_ptr(),
+                crate::statistics::FILE_CONTROL_STATS_V1,
+                std::ptr::from_mut(&mut bad_header).cast(),
+            )
+        },
+        ffi::SQLITE_MISUSE
+    );
+    Ok(())
+}
+
 static EXPECTED_PARENT_VFS: AtomicPtr<ffi::sqlite3_vfs> = AtomicPtr::new(null_mut());
 static EXPECTED_PARENT_APP_DATA: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static PARENT_CONTEXT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -453,7 +547,7 @@ fn register() -> Result<(), String> {
 
 fn native_vfs_name() -> Result<CString, String> {
     let zsqlite = unsafe { ffi::sqlite3_vfs_find(VFS_NAME.as_ptr().cast()) };
-    if let Some(app) = unsafe { app_data(zsqlite) } {
+    if let Some(app) = unsafe { app_data(&*zsqlite) } {
         let parent = unsafe { app.parent.as_ref() }.ok_or("zsqlite parent VFS is null")?;
         return Ok(unsafe { CStr::from_ptr(parent.zName) }.to_owned());
     }
@@ -523,7 +617,7 @@ fn db_facade_is_a_read_only_native_notice() -> Result<(), Box<dyn std::error::Er
          INSERT INTO actual_data VALUES('stored by zsqlite');",
     )?;
 
-    assert_eq!(std::fs::read(&storage)?[..8], *b"ZSQLSE06");
+    assert_eq!(std::fs::read(&storage)?[..8], *crate::format::ACTIVE_MAGIC);
     assert_eq!(std::fs::metadata(&logical)?.len(), 4096);
     assert!(storage_wal.exists());
     assert!(!native_wal.exists());
@@ -823,6 +917,7 @@ fn inherited_parent_vfs_callbacks_receive_the_parent_context() {
 
     let app = AppData {
         parent: parent_pointer,
+        storage: None,
     };
     let mut shim = parent;
     shim.pAppData = std::ptr::from_ref(&app).cast_mut().cast();
@@ -1088,7 +1183,12 @@ fn registry_delete_cannot_remove_a_racing_replacement() -> Result<(), Box<dyn st
         })
         .map_err(|error| error.to_string())
     });
-    deleted_rx.recv_timeout(Duration::from_secs(5))?;
+    if let Err(error) = deleted_rx.recv_timeout(Duration::from_secs(5)) {
+        if matches!(error, mpsc::RecvTimeoutError::Disconnected) {
+            return Err(format!("delete thread: {:?}", deleter.join()).into());
+        }
+        return Err(error.into());
+    }
     assert!(!path.exists());
     assert!(!append_suffix(&path, ".d").exists());
 
@@ -1602,6 +1702,7 @@ fn deterministic_random_workload_matches_native_sqlite() -> Result<(), Box<dyn s
     drop(compressed);
     let mut store = Store::open_existing(&compressed_path)?;
     store.verify()?;
+    store.flush_sidecars()?;
     store.compact()?;
     store.verify()?;
     drop(store);
@@ -2801,8 +2902,8 @@ fn compaction_preserves_the_exact_exported_sqlite_image() -> Result<(), Box<dyn 
     let before_length = crate::export_to_sqlite(&path, &before_path)?;
     let before = std::fs::read(&before_path)?;
     assert_eq!(before_length, before.len() as u64);
-    let compacted = crate::compact(&path)?;
-    assert!(compacted.generation > 0);
+    crate::flush(&path)?;
+    crate::compact(&path)?;
     let after_length = crate::export_to_sqlite(&path, &after_path)?;
     let after = std::fs::read(&after_path)?;
     assert_eq!(after_length, after.len() as u64);
@@ -2839,6 +2940,7 @@ fn maintenance_is_exclusive_and_read_only_first_does_not_poison_writers()
     let writer = Connection::open(&path)?;
     writer.execute("INSERT INTO messages VALUES(2, 'second')")?;
     assert_eq!(read_only.integer("SELECT count(*) FROM messages")?, 2);
+    crate::flush(&path)?;
     let online = crate::compact(&path)?;
     assert_eq!(online.indexed_pages, online.page_count as usize);
     crate::verify(&path)?;
@@ -2846,6 +2948,7 @@ fn maintenance_is_exclusive_and_read_only_first_does_not_poison_writers()
     drop(writer);
     drop(read_only);
 
+    crate::flush(&path)?;
     let compacted = crate::compact(&path)?;
     assert_eq!(compacted.indexed_pages, compacted.page_count as usize);
     let verified = crate::verify(&path)?;

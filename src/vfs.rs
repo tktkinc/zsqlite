@@ -150,7 +150,7 @@ struct FileState {
     store: Option<Arc<Mutex<Store>>>,
     /// Owns the alternate main-file pathname for as long as the parent VFS
     /// may retain the pointer passed to xOpen.
-    _parent_name: Option<CString>,
+    _parent_name: Option<SqliteFilename>,
     read_only: bool,
     lock_level: c_int,
     vfs: *mut ffi::sqlite3_vfs,
@@ -158,6 +158,54 @@ struct FileState {
     /// strength of the last successful parent main-file sync.
     publication: PublicationState,
     checkpoint: CheckpointState,
+    io_statistics: crate::statistics::HandleIoStats,
+}
+
+/// `SQLite` filenames include private framing and URI fields around the pathname.
+/// A plain `CString` is not safe for parent VFS calls to `sqlite3_uri_parameter`,
+/// including the calls made long after xOpen when WAL shared memory is opened.
+struct SqliteFilename(*const c_char);
+
+impl SqliteFilename {
+    /// `original` must be the live main-database filename supplied by `SQLite`.
+    unsafe fn remap(path: &CStr, original: *const c_char) -> Result<Self, c_int> {
+        let mut parameters = Vec::new();
+        let mut count: c_int = 0;
+        loop {
+            let key = unsafe { ffi::sqlite3_uri_key(original, count) };
+            if key.is_null() {
+                break;
+            }
+            parameters.push(key);
+            parameters.push(unsafe { ffi::sqlite3_uri_parameter(original, key) });
+            count = count.checked_add(1).ok_or(ffi::SQLITE_TOOBIG)?;
+        }
+        let filename = unsafe {
+            ffi::sqlite3_create_filename(
+                path.as_ptr(),
+                ffi::sqlite3_filename_journal(original),
+                ffi::sqlite3_filename_wal(original),
+                count,
+                parameters.as_mut_ptr(),
+            )
+        };
+        if filename.is_null() {
+            Err(ffi::SQLITE_NOMEM)
+        } else {
+            Ok(Self(filename))
+        }
+    }
+
+    fn as_ptr(&self) -> *const c_char {
+        self.0
+    }
+}
+
+impl Drop for SqliteFilename {
+    fn drop(&mut self) {
+        // FileState is dropped only after the parent xClose has returned.
+        unsafe { ffi::sqlite3_free_filename(self.0.cast_mut()) };
+    }
 }
 
 fn discard_owned_pending(file_state: &mut FileState, lock_error: c_int) -> c_int {
@@ -183,6 +231,7 @@ fn discard_owned_pending(file_state: &mut FileState, lock_error: c_int) -> c_int
 
 struct AppData {
     parent: *mut ffi::sqlite3_vfs,
+    storage: Option<crate::Storage>,
 }
 
 // Access is serialized by SQLite's global VFS registration mutex after setup.
@@ -335,24 +384,24 @@ fn spawn_maintenance_worker(store: Weak<Mutex<Store>>) {
     });
 }
 
-unsafe fn app_data(vfs: *mut ffi::sqlite3_vfs) -> Option<&'static AppData> {
-    let raw = unsafe { vfs.as_ref()?.pAppData.cast::<AppData>() };
+unsafe fn app_data(vfs: &ffi::sqlite3_vfs) -> Option<&AppData> {
+    let raw = vfs.pAppData.cast::<AppData>();
     unsafe { raw.as_ref() }
 }
 
 unsafe fn parent_vfs_for(
-    vfs: *mut ffi::sqlite3_vfs,
-) -> Option<(*mut ffi::sqlite3_vfs, &'static ffi::sqlite3_vfs)> {
+    vfs: &ffi::sqlite3_vfs,
+) -> Option<(*mut ffi::sqlite3_vfs, &ffi::sqlite3_vfs)> {
     let parent = unsafe { app_data(vfs) }?.parent;
     Some((parent, unsafe { parent.as_ref()? }))
 }
 
-unsafe fn zfile(file: *mut ffi::sqlite3_file) -> Option<&'static mut ZFile> {
-    unsafe { file.cast::<ZFile>().as_mut() }
+unsafe fn zfile(file: &mut ffi::sqlite3_file) -> Option<&mut ZFile> {
+    unsafe { (std::ptr::from_mut(file).cast::<ZFile>()).as_mut() }
 }
 
-unsafe fn state(file: *mut ffi::sqlite3_file) -> Option<&'static mut FileState> {
-    let state = unsafe { zfile(file)?.state };
+unsafe fn state(file: &mut ffi::sqlite3_file) -> Option<&mut FileState> {
+    let state = unsafe { zfile(&mut *file)?.state };
     unsafe { state.as_mut() }
 }
 
@@ -389,7 +438,7 @@ unsafe extern "C" fn x_open(
             );
         }
         let output = unsafe { &mut *output_pointer };
-        let Some(app) = (unsafe { app_data(vfs) }) else {
+        let Some(app) = (unsafe { app_data(&*vfs) }) else {
             return ffi::SQLITE_INTERNAL;
         };
         let Some(parent_vfs) = (unsafe { app.parent.as_ref() }) else {
@@ -403,8 +452,14 @@ unsafe extern "C" fn x_open(
                 return ffi::SQLITE_CANTOPEN;
             }
             let path = crate::facade::vfs_storage_path(&path_from_name(name));
-            let managed = path.extension().and_then(|value| value.to_str()) == Some("zsqlite");
+            let managed = app.storage.is_some()
+                || path.extension().and_then(|value| value.to_str()) == Some("zsqlite");
             if managed {
+                if let Some(storage) = &app.storage
+                    && let Err(error) = storage.bind(&path)
+                {
+                    return sqlite_result(&error);
+                }
                 let create = flags & ffi::SQLITE_OPEN_CREATE != 0;
                 let storage_existed = path.exists();
                 if !storage_existed
@@ -429,7 +484,10 @@ unsafe extern "C" fn x_open(
                 let Ok(encoded) = path_to_c_string(&lock_path) else {
                     return ffi::SQLITE_CANTOPEN;
                 };
-                parent_name = Some(encoded);
+                parent_name = match unsafe { SqliteFilename::remap(&encoded, name) } {
+                    Ok(filename) => Some(filename),
+                    Err(code) => return code,
+                };
                 store = Some(opened);
             }
         }
@@ -447,7 +505,7 @@ unsafe extern "C" fn x_open(
             unsafe { ffi::sqlite3_free(parent_file.cast()) };
             return ffi::SQLITE_INTERNAL;
         };
-        let parent_name_pointer = parent_name.as_ref().map_or(name, |value| value.as_ptr());
+        let parent_name_pointer = parent_name.as_ref().map_or(name, SqliteFilename::as_ptr);
         let rc = unsafe {
             parent_open(
                 app.parent,
@@ -463,7 +521,7 @@ unsafe extern "C" fn x_open(
             unsafe { close_parent(parent_file) };
             return rc;
         }
-        let Some(parent_methods) = (unsafe { parent_methods_for(parent_file) }) else {
+        let Some(parent_methods) = (unsafe { parent_methods_for(&*parent_file) }) else {
             unsafe { close_parent(parent_file) };
             return ffi::SQLITE_IOERR;
         };
@@ -488,6 +546,7 @@ unsafe extern "C" fn x_open(
             vfs,
             publication: PublicationState::default(),
             checkpoint: CheckpointState::Idle,
+            io_statistics: crate::statistics::HandleIoStats::default(),
         }));
         output.base.pMethods = io;
         ffi::SQLITE_OK
@@ -519,7 +578,7 @@ unsafe fn close_parent(parent: *mut ffi::sqlite3_file) -> c_int {
 
 unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
     ffi_guard(|| {
-        let Some(file) = (unsafe { zfile(file) }) else {
+        let Some(file) = (unsafe { zfile(&mut *file) }) else {
             return ffi::SQLITE_MISUSE;
         };
         let mut index_rc = ffi::SQLITE_OK;
@@ -564,7 +623,7 @@ unsafe extern "C" fn x_read(
         if amount == 0 {
             return ffi::SQLITE_OK;
         }
-        let Some(file_state) = (unsafe { state(file) }) else {
+        let Some(file_state) = (unsafe { state(&mut *file) }) else {
             return ffi::SQLITE_IOERR_READ;
         };
         if file_state.checkpoint == CheckpointState::FallbackFinishing {
@@ -580,7 +639,11 @@ unsafe extern "C" fn x_read(
                 .map_err(|_| ffi::SQLITE_IOERR)
                 .and_then(|mut store| {
                     store
-                        .read_at(offset.cast_unsigned(), data)
+                        .read_with_statistics(
+                            offset.cast_unsigned(),
+                            data,
+                            &mut file_state.io_statistics,
+                        )
                         .map_err(|error| sqlite_result(&error))
                 });
             match result {
@@ -591,7 +654,7 @@ unsafe extern "C" fn x_read(
         } else {
             unsafe {
                 call_read(
-                    zfile(file).expect("validated file").parent,
+                    zfile(&mut *file).expect("validated file").parent,
                     output,
                     amount,
                     offset,
@@ -614,7 +677,7 @@ unsafe extern "C" fn x_write(
         if amount == 0 {
             return ffi::SQLITE_OK;
         }
-        let Some(file_state) = (unsafe { state(file) }) else {
+        let Some(file_state) = (unsafe { state(&mut *file) }) else {
             return ffi::SQLITE_IOERR_WRITE;
         };
         if let Some(store) = &file_state.store {
@@ -673,7 +736,7 @@ unsafe extern "C" fn x_write(
         } else {
             unsafe {
                 call_write(
-                    zfile(file).expect("validated file").parent,
+                    zfile(&mut *file).expect("validated file").parent,
                     input,
                     amount,
                     offset,
@@ -688,7 +751,7 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
         if size < 0 {
             return ffi::SQLITE_IOERR_TRUNCATE;
         }
-        let Some(file_state) = (unsafe { state(file) }) else {
+        let Some(file_state) = (unsafe { state(&mut *file) }) else {
             return ffi::SQLITE_IOERR_TRUNCATE;
         };
         if let Some(store) = &file_state.store {
@@ -748,9 +811,9 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
                 }
             }
         } else {
-            let parent = unsafe { zfile(file).expect("validated file").parent };
+            let parent = unsafe { zfile(&mut *file).expect("validated file").parent };
             unsafe {
-                parent_methods_for(parent)
+                parent_methods_for(&*parent)
                     .and_then(|methods| methods.xTruncate)
                     .map_or(ffi::SQLITE_IOERR_TRUNCATE, |truncate| {
                         truncate(parent, size)
@@ -762,7 +825,7 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
 
 unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     ffi_guard(|| {
-        let Some(file_state) = (unsafe { state(file) }) else {
+        let Some(file_state) = (unsafe { state(&mut *file) }) else {
             return ffi::SQLITE_IOERR_FSYNC;
         };
         if let Some(store) = &file_state.store
@@ -787,9 +850,9 @@ unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int
             }
             file_state.publication.clear_pending();
         }
-        let parent = unsafe { zfile(file).expect("validated file").parent };
+        let parent = unsafe { zfile(&mut *file).expect("validated file").parent };
         let rc = unsafe {
-            parent_methods_for(parent)
+            parent_methods_for(&*parent)
                 .and_then(|methods| methods.xSync)
                 .map_or(ffi::SQLITE_OK, |sync| sync(parent, flags))
         };
@@ -810,7 +873,7 @@ unsafe extern "C" fn x_file_size(
         let Some(output) = (unsafe { output.as_mut() }) else {
             return ffi::SQLITE_IOERR_FSTAT;
         };
-        let Some(file_state) = (unsafe { state(file) }) else {
+        let Some(file_state) = (unsafe { state(&mut *file) }) else {
             return ffi::SQLITE_IOERR_FSTAT;
         };
         if file_state.checkpoint == CheckpointState::FallbackFinishing {
@@ -828,9 +891,9 @@ unsafe extern "C" fn x_file_size(
                 Err(_) => ffi::SQLITE_IOERR_FSTAT,
             }
         } else {
-            let parent = unsafe { zfile(file).expect("validated file").parent };
+            let parent = unsafe { zfile(&mut *file).expect("validated file").parent };
             unsafe {
-                parent_methods_for(parent)
+                parent_methods_for(&*parent)
                     .and_then(|methods| methods.xFileSize)
                     .map_or(ffi::SQLITE_IOERR_FSTAT, |file_size| {
                         file_size(parent, output)
@@ -840,10 +903,7 @@ unsafe extern "C" fn x_file_size(
     })
 }
 
-unsafe fn parent_methods_for(
-    parent: *mut ffi::sqlite3_file,
-) -> Option<&'static ffi::sqlite3_io_methods> {
-    let parent = unsafe { parent.as_ref()? };
+unsafe fn parent_methods_for(parent: &ffi::sqlite3_file) -> Option<&ffi::sqlite3_io_methods> {
     unsafe { parent.pMethods.as_ref() }
 }
 
@@ -854,7 +914,7 @@ unsafe fn call_read(
     offset: ffi::sqlite3_int64,
 ) -> c_int {
     unsafe {
-        parent_methods_for(parent)
+        parent_methods_for(&*parent)
             .and_then(|methods| methods.xRead)
             .map_or(ffi::SQLITE_IOERR_READ, |read| {
                 read(parent, output, amount, offset)
@@ -869,7 +929,7 @@ unsafe fn call_write(
     offset: ffi::sqlite3_int64,
 ) -> c_int {
     unsafe {
-        parent_methods_for(parent)
+        parent_methods_for(&*parent)
             .and_then(|methods| methods.xWrite)
             .map_or(ffi::SQLITE_IOERR_WRITE, |write| {
                 write(parent, input, amount, offset)
@@ -879,7 +939,7 @@ unsafe fn call_write(
 
 unsafe fn call_lock(parent: *mut ffi::sqlite3_file, level: c_int) -> c_int {
     unsafe {
-        parent_methods_for(parent)
+        parent_methods_for(&*parent)
             .and_then(|methods| methods.xLock)
             .map_or(ffi::SQLITE_IOERR_LOCK, |lock| lock(parent, level))
     }
@@ -887,7 +947,7 @@ unsafe fn call_lock(parent: *mut ffi::sqlite3_file, level: c_int) -> c_int {
 
 unsafe fn call_unlock(parent: *mut ffi::sqlite3_file, level: c_int) -> c_int {
     unsafe {
-        parent_methods_for(parent)
+        parent_methods_for(&*parent)
             .and_then(|methods| methods.xUnlock)
             .map_or(ffi::SQLITE_IOERR_UNLOCK, |unlock| unlock(parent, level))
     }
@@ -977,8 +1037,8 @@ unsafe extern "C" fn x_check_reserved_lock(
     output: *mut c_int,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        let parent = zfile(file).map_or(null_mut(), |file| file.parent);
-        parent_methods_for(parent)
+        let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
+        parent_methods_for(&*parent)
             .and_then(|methods| methods.xCheckReservedLock)
             .map_or(ffi::SQLITE_IOERR_CHECKRESERVEDLOCK, |check| {
                 check(parent, output)
@@ -993,9 +1053,46 @@ unsafe extern "C" fn x_file_control(
     argument: *mut c_void,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        let is_main = state(file).is_some_and(|state| state.store.is_some());
+        if operation == crate::statistics::FILE_CONTROL_STATS_V1 {
+            let Some(header) = argument.cast::<crate::statistics::StatsHeader>().as_ref() else {
+                return ffi::SQLITE_MISUSE;
+            };
+            if header.version != 1
+                || header.size as usize
+                    != std::mem::size_of::<crate::statistics::FileControlStatsV1>()
+            {
+                return ffi::SQLITE_MISUSE;
+            }
+            let Some(output) = argument
+                .cast::<crate::statistics::FileControlStatsV1>()
+                .as_mut()
+            else {
+                return ffi::SQLITE_MISUSE;
+            };
+            if output.version != 1
+                || output.size as usize
+                    != std::mem::size_of::<crate::statistics::FileControlStatsV1>()
+            {
+                return ffi::SQLITE_MISUSE;
+            }
+            let Some(state) = state(&mut *file) else {
+                return ffi::SQLITE_MISUSE;
+            };
+            let Some(store) = &state.store else {
+                return ffi::SQLITE_NOTFOUND;
+            };
+            let Ok(store) = store.lock() else {
+                return ffi::SQLITE_IOERR;
+            };
+            *output = crate::statistics::FileControlStatsV1::snapshot(
+                state.io_statistics,
+                store.cache_stats(),
+            );
+            return ffi::SQLITE_OK;
+        }
+        let is_main = state(&mut *file).is_some_and(|state| state.store.is_some());
         if is_main && operation == ffi::SQLITE_FCNTL_CKPT_START {
-            let checkpoint_store = state(file).and_then(|file_state| {
+            let checkpoint_store = state(&mut *file).and_then(|file_state| {
                 if file_state.checkpoint == CheckpointState::FallbackFinishing {
                     file_state.checkpoint = CheckpointState::Idle;
                 }
@@ -1034,13 +1131,13 @@ unsafe extern "C" fn x_file_control(
                 operation,
                 ffi::SQLITE_FCNTL_CKPT_START | ffi::SQLITE_FCNTL_CKPT_DONE
             )
-            && let Some(file_state) = state(file)
+            && let Some(file_state) = state(&mut *file)
             && file_state.checkpoint == CheckpointState::FallbackFinishing
         {
             file_state.checkpoint = CheckpointState::Idle;
         }
         if is_main && operation == ffi::SQLITE_FCNTL_SYNC {
-            let pending_store = state(file).and_then(|state| {
+            let pending_store = state(&mut *file).and_then(|state| {
                 state.publication.require_sync();
                 state
                     .publication
@@ -1060,7 +1157,7 @@ unsafe extern "C" fn x_file_control(
             if let Err(error) = result {
                 return error;
             }
-            if had_pending && let Some(file_state) = state(file) {
+            if had_pending && let Some(file_state) = state(&mut *file) {
                 // SQLITE_FCNTL_SYNC is observed even when Pager.noSync skips
                 // xSync(), including during hot-journal recovery. Publish a
                 // visible nondurable commit before SQLite finalizes the
@@ -1070,7 +1167,7 @@ unsafe extern "C" fn x_file_control(
         }
         if is_main
             && operation == ffi::SQLITE_FCNTL_CKPT_DONE
-            && let Some(file_state) = state(file)
+            && let Some(file_state) = state(&mut *file)
         {
             let fallback = file_state.checkpoint == CheckpointState::FallbackWriting;
             if file_state.checkpoint == CheckpointState::ShmWriting {
@@ -1096,7 +1193,7 @@ unsafe extern "C" fn x_file_control(
             }
         }
         if is_main && operation == ffi::SQLITE_FCNTL_COMMIT_PHASETWO {
-            let pending_store = state(file).and_then(|state| {
+            let pending_store = state(&mut *file).and_then(|state| {
                 state
                     .publication
                     .owns_pending()
@@ -1127,7 +1224,7 @@ unsafe extern "C" fn x_file_control(
             if let Err(error) = result {
                 return error;
             }
-            if let Some(file_state) = state(file) {
+            if let Some(file_state) = state(&mut *file) {
                 file_state.publication.reset();
             }
         }
@@ -1147,9 +1244,9 @@ unsafe extern "C" fn x_file_control(
             let Some(moved) = argument.cast::<c_int>().as_mut() else {
                 return ffi::SQLITE_MISUSE;
             };
-            let parent = zfile(file).map_or(null_mut(), |file| file.parent);
+            let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
             let mut parent_moved = 0;
-            let parent_result = parent_methods_for(parent)
+            let parent_result = parent_methods_for(&*parent)
                 .and_then(|methods| methods.xFileControl)
                 .map_or(ffi::SQLITE_NOTFOUND, |control| {
                     control(parent, operation, (&raw mut parent_moved).cast::<c_void>())
@@ -1157,7 +1254,7 @@ unsafe extern "C" fn x_file_control(
             if !matches!(parent_result, ffi::SQLITE_OK | ffi::SQLITE_NOTFOUND) {
                 return parent_result;
             }
-            let database_moved = state(file)
+            let database_moved = state(&mut *file)
                 .and_then(|state| state.store.as_ref().map(Arc::clone))
                 .ok_or(ffi::SQLITE_IOERR)
                 .and_then(|store| {
@@ -1187,15 +1284,15 @@ unsafe extern "C" fn x_file_control(
         }
         if is_main && operation == ffi::SQLITE_FCNTL_VFS_POINTER {
             if let Some(output) = argument.cast::<*mut ffi::sqlite3_vfs>().as_mut()
-                && let Some(file_state) = state(file)
+                && let Some(file_state) = state(&mut *file)
             {
                 *output = file_state.vfs;
                 return ffi::SQLITE_OK;
             }
             return ffi::SQLITE_MISUSE;
         }
-        let parent = zfile(file).map_or(null_mut(), |file| file.parent);
-        parent_methods_for(parent)
+        let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
+        parent_methods_for(&*parent)
             .and_then(|methods| methods.xFileControl)
             .map_or(ffi::SQLITE_NOTFOUND, |control| {
                 control(parent, operation, argument)
@@ -1205,8 +1302,8 @@ unsafe extern "C" fn x_file_control(
 
 unsafe extern "C" fn x_sector_size(file: *mut ffi::sqlite3_file) -> c_int {
     ffi_guard(|| unsafe {
-        let parent = zfile(file).map_or(null_mut(), |file| file.parent);
-        parent_methods_for(parent)
+        let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
+        parent_methods_for(&*parent)
             .and_then(|methods| methods.xSectorSize)
             .map_or(4096, |sector_size| sector_size(parent))
     })
@@ -1214,11 +1311,11 @@ unsafe extern "C" fn x_sector_size(file: *mut ffi::sqlite3_file) -> c_int {
 
 unsafe extern "C" fn x_device_characteristics(file: *mut ffi::sqlite3_file) -> c_int {
     ffi_guard(|| unsafe {
-        if state(file).is_some_and(|state| state.store.is_some()) {
+        if state(&mut *file).is_some_and(|state| state.store.is_some()) {
             0
         } else {
-            let parent = zfile(file).map_or(null_mut(), |file| file.parent);
-            parent_methods_for(parent)
+            let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
+            parent_methods_for(&*parent)
                 .and_then(|methods| methods.xDeviceCharacteristics)
                 .map_or(0, |characteristics| characteristics(parent))
         }
@@ -1233,8 +1330,8 @@ unsafe extern "C" fn x_shm_map(
     output: *mut *mut c_void,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        let parent = zfile(file).map_or(null_mut(), |file| file.parent);
-        parent_methods_for(parent)
+        let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
+        parent_methods_for(&*parent)
             .filter(|methods| methods.iVersion >= 2)
             .and_then(|methods| methods.xShmMap)
             .map_or(ffi::SQLITE_IOERR_SHMMAP, |map| {
@@ -1250,8 +1347,8 @@ unsafe extern "C" fn x_shm_lock(
     flags: c_int,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        let parent = zfile(file).map_or(null_mut(), |file| file.parent);
-        let Some(lock) = parent_methods_for(parent)
+        let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
+        let Some(lock) = parent_methods_for(&*parent)
             .filter(|methods| methods.iVersion >= 2)
             .and_then(|methods| methods.xShmLock)
         else {
@@ -1262,7 +1359,7 @@ unsafe extern "C" fn x_shm_lock(
             && flags & ffi::SQLITE_SHM_EXCLUSIVE != 0
             && offset == WAL_CHECKPOINT_LOCK
             && count == 1
-            && let Some(file_state) = state(file)
+            && let Some(file_state) = state(&mut *file)
             && file_state.checkpoint.uses_shm()
         {
             file_state.checkpoint = CheckpointState::Idle;
@@ -1290,7 +1387,7 @@ unsafe extern "C" fn x_shm_lock(
             && offset == WAL_CHECKPOINT_LOCK
             && count == 1;
         if rc == ffi::SQLITE_OK && flags & ffi::SQLITE_SHM_LOCK != 0 {
-            let refresh = state(file)
+            let refresh = state(&mut *file)
                 .and_then(|state| state.store.as_ref().map(Arc::clone))
                 .map_or(Ok(()), |store| {
                     store
@@ -1315,7 +1412,7 @@ unsafe extern "C" fn x_shm_lock(
                 return error;
             }
             if checkpoint_lock
-                && let Some(file_state) = state(file)
+                && let Some(file_state) = state(&mut *file)
                 && file_state.store.is_some()
             {
                 // CKPT_START is advisory and its return value is ignored. The
@@ -1333,8 +1430,8 @@ unsafe extern "C" fn x_shm_lock(
 
 unsafe extern "C" fn x_shm_barrier(file: *mut ffi::sqlite3_file) {
     let _ = std::panic::catch_unwind(|| unsafe {
-        let parent = zfile(file).map_or(null_mut(), |file| file.parent);
-        if let Some(barrier) = parent_methods_for(parent)
+        let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
+        if let Some(barrier) = parent_methods_for(&*parent)
             .filter(|methods| methods.iVersion >= 2)
             .and_then(|methods| methods.xShmBarrier)
         {
@@ -1345,8 +1442,8 @@ unsafe extern "C" fn x_shm_barrier(file: *mut ffi::sqlite3_file) {
 
 unsafe extern "C" fn x_shm_unmap(file: *mut ffi::sqlite3_file, delete: c_int) -> c_int {
     ffi_guard(|| unsafe {
-        let parent = zfile(file).map_or(null_mut(), |file| file.parent);
-        parent_methods_for(parent)
+        let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
+        parent_methods_for(&*parent)
             .filter(|methods| methods.iVersion >= 2)
             .and_then(|methods| methods.xShmUnmap)
             .map_or(ffi::SQLITE_OK, |unmap| unmap(parent, delete))
@@ -1360,14 +1457,14 @@ unsafe extern "C" fn x_fetch(
     output: *mut *mut c_void,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        if state(file).is_some_and(|state| state.store.is_some()) {
+        if state(&mut *file).is_some_and(|state| state.store.is_some()) {
             if let Some(output) = output.as_mut() {
                 *output = null_mut();
             }
             ffi::SQLITE_OK
         } else {
-            let parent = zfile(file).map_or(null_mut(), |file| file.parent);
-            parent_methods_for(parent)
+            let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
+            parent_methods_for(&*parent)
                 .filter(|methods| methods.iVersion >= 3)
                 .and_then(|methods| methods.xFetch)
                 .map_or(ffi::SQLITE_OK, |fetch| {
@@ -1383,11 +1480,11 @@ unsafe extern "C" fn x_unfetch(
     pointer: *mut c_void,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        if state(file).is_some_and(|state| state.store.is_some()) {
+        if state(&mut *file).is_some_and(|state| state.store.is_some()) {
             ffi::SQLITE_OK
         } else {
-            let parent = zfile(file).map_or(null_mut(), |file| file.parent);
-            parent_methods_for(parent)
+            let parent = zfile(&mut *file).map_or(null_mut(), |file| file.parent);
+            parent_methods_for(&*parent)
                 .filter(|methods| methods.iVersion >= 3)
                 .and_then(|methods| methods.xUnfetch)
                 .map_or(ffi::SQLITE_OK, |unfetch| unfetch(parent, offset, pointer))
@@ -1401,7 +1498,7 @@ unsafe extern "C" fn x_delete(
     sync_dir: c_int,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        let Some(app) = app_data(vfs) else {
+        let Some(app) = app_data(&*vfs) else {
             return ffi::SQLITE_INTERNAL;
         };
         let Ok(mapped) = mapped_storage_name(name) else {
@@ -1410,7 +1507,9 @@ unsafe extern "C" fn x_delete(
         let parent_name = mapped.as_ref().map_or(name, |path| path.as_ptr());
         if !name.is_null() {
             let path = crate::facade::vfs_storage_path(&path_from_name(name));
-            if path.extension().and_then(|value| value.to_str()) == Some("zsqlite") {
+            if path.extension().and_then(|value| value.to_str()) == Some("zsqlite")
+                || crate::Storage::is_bound(&crate::backend::sidecar_dir(&path)).unwrap_or(false)
+            {
                 if let Err(error) = crate::facade::validate_notice(&path) {
                     return sqlite_result(&error);
                 }
@@ -1456,7 +1555,7 @@ unsafe extern "C" fn x_access(
     output: *mut c_int,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        let Some(app) = app_data(vfs) else {
+        let Some(app) = app_data(&*vfs) else {
             return ffi::SQLITE_INTERNAL;
         };
         let Ok(mapped) = mapped_storage_name(name) else {
@@ -1479,7 +1578,7 @@ unsafe extern "C" fn x_full_pathname(
     output: *mut c_char,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        let Some(app) = app_data(vfs) else {
+        let Some(app) = app_data(&*vfs) else {
             return ffi::SQLITE_INTERNAL;
         };
         let Ok(mapped) = mapped_storage_name(name) else {
@@ -1497,7 +1596,7 @@ unsafe extern "C" fn x_full_pathname(
 
 unsafe extern "C" fn x_dl_open(vfs: *mut ffi::sqlite3_vfs, filename: *const c_char) -> *mut c_void {
     ffi_guard_or(null_mut(), || unsafe {
-        let Some((parent, methods)) = parent_vfs_for(vfs) else {
+        let Some((parent, methods)) = parent_vfs_for(&*vfs) else {
             return null_mut();
         };
         methods
@@ -1512,7 +1611,7 @@ unsafe extern "C" fn x_dl_error(
     output: *mut c_char,
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        if let Some((parent, methods)) = parent_vfs_for(vfs)
+        if let Some((parent, methods)) = parent_vfs_for(&*vfs)
             && let Some(error) = methods.xDlError
         {
             error(parent, output_size, output);
@@ -1526,7 +1625,7 @@ unsafe extern "C" fn x_dl_sym(
     symbol: *const c_char,
 ) -> Option<unsafe extern "C" fn(*mut ffi::sqlite3_vfs, *mut c_void, *const c_char)> {
     ffi_guard_or(None, || unsafe {
-        let (parent, methods) = parent_vfs_for(vfs)?;
+        let (parent, methods) = parent_vfs_for(&*vfs)?;
         methods
             .xDlSym
             .and_then(|lookup| lookup(parent, handle, symbol))
@@ -1535,7 +1634,7 @@ unsafe extern "C" fn x_dl_sym(
 
 unsafe extern "C" fn x_dl_close(vfs: *mut ffi::sqlite3_vfs, handle: *mut c_void) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        if let Some((parent, methods)) = parent_vfs_for(vfs)
+        if let Some((parent, methods)) = parent_vfs_for(&*vfs)
             && let Some(close) = methods.xDlClose
         {
             close(parent, handle);
@@ -1549,7 +1648,7 @@ unsafe extern "C" fn x_randomness(
     output: *mut c_char,
 ) -> c_int {
     ffi_guard_or(0, || unsafe {
-        let Some((parent, methods)) = parent_vfs_for(vfs) else {
+        let Some((parent, methods)) = parent_vfs_for(&*vfs) else {
             return 0;
         };
         methods
@@ -1560,7 +1659,7 @@ unsafe extern "C" fn x_randomness(
 
 unsafe extern "C" fn x_sleep(vfs: *mut ffi::sqlite3_vfs, microseconds: c_int) -> c_int {
     ffi_guard_or(0, || unsafe {
-        let Some((parent, methods)) = parent_vfs_for(vfs) else {
+        let Some((parent, methods)) = parent_vfs_for(&*vfs) else {
             return 0;
         };
         methods
@@ -1571,7 +1670,7 @@ unsafe extern "C" fn x_sleep(vfs: *mut ffi::sqlite3_vfs, microseconds: c_int) ->
 
 unsafe extern "C" fn x_current_time(vfs: *mut ffi::sqlite3_vfs, output: *mut f64) -> c_int {
     ffi_guard(|| unsafe {
-        let Some((parent, methods)) = parent_vfs_for(vfs) else {
+        let Some((parent, methods)) = parent_vfs_for(&*vfs) else {
             return ffi::SQLITE_IOERR;
         };
         methods
@@ -1588,7 +1687,7 @@ unsafe extern "C" fn x_get_last_error(
     output: *mut c_char,
 ) -> c_int {
     ffi_guard_or(0, || unsafe {
-        let Some((parent, methods)) = parent_vfs_for(vfs) else {
+        let Some((parent, methods)) = parent_vfs_for(&*vfs) else {
             return 0;
         };
         methods
@@ -1602,7 +1701,7 @@ unsafe extern "C" fn x_current_time_int64(
     output: *mut ffi::sqlite3_int64,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        let Some((parent, methods)) = parent_vfs_for(vfs) else {
+        let Some((parent, methods)) = parent_vfs_for(&*vfs) else {
             return ffi::SQLITE_IOERR;
         };
         methods
@@ -1619,7 +1718,7 @@ unsafe extern "C" fn x_set_system_call(
     call: ffi::sqlite3_syscall_ptr,
 ) -> c_int {
     ffi_guard(|| unsafe {
-        let Some((parent, methods)) = parent_vfs_for(vfs) else {
+        let Some((parent, methods)) = parent_vfs_for(&*vfs) else {
             return ffi::SQLITE_NOTFOUND;
         };
         methods
@@ -1633,7 +1732,7 @@ unsafe extern "C" fn x_get_system_call(
     name: *const c_char,
 ) -> ffi::sqlite3_syscall_ptr {
     ffi_guard_or(None, || unsafe {
-        let (parent, methods) = parent_vfs_for(vfs)?;
+        let (parent, methods) = parent_vfs_for(&*vfs)?;
         methods.xGetSystemCall.and_then(|get| get(parent, name))
     })
 }
@@ -1643,7 +1742,7 @@ unsafe extern "C" fn x_next_system_call(
     name: *const c_char,
 ) -> *const c_char {
     ffi_guard_or(null(), || unsafe {
-        let Some((parent, methods)) = parent_vfs_for(vfs) else {
+        let Some((parent, methods)) = parent_vfs_for(&*vfs) else {
             return null();
         };
         methods
@@ -1797,16 +1896,42 @@ fn install_parent_vfs_wrappers(shim: &mut ffi::sqlite3_vfs, parent: &ffi::sqlite
 }
 
 unsafe fn register_vfs() -> c_int {
+    unsafe {
+        register_named_vfs(
+            CStr::from_bytes_with_nul(VFS_NAME).expect("static VFS name"),
+            None,
+        )
+    }
+}
+unsafe fn register_named_vfs(requested_name: &CStr, storage: Option<crate::Storage>) -> c_int {
     let Ok(_registration) = REGISTRATION_LOCK.lock() else {
         return ffi::SQLITE_ERROR;
     };
-    let name = VFS_NAME.as_ptr().cast::<c_char>();
+    let name = requested_name.as_ptr();
     let existing = unsafe { ffi::sqlite3_vfs_find(name) };
     if let Some(existing) = unsafe { existing.as_ref() } {
-        return if existing
+        // Only our own callback establishes the type of pAppData.
+        if existing
             .xOpen
             .map(|function| function as *const () as usize)
-            == Some(x_open as *const () as usize)
+            != Some(x_open as *const () as usize)
+        {
+            return ffi::SQLITE_MISUSE;
+        }
+        let same_storage =
+            unsafe { app_data(existing) }.is_some_and(|app| match (&app.storage, &storage) {
+                (None, None) => true,
+                (Some(old), Some(new)) => {
+                    old.backend().identity() == new.backend().identity()
+                        && old.coordination_directory() == new.coordination_directory()
+                }
+                _ => false,
+            });
+        return if same_storage
+            && existing
+                .xOpen
+                .map(|function| function as *const () as usize)
+                == Some(x_open as *const () as usize)
         {
             ffi::SQLITE_OK
         } else {
@@ -1826,16 +1951,17 @@ unsafe fn register_vfs() -> c_int {
         Err(_) => return ffi::SQLITE_ERROR,
     };
     shim.mxPathname = parent_ref.mxPathname.saturating_add(8);
-    let app = Box::new(AppData { parent });
+    let app = Box::new(AppData { parent, storage });
     let app_ptr = Box::into_raw(app);
     shim.pNext = null_mut();
-    shim.zName = name;
+    shim.zName = requested_name.to_owned().into_raw();
     shim.pAppData = app_ptr.cast();
     install_parent_vfs_wrappers(&mut shim, parent_ref);
     let shim_ptr = Box::into_raw(Box::new(shim));
     let rc = unsafe { ffi::sqlite3_vfs_register(shim_ptr, 0) };
     if rc != ffi::SQLITE_OK {
         unsafe {
+            drop(CString::from_raw((*shim_ptr).zName.cast_mut()));
             drop(Box::from_raw(shim_ptr));
             drop(Box::from_raw(app_ptr));
         }
@@ -1927,3 +2053,20 @@ fn managed_extension_with_non_zsqlite_header_fails_closed() -> Result<(), Box<dy
 #[cfg(all(test, feature = "static"))]
 #[path = "vfs_tests.rs"]
 mod tests;
+
+#[cfg(feature = "static")]
+pub(crate) fn register_storage_static_vfs(
+    name: &str,
+    storage: crate::Storage,
+) -> Result<(), c_int> {
+    let name = CString::new(name).map_err(|_| ffi::SQLITE_MISUSE)?;
+    if name.as_bytes().is_empty() {
+        return Err(ffi::SQLITE_MISUSE);
+    }
+    let result = unsafe { register_named_vfs(&name, Some(storage)) };
+    if result == ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(result)
+    }
+}

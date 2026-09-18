@@ -25,20 +25,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Flush(path) => {
             let info = zsqlite::flush(path)?;
-            println!("flushed: {} sealed segment(s)", info.sealed_segments);
+            println!("flushed: {} immutable pack(s)", info.pack_count);
         }
         Command::Compact(path) => {
             let info = zsqlite::compact(path)?;
             println!(
-                "compacted: {} logical bytes into {} segment bytes",
-                info.logical_size, info.segment_bytes
+                "compacted: {} logical bytes into {} sealed object bytes",
+                info.logical_size, info.sealed_object_bytes
             );
         }
         Command::Convert(source, output) => {
             let info = zsqlite::convert_to_zsqlite(source, output)?;
             println!(
-                "converted: {} logical bytes into {} segment bytes",
-                info.logical_size, info.segment_bytes
+                "converted: {} logical bytes into {} sealed object bytes",
+                info.logical_size, info.sealed_object_bytes
             );
         }
         Command::Export(database, output) => {
@@ -52,27 +52,82 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn print_inspect(info: &zsqlite::Inspect) {
     println!("database: {}", info.path.display());
     println!("sidecar: {}", info.sidecar_path.display());
-    println!("format: V6 active-segment");
+    println!("format: V1 active + sealed metadata + catalog + blobs");
     println!("page_size: {}", info.page_size);
     println!("page_count: {}", info.page_count);
     println!("logical_bytes: {}", info.logical_size);
     println!("head_txid: {}", info.head_txid);
     println!("head_history: {}", zsqlite::format::hex(&info.head_history));
-    println!("generation: {}", info.generation);
-    println!("sealed_segments: {}", info.sealed_segments);
+    println!("pack_count: {}", info.pack_count);
     println!("active: {}", info.active);
     println!("file_bytes: {}", info.file_bytes);
     println!("file_allocated_bytes: {}", info.file_allocated_bytes);
-    println!("segment_bytes: {}", info.segment_bytes);
-    println!("segment_allocated_bytes: {}", info.segment_allocated_bytes);
+    println!("sealed_object_bytes: {}", info.sealed_object_bytes);
+    println!(
+        "sealed_object_allocated_bytes: {}",
+        info.sealed_object_allocated_bytes
+    );
     println!("indexed_pages: {}", info.indexed_pages);
     println!("dictionary_bytes: {}", info.dictionary_bytes);
-    println!("settle_seconds: {}", info.policy.settle.as_secs());
-    println!("max_stale_seconds: {}", info.policy.max_stale.as_secs());
-    println!("target_segment_bytes: {}", info.policy.target_segment_bytes);
+    println!("preferred_dictionaries: {}", info.preferred_dictionaries);
+    if let Some(manifest) = &info.manifest {
+        println!("manifest_bytes: {}", manifest.head_bytes().get());
+        println!(
+            "logical_view_hash: {}",
+            zsqlite::format::hex(manifest.logical_hash().as_bytes())
+        );
+        println!(
+            "manifest_ancestor_bytes: {}",
+            manifest.ancestor_bytes().get()
+        );
+        println!("manifest_run_depth: {}", manifest.run_depth());
+        if let Some(parent) = manifest.parent() {
+            println!(
+                "logical_parent_hash: {}",
+                zsqlite::format::hex(parent.as_bytes())
+            );
+        }
+        println!(
+            "resolved_txid_begin: {}",
+            manifest.transaction_span().begin().get()
+        );
+        println!(
+            "resolved_txid_end: {}",
+            manifest.transaction_span().end().get()
+        );
+    }
+    println!("retention: {:?}", info.retention);
+    for bin in &info.frame_distribution {
+        println!(
+            "frames: decoded={} count={} raw={} dictionary={} payload={}",
+            bin.decoded_bytes.get(),
+            bin.frames,
+            bin.raw_frames,
+            bin.dictionary_frames,
+            bin.stored_payload_bytes.get()
+        );
+    }
+    for pack in &info.pack_occupancy {
+        println!(
+            "pack: {:?} live_pages={}/{} stored={} estimated_obsolete={}",
+            pack.pack,
+            pack.live_pages,
+            pack.total_pages,
+            pack.stored_bytes.get(),
+            pack.reclaimable_bytes()
+        );
+    }
+    println!("settle_seconds: {}", info.policy.settle().as_secs());
+    println!("max_stale_seconds: {}", info.policy.max_stale().as_secs());
+    println!(
+        "rollover_bytes: {}",
+        info.policy
+            .rollover_bytes()
+            .map_or(0, std::num::NonZeroU64::get)
+    );
     println!(
         "dictionary_sample_bytes: {}",
-        info.policy.dictionary.sample_bytes
+        info.policy.dictionary().sample_bytes()
     );
 }
 

@@ -1,132 +1,204 @@
 # zsqlite
 
-`zsqlite` is a SQLite VFS that keeps changed live pages in overwriteable raw
-page records and turns those records into independently readable compressed
-page records when the generation is sealed. SQLite journals and WAL files
-continue to use the host VFS.
+`zsqlite` is a SQLite VFS with overwriteable raw active pages and immutable,
+compressed sealed storage. SQLite journals and WAL files use the host VFS.
 
-The current format is V6 and intentionally has no compatibility path for older
-zsqlite formats.
+All active files, sealed metadata, payload packs, frames, dictionaries, catalogs,
+blobs, and indexes use the V1 format. Logical pins live in the catalog.
+See [storage invariants and interfaces](docs/storage.md) and
+[transcript replay methodology](docs/transcript-replay.md). The adapter contract
+and lazy recovery are documented in [pluggable sealed storage](docs/storage-backends.md).
 
 ## Storage model
 
-A logical `.db` name is a small ordinary SQLite notice database. Selecting the
-`zsqlite` VFS maps that name to a mutable active segment and a sibling
-directory of sealed predecessors:
+A logical `.db` name is a small read-only SQLite notice database. Selecting the
+`zsqlite` VFS resolves it to the active file and sibling catalogue:
 
 ```text
-database.db                           read-only SQLite notice
-database.db.zsqlite                   mutable active segment
+database.db                           SQLite notice, not application data
+database.db.zsqlite                   raw active pagefile
 database.db.zsqlite.d/
-  segments/
-    <start-txid>-<end-txid>-<history>-<physical>.zseg
-  locks/
-    publication.lock
-    lifecycle.lock
-    sqlite.lock
+  objects/<digest>.segment            metadata run or checkpoint only
+  objects/<digest>.blob               complete logical packs + extent index
+  objects/<digest>.dict               shared dictionary
+  objects/<digest>.index              immutable catalog index run/checkpoint
+  catalog-head                        CAS root referencing indexes and named heads
+  active-location                     local attachment reservation
+  readers/<manifest-digest>            manifest-specific OS reader lease
+  object-readers/<logical-object>      exact reader metadata dependencies
+  physical-readers/<blob-or-index>     exact placement/blob leases
+  dictionary.samples                 advisory bounded sample reservoir
+  locks/{publication,catalog,lifecycle,sqlite}.lock
 ```
 
-Without the VFS, `sqlite3 database.db` can read the
-`zsqlite_extension_required` view, which explains how to reopen the database.
-The notice is made read-only to reject accidental native writes. With the VFS,
-`file:database.db?vfs=zsqlite` opens `database.db.zsqlite`; SQLite derives its
-journal and WAL paths from that storage name, so native notice-file recovery
-state cannot collide with the real database. An existing ordinary
-`database.db` is never overwritten or implicitly converted.
+Without the VFS, opening `database.db` exposes the
+`zsqlite_extension_required` notice. With `file:database.db?vfs=zsqlite`,
+journals and WAL paths derive from `database.db.zsqlite`. Existing ordinary
+SQLite files are never implicitly converted. Direct `.zsqlite` paths remain
+supported.
 
-Direct `.zsqlite` paths remain supported for existing bundles and low-level
-maintenance, but they do not create a separate notice database.
+A metadata run records its own page changes and one parent hash. Missing
+pages fall back to that parent, recursively; explicit zero entries and logical
+truncation stop fallback. A checkpoint manifest ends the chain. There is no
+page-range delegation. Recovery resolves the chain into a complete in-memory map
+and verifies its content root before serving reads.
 
-The `.db.zsqlite` file is the active generation. Its immutable header contains
-the database identity and the physical digest of its sealed predecessor. Two
-alternating checksummed state sectors publish its logical size, transaction
-identity, page-record count, and truncate boundary. Active and sealed files use
-the same page-record header. The active page map associates each logical SQLite
-page with a record offset; the first update appends a raw record and later
-updates overwrite that record in place. Pages absent from the active map
-resolve through the sealed digest chain in `segments/`; unrelated files are
-not authoritative.
+Each segment has a 128-byte header with full-view txid begin/end,
+represented transaction range, logical endpoint hash and logical parent hash.
+The compressed metadata run or checkpoint is a footer in its own segment file.
+All frame payloads live in immutable logical packs inside backend blobs.
+Segment headers carry no ordering counter. The txid span
+preserves the base checkpoint's starting endpoint through the current
+endpoint, not a promise that every intermediate snapshot is retained. An explicit
+authenticated endpoint index records represented coverage. Parent lookup selects the widest range ending at the exact logical endpoint hash;
+ties prefer checkpoints, then a deterministic physical checksum order, never
+rewrite recency. Typed manifest IDs keep equivalent encodings distinct. Logical hashes bind database/lineage, size,
+txid, history and page versions/checksums, but exclude physical layout. Rollups
+preserve them; only authenticated, fully resolved metadata can satisfy a parent.
+Invalid segment encodings, level-prefixed names, standalone manifest objects,
+and physical-manifest retention records are rejected.
 
-The host VFS uses `sqlite.lock` as the native SQLite byte-lock and WAL-SHM
-carrier. It deliberately does not use the active segment inode for SQLite byte
-locks: on POSIX, closing any independently opened database descriptor could otherwise release a
-live connection's process-owned `fcntl` locks.
+Active records contain one raw page and can be overwritten in place.
+Sealed records share their envelope but may contain multiple pages in a raw or
+Zstandard frame. Frames are independently authenticated fetch/decode
+units; segment/pack files are physical collection/upload units. Only absence
+from the fully resolved map means zero.
 
-Each sealed segment contains:
+The stable `sqlite.lock` inode carries SQLite's native byte locks and WAL SHM,
+separately from the active pathname that sealing replaces.
 
-- its database identity, TXID range, and parent history hash;
-- any Zstandard dictionaries added by that segment;
-- raw or individually decompressible page frames using lineage dictionaries;
-- a sorted live-page index and complete page-to-last-TXID map;
-- a logical content root and physical BLAKE3 digest.
+## Publication and durability
 
-TXID zero in a full page map represents a zero-filled sparse page. This
-matches native file semantics when a WAL checkpoint extends the main image
-before copying every newly addressable page.
+Ordinary writes and commits keep the active inode. The first changed version
+of a page appends a raw record; subsequent changes overwrite that record.
+SQLite retains responsibility for rollback and WAL recovery. Only successful
+main-image publications advance the active endpoint. A WAL checkpoint may
+publish many individual main-file writes under one publication lock.
 
-Fixed-width hexadecimal TXID prefixes preserve LTX-style lexical range order.
-The ending history hash remains unchanged by compaction; only the physical
-digest changes.
+Sealing durably installs dictionaries, payload blobs, metadata and index deltas.
+It CAS-publishes a pending candidate protecting both heads, replaces and syncs
+an empty active file, then finalizes the published sealed head.
+Unchanged pages are inherited. The first seal
+uses the same path as later seals; it never expands a sealed database into the
+active file.
 
-## Commit and durability behavior
+Two checksummed active state sectors record publication sequence, logical size,
+history and truncate state. They are **not** historical copies of overwritten
+page bytes: damaged state metadata fails closed. SQLite sync strength is
+propagated, including macOS full sync. If visibility may have preceded an I/O
+failure, `PublicationUncertain` preserves possibly referenced objects and the
+Store reloads rather than deleting them. `synchronous=OFF` does not promise
+power-loss durability.
 
-`xWrite` writes affected SQLite pages directly into raw active records.
-Within a process, zsqlite retains original page images until SQLite publishes or
-rolls back the operation. Publication syncs the raw pages as requested and then
-writes the alternate checksummed state sector. The state sequence is the Store
-visibility point; SQLite's rollback journal or WAL remains responsible for its
-normal crash-recovery protocol around in-place main-file updates.
+Readers pin their selected manifest and its exact physical dependencies.
+New readers may resolve a logical parent through a wider rollup without changing
+the child; existing pins keep their old files alive. The local implementation still
+serializes sealing/repacking with Store publication and its process mutex;
+compression can delay same-process readers. It is not an asynchronous
+object-storage uploader.
 
-With `synchronous=OFF`, the records are still structurally complete,
-but zsqlite does not ask the operating system to make them power-loss durable.
-With SQLite sync enabled, the raw records are synced before the state sector is
-published. `synchronous=FULL` also propagates macOS `F_FULLFSYNC` to those Store
-files. A corrupt newest state sector falls back to the preceding sector.
-Truncate-and-regrow operations zero discarded pages so old contents cannot be
-resurrected.
+## Dictionaries, layouts, and collection
 
-In WAL mode, WAL writes are passed through. When SQLite acquires its exclusive
-checkpoint SHM lock, zsqlite holds one publication lease for the whole
-checkpoint. Each successful checkpoint `xWrite` publishes its completed
-main-image change nondurably before returning, because SQLite ignores errors
-from later checkpoint-done and unlock notifications. A checkpoint `xTruncate`
-is published the same way, and a subsequent `xSync` syncs the active data and
-state sector. Consequently a zsqlite TXID describes an
-atomic main-image publication, often one checkpoint write, not an individual
-SQL transaction in the WAL.
+An up-to-96 MiB committed-page reservoir survives seals and reopening. Conversion
+samples across the whole database, not just its first pages. Fresh databases
+accumulate samples across seals; dictionary candidates grow from 8 KiB to 768 KiB
+as enough distinct training pages become available. The full pool supports
+comparison of 512 KiB and 768 KiB candidates, with about 100 training bytes per
+dictionary byte plus separate held-out pages. After 1 MiB of new distinct samples,
+candidates are evaluated on held-out pages, including the new dictionary's
+storage cost, and promoted only for at least 5% improvement over existing choices.
+Up to four preferred dictionaries are carried
+forward, including a fallback; live frames retain any additional dictionaries
+they require. Tiny seals can reuse dictionaries without copying them into
+each pack. Training failure is advisory. Compression competes with raw storage.
 
-SQLite suppresses SHM-lock callbacks in `locking_mode=EXCLUSIVE` and during
-its last-close checkpoint. For those paths, checkpoint start/done file controls
-provide the equivalent bounded publication state; partial checkpoints release
-at DONE, while an immediately following truncate remains attributable to the
-completed checkpoint.
+Page frames at Zstandard level 3 remain the default baseline. Validated policy
+types enable page-sized or fixed 512-byte–8-MiB frames, plus explicit pack,
+cache, codec, and maintenance limits.
 
-Ordinary commits retain the active inode. A page's first update in an active
-generation appends one raw record; later updates overwrite that record without
-growing the file. Sealing writes the same record format into a staged segment,
-optionally with compressed payloads, and appends its final index, page map, and
-trailer. Later seals write only pages represented by the active records. Each
-segment's authoritative ending page map removes zeroed or truncated pages from
-older mappings. Sealing then replaces `.db.zsqlite` with an empty active
-generation naming the new head. Existing readers keep the old generation; new
-readers follow the new chain.
+Decoded pages are cached in a private, unlinked temporary file, not retained as
+RAM frames. By default its cap is 20% of the database's logical size, limited to
+half the free space reported by the temporary-file filesystem. The file grows
+only as pages are cached. Callers can instead set a fixed cap, including zero to
+disable it. Filesystem-aligned slots and an in-memory page index/LRU support
+reads from active pages, then this plaintext cache, then compressed frames.
+Writes invalidate the old cached page immediately and attempt to hole-punch its
+slot; punching is best-effort only.
+Unsupported/failed punches leave the rest of the cache intact and slots remain
+reusable. Active writes stay in the authoritative active file, separate from
+this disposable cache. The OS may cache file data; dictionary training and
+transient decoding still use RAM.
+GC traces the current manifest, named offline roots and reader leases.
+Named roots pin a logical hash and endpoint txid, not a physical manifest file.
+They resolve through the widest validated rollup ending at that same hash; a
+newer endpoint cannot substitute merely because its txid range overlaps. GC keeps
+the chosen representation and its dependencies, and may delete superseded
+narrower files after their physical readers close. Creating a pin writes only a
+small retained-root index delta, not a copy of the resolved page map.
+Dropping a named-pin handle does **not** release its persistent root.
+Wholly unreachable blobs need no copying; dead extents remain until the whole
+blob is collectible. Explicit byte-budgeted relocation can group compatible
+packs while exact reader leases retain old blobs. Missing/corrupt retained metadata
+blocks destructive collection. Routine deletion is budgeted; bounded repacking
+selects at most one pack below 50% live occupancy and at most 64 MiB of decoded
+input and skipping packs retained by forks. `compact()` requires an explicitly
+flushed head and merges its metadata LSM
+runs into an equivalent checkpoint;
+it never reads frame payloads, decompresses them, or rewrites payload packs. `maintain()` is the
+separate bounded operation that can rewrite partially live payload.
+Compression/layout choices are made when payload packs are first sealed or when
+that bounded payload maintenance is justified by reclaimable garbage.
+Use `convert_to_zsqlite_with_policy()` to select the intended layout and compression
+when importing a SQLite file, without a second compression pass.
 
-## Dictionaries and compaction
+## Configured storage and lazy opening
 
-The live generation has no compressed frames or dictionary. At seal, zsqlite
-samples up to 8 MiB from its changed raw page records, trains one 64 KiB
-dictionary when at least 256 pages and 1 MiB are available, and compresses those
-pages into the staged segment. A page remains raw when dictionary compression
-would not save at least 64 bytes. Zero pages lose their entry in the
-authoritative ending map and therefore need no stored payload. Dictionary
-selectors address the cumulative dictionary set inherited through the segment
-lineage. Small delta segments reuse the newest inherited dictionary without
-copying its bytes into each segment; a segment header stores only newly trained
-dictionaries.
+The host can provide any `Arc<dyn StorageBackend>` and register a named VFS:
 
-Compaction resolves the current page map and rewrites one complete compressed
-base segment, allowing older incremental segments to be collected after their
-reader leases end.
+```rust,no_run
+use std::sync::Arc;
+use zsqlite::{FilesystemBackend, Storage};
+let storage = Storage::new(
+    Arc::new(FilesystemBackend::open("sealed-storage")?),
+    "local-coordination",
+)?;
+# #[cfg(feature = "static")]
+storage.register_vfs("archive")?;
+// Now SQLite opens file:local.db?vfs=archive normally.
+// A missing pagefile restores the latest finalized seal lazily.
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The adapter owns all sealed data and metadata. Active changes, the existing
+extracted-page cache, SQLite WAL/journals and filesystem coordination stay local.
+The filesystem layout above is the default backend; custom adapters do not need
+local sealed objects. All processes share the namespace's coordination directory;
+each named head has its own writable pagefile and local locks. A separate named VFS can configure another source;
+callers do not pass a data source on each open.
+
+`storage.bootstrap(destination)` explicitly restores the finalized sealed head
+and returns a `Database`; `inspect()` exposes the restored logical endpoint.
+Bootstrap starts with a 12 KiB active pagefile and an empty extracted-page cache.
+It reads authenticated metadata, dictionaries and the SQLite header frame, then
+fetches other frames on demand. It rejects existing destinations and open local
+instances, and fences superseded pagefiles with a fresh attachment token.
+Unsealed pagefile changes and transactions remaining only in WAL are outside
+this recovery boundary. There is no S3 adapter, compressed-object cache, automatic
+offloading, or self-contained read-only bundle implementation.
+
+`storage.fork("experiment")` creates an independent writable head sharing the
+source's latest finalized seal. Register the returned handle under a separate
+VFS name and open a new local path normally. `storage.head("experiment")` selects
+it in another process. Each head has its own attachment and pending/finalized
+seal; GC protects all heads. Removing a closed fork with `remove_head()` fences
+its old pagefiles and allows unreferenced objects to be collected.
+
+Content and lineage hashes are computed at sealing, not on each mutable
+publication. Packs derive identity from ordered frame IDs and layout metadata;
+blobs derive identity from ordered pack extents. Adapter-owned staged writers
+stream payloads and finalize under the completed key. Filesystem finalization
+installs the same temporary file without copying it. Objects have no 512 MiB cap;
+read, decoding, and metadata budgets remain bounded.
 
 ## Rust API
 
@@ -135,6 +207,10 @@ let info = zsqlite::inspect("app.db")?;
 zsqlite::verify("app.db")?;
 zsqlite::flush("app.db")?;
 zsqlite::compact("app.db")?;
+let pin = zsqlite::retain("app.db", zsqlite::RetentionName::new("offline-fork")?)?;
+let report = zsqlite::collect("app.db", 0)?; // inspect without deleting
+zsqlite::release_retention("app.db", pin)?;  // explicit durable-root release
+let work = zsqlite::maintain("app.db")?;     // one bounded repack
 
 zsqlite::convert_to_zsqlite("legacy.db", "app.db")?;
 zsqlite::export_to_sqlite("app.db", "restored.db")?;
@@ -145,15 +221,17 @@ zsqlite::export_to_sqlite("app.db", "restored.db")?;
 A raw bundle copy is not a SQLite online backup. In WAL mode, acknowledged SQL
 transactions can exist only in the host `-wal` file while the `.db.zsqlite` active
 still names an older main image. Copy a closed or coordinately checkpointed
-database, or use SQLite's online-backup protocol. The notice, active segment,
+database, or use SQLite's online-backup protocol. The notice, active pagefile,
 sidecar directory, and any live SQLite auxiliary files must be captured from
 one pinned point in time; `database.db` by itself contains no application data.
 
 `configure()` persists settle, maximum-staleness, target segment size, and
-dictionary sizing policy. Active generations seal at a configured byte target,
+dictionary sizing policy. Active files seal at a configured byte target,
 on either time trigger, or on an explicit `flush`. Defaults are a 5 minute
-settle interval, 1 hour maximum active age, no byte target, 64 KiB dictionaries,
-and an 8 MiB sample budget.
+settle interval, 1 hour maximum active age, no byte target, a 768 KiB dictionary
+ceiling, and a 96 MiB sample budget. Existing bundles retain their persisted
+limits until reconfigured. The reservoir is advisory and stored compressed;
+training and serialization use additional transient memory beyond the sample budget.
 
 ## CLI
 
@@ -165,6 +243,9 @@ zsqlite compact database.db
 zsqlite convert legacy.db database.db
 zsqlite export database.db restored.db
 ```
+
+The optional ZIM importer is a separate local experiment under
+`experiments/zim-import`, not a dependency of the library or CLI.
 
 ## Performance checks
 
@@ -183,13 +264,68 @@ cache profiles. `--rows`, `--reads`, `--updates`, `--payload-bytes`,
 `--page-size`, and `--samples` control workload size. The report includes
 SQLite's post-warmup page-cache usage, hit/miss, write, and spill counters.
 
-The separate dictionary experiment accepts an ordinary, checkpointed SQLite
-database and compares 64 KiB frames with per-page frames with and without a
-shared dictionary:
+The frame-layout benchmark exports every profile byte-for-byte and measures
+read amplification and fork-retained churn. It keeps inputs and CSV reports in
+its printed scratch directory. `--source` requires a closed ordinary SQLite snapshot.
 
 ```sh
-cargo bench --bench page_dictionary -- test.db
+cargo bench --no-default-features --features static --bench frame_layout -- --source snapshot.sqlite
+cargo bench --no-default-features --features static --bench frame_layout -- --churn --skip-reads
 ```
+
+For application reads, prepare bundles **without page probes**, then run seeded
+parameterized point/range reads through every usable primary/rowid/secondary
+index on every ordinary application table, plus FTS virtual-index searches:
+
+```sh
+cargo bench --no-default-features --features static --bench frame_layout -- --source snapshot.sqlite --build-only
+cargo bench --no-default-features --features static --bench transcript_queries -- --bundles /path/printed/by/first/command
+```
+
+The query benchmark discovers the schema, excludes SQLite/FTS shadow tables,
+reports empty/NULL-only/unsupported access paths, and fails if an ordinary
+indexed case devolves to a full scan. It validates every result against native
+SQLite, records query plans, and runs three fresh-process shuffled streams per
+layout. Every case gets a `stream-first` execution followed immediately by an
+`immediate-repeat`; only the first query in each stream follows connection
+startup. Connection-open latency is reported separately. Every profile uses a
+10 MiB SQLite RAM page cache; managed profiles also get a 256 MiB disk page cache.
+“Cold” does not flush the OS cache. Use `--sqlite-cache-mib` for the shared RAM
+pager budget and `--page-cache-mib` for the separate VFS disk budget
+(`--frame-cache-mib` remains an alias). Use `--profiles`, `--repeats`, and
+`--random-samples` for paired experiments. Start from fresh
+`frame_layout --build-only` bundles for each run.
+Default profiles stop at 4 MiB.
+The historical measurements used a RAM frame cache; current runs use a disk
+page cache, so compare new runs with each other rather than those old timings.
+
+Run the indexed-read, mutation, retained-root, and GC sequence
+against a closed transcript snapshot:
+
+```sh
+cargo bench --offline --no-default-features --features static --bench transcript_replay -- \
+  --source /path/to/closed-transcripts.sqlite
+```
+
+For the current V1 transcript schema this converts the complete snapshot into
+private native/page/64-KiB/1-MiB copies. It repeatedly reads every
+ordinary application table through real PK/rowid/secondary indexes and FTS,
+using one connection per seeded round rather than one per case. Four final-read
+phases and three rounds therefore open 12 connections per profile while still
+recording two executions of every case in every round and phase.
+The harness then deterministically mutates and exactly restores bounded rows from
+`session`, event, message, tool, agent-work, and conversation tables. The
+mutations churn populated ordinary/partial indexes and trigger-maintained FTS
+indexes without changing keys or foreign-key columns. Eight churn seals are
+followed by a metadata rollup and four retained-root GC-evaluation seals. The
+report covers page/frame/pack occupancy before and after root release,
+bounded/full GC, and final rollup. Use `--preflight` for a read-only bounded
+schema/target check plus one-key-per-index workload and query-plan validation;
+the sampled native queries are also executed. `fts5vocab` metadata is excluded
+from base FTS searches, and vocabulary terms are phrase-escaped before binding.
+Use `--mutation-rows` to set rows per mutation family. The legacy
+`rec/raw/ft/sess/dim` incremental replay remains supported. See
+[methodology and output](docs/transcript-replay.md).
 
 ## Validation
 
