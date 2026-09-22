@@ -1,0 +1,5 @@
+# Android cross-compile target. `renameat2` (src/fs.rs) is a bionic API-30 symbol, so the android
+# build must target platform >= 30; we pin 31 to match the tkos app's minSdk. cargo-ndk reads this,
+# so `cargo ndk -t arm64-v8a build` uses API 31 without a manual `-P 31`.
+[env]
+CARGO_NDK_PLATFORM = "31"
