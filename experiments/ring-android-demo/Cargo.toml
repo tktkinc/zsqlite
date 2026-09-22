@@ -1,0 +1,30 @@
+# A standalone spike: prove a `ring` (AES-256-GCM) encrypting StorageBackend works over zsqlite's
+# VFS, on the phone. Not part of the zsqlite library or workspace (empty [workspace] keeps it out of
+# any parent graph). Built for android with `cargo ndk -t arm64-v8a -P 31 build --release`, pushed to
+# /data/local/tmp, and run there.
+[package]
+name = "ring-android-demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "ring-android-demo"
+path = "src/main.rs"
+
+[dependencies]
+# The `static` feature bundles SQLite and enables `register_vfs`; default `loadable` is the opposite
+# build, so turn defaults off.
+zsqlite = { path = "../..", default-features = false, features = ["static"] }
+# The SAME libsqlite3-sys zsqlite's `static` pulls, so cargo unifies to one bundled sqlite3; used here
+# only for the raw open/exec FFI to drive SQL through the VFS.
+libsqlite3-sys = { version = "0.38", features = ["bundled"] }
+ring = "0.17"
+blake3 = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

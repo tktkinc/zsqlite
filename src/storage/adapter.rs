@@ -286,6 +286,13 @@ impl FilesystemBackend {
             match std::fs::hard_link(temporary.path(), &identity_path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // Android denies `link` (see the object-install site); fall back to rename, guarded so
+                // a first writer wins rather than clobbering an identity another writer just installed.
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    if !identity_path.exists() {
+                        std::fs::rename(temporary.path(), &identity_path)?;
+                    }
+                }
                 Err(error) => return Err(error.into()),
             }
             sync_dir(&root).map_err(storage_io)?;
@@ -349,6 +356,16 @@ impl ObjectWriter for FilesystemWriter<'_> {
         super::faults::check(super::faults::Point::ObjectDataSynced)?;
         match std::fs::hard_link(staging.path(), self.backend.object_path(key)) {
             Ok(()) => {}
+            // SELinux on Android denies `link` for app domains (`getenforce` = Enforcing), so hard-link
+            // fails with EPERM/EACCES on the phone. Install by atomic `rename` instead: the object is
+            // content-addressed and immutable, so replacing it with identical bytes is safe, and rename
+            // is atomic on the same filesystem. Non-Android hosts keep the hard-link + de-dup path.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                staging.as_file().sync_all()?;
+                std::fs::rename(staging.path(), self.backend.object_path(key))?;
+                sync_dir(&self.backend.root.join("objects")).map_err(storage_io)?;
+                return Ok(());
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let file = std::fs::File::open(self.backend.object_path(key))?;
                 if file.metadata()?.len() != length.get() {
