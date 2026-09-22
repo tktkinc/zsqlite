@@ -390,7 +390,9 @@ pub(crate) fn install_pagefile(
             source.as_ptr(),
             libc::AT_FDCWD,
             destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            // `RENAME_NOREPLACE` is typed `i32` in Android's libc but `u32` in glibc; cast so the
+            // `renameat2` flags argument matches on both.
+            libc::RENAME_NOREPLACE as u32,
         )
     };
     if result != 0 {
