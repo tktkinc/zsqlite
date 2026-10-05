@@ -133,7 +133,7 @@ fn pin_current(fixture: &Fixture) -> Result<super::PinnedView, StoreError> {
 }
 
 fn assert_reader(reader: &super::PinnedView, expected: &[u8]) -> TestResult {
-    for (index, bytes) in expected.chunks_exact(PAGE_BYTES).enumerate() {
+    for (index, bytes) in expected.as_chunks::<PAGE_BYTES>().0.iter().enumerate() {
         let number = PageNumber::new(u32::try_from(index + 1)?)?;
         assert_eq!(reader.resolve(number)?.read()?, bytes);
     }
@@ -451,7 +451,13 @@ fn current_view_reader_retains_source_blobs_until_its_lease_ends() -> TestResult
     for blob in &blobs {
         assert!(fixture.backend.stat(*blob)?.is_some());
     }
-    for (index, expected) in fixture.expected.chunks_exact(PAGE_BYTES).enumerate() {
+    for (index, expected) in fixture
+        .expected
+        .as_chunks::<PAGE_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let page = PageNumber::new(u32::try_from(index + 1)?)?;
         assert_eq!(reader.resolve(page)?.read()?, expected);
     }

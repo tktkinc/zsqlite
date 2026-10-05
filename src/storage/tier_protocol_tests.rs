@@ -616,7 +616,7 @@ fn lagging_remote_root_and_remote_readers_survive_local_repack_and_collection() 
     for key in &old_blobs {
         assert!(remote.backend.stat(*key)?.is_some());
     }
-    for (index, expected) in old_bytes.chunks_exact(4096).enumerate() {
+    for (index, expected) in old_bytes.as_chunks::<4096>().0.iter().enumerate() {
         assert_eq!(
             reader
                 .resolve(PageNumber::new(u32::try_from(index + 1)?)?)?
