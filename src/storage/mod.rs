@@ -33,6 +33,7 @@ mod repack;
 mod retention;
 mod samples;
 mod seal;
+pub(crate) mod seed;
 mod segment;
 mod view;
 pub(crate) mod wire;

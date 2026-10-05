@@ -184,6 +184,22 @@ layout. Failed training/scoring/persistence does not prevent sealing.
 
 The preferred pool retains up to four dictionaries, including a general fallback.
 Old frames and fork pins retain additional required dictionaries independently.
+
+`create_with_dictionary_from(path, related)` creates an empty database whose
+first seal adopts one related database's preferred dictionary as that fallback.
+Related reservoirs are stored in digest order, so the lowest digests of their
+union form one bounded 8 MiB sample; each file is read only up to that cutoff
+and that prefix is structurally validated, not hash-verified. Each candidate is
+scored on pages some non-holder contributed, because its holder may have trained
+it on the rest. Every candidate is screened on a 1 MiB digest prefix; four
+finalists are scored on the whole sample. The estimate scales payload to the
+median related logical size and charges the dictionary once; adoption requires
+the same 5% improvement over plain Zstandard. The chosen bytes are recorded as an
+advisory `dictionary.seed`. A first seal installs them only if they still decode
+and encode; later seals delete the record. Later trained candidates must beat
+the seed and never evict it. Each related head is pinned briefly under its
+catalog lock. Dictionaries contain verbatim sample bytes, so only relate
+databases within one trust boundary.
 Immutable dictionary objects up to 768 KiB are accepted by both readers and GC;
 new dictionaries never reinterpret old frames. Compression contexts are reused
 within each seal without making frames depend on one another. Pinned views keep

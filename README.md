@@ -36,6 +36,7 @@ database.db.zsqlite.d/
   object-readers/<logical-object>      exact reader metadata dependencies
   physical-readers/<blob-or-index>     exact placement/blob leases
   dictionary.samples                 advisory bounded sample reservoir
+  dictionary.seed                    related dictionary awaiting the first seal
   locks/{publication,catalog,lifecycle,sqlite}.lock
 ```
 
@@ -119,6 +120,9 @@ Up to four preferred dictionaries are carried
 forward, including a fallback; live frames retain any additional dictionaries
 they require. Tiny seals can reuse dictionaries without copying them into
 each pack. Training failure is advisory. Compression competes with raw storage.
+`create_with_dictionary_from(path, related)` starts a database with the related
+databases' best dictionary, scored on their samples excluding each candidate's
+own pages; see [storage](docs/storage.md).
 
 Page frames at Zstandard level 3 remain the default baseline. Validated policy
 types enable page-sized or fixed 512-byte–8-MiB frames, plus explicit pack,

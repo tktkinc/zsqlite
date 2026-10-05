@@ -14,7 +14,7 @@ pub mod storage;
 mod store;
 mod vfs;
 
-pub use dictionary::DictionaryPolicy;
+pub use dictionary::{DictionaryPolicy, DictionarySeed};
 pub use storage::{
     Database, DurablePin, FilesystemBackend, GcReport, MaintenanceReport, MemoryBackend,
     PinnedView, RetentionName, Storage, StorageBackend,
@@ -138,6 +138,38 @@ pub fn configure(path: impl AsRef<Path>, policy: StoragePolicy) -> Result<Inspec
     database.release_maintenance();
     result?;
     database.inspect()
+}
+
+/// Creates an empty database whose first seal adopts the best preferred
+/// dictionary among related databases, such as others with the same schema.
+/// Candidates are scored on the related sample reservoirs, excluding pages only
+/// their holders contributed, and charged their own size against the related
+/// databases' median logical size. The seed takes the fallback slot that later
+/// trained dictionaries never evict. Unreadable related paths are skipped.
+/// Each related catalog is locked briefly; cost grows with their dictionaries.
+pub fn create_with_dictionary_from<P: AsRef<Path>>(
+    path: impl AsRef<Path>,
+    related: impl IntoIterator<Item = P>,
+) -> Result<DictionarySeed, StoreError> {
+    let logical = absolute_path(path.as_ref())?;
+    let path = facade::storage_path(&logical);
+    if path != logical && logical.exists() {
+        return Err(StoreError::DestinationExists(logical));
+    }
+    ensure_bundle_absent(&path)?;
+    let related = related
+        .into_iter()
+        .map(|related| Ok(facade::storage_path(&absolute_path(related.as_ref())?)))
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    let (seed, report) = storage::seed::choose(&related, layout::LayoutPolicy::default().level());
+    let store = store::Store::open(&path, true)?;
+    facade::ensure_notice(&path)?;
+    if let Some((_, bytes)) = seed {
+        let catalog = storage::Catalog::open(&backend::sidecar_dir(&path), false)?;
+        storage::seed::record(&catalog.lock()?, &bytes)?;
+    }
+    drop(store);
+    Ok(report)
 }
 
 /// Converts a closed ordinary `SQLite` database using the default storage policy.
