@@ -2300,8 +2300,22 @@ fn reject_aliased_active(_file: &File) -> Result<(), StoreError> {
 }
 
 pub(crate) fn reject_auxiliary_files(path: &Path) -> Result<(), StoreError> {
-    let mut auxiliary = Vec::with_capacity(5);
-    for suffix in ["-journal", "-wal", "-shm"] {
+    // SQLite writes a rollback journal header zeroed and adds its magic when it
+    // syncs the journal, before changing the database. Like SQLite's hot-journal
+    // check, a zero first byte means a crashed writer left the database intact.
+    let mut journal = path.as_os_str().to_os_string();
+    journal.push("-journal");
+    let mut first = [0_u8; 1];
+    match File::open(PathBuf::from(journal)) {
+        Ok(file) if read_exact_at(&file, 0, &mut first).is_ok() && first[0] != 0 => {
+            return Err(StoreError::Busy);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut auxiliary = Vec::with_capacity(4);
+    for suffix in ["-wal", "-shm"] {
         let mut name = path.as_os_str().to_os_string();
         name.push(suffix);
         auxiliary.push(PathBuf::from(name));
@@ -3009,6 +3023,33 @@ mod tests {
         reopened.read_at(0, &mut actual)?;
         assert_eq!(actual, working);
         reopened.verify()?;
+        Ok(())
+    }
+
+    #[test]
+    fn only_hot_rollback_journals_are_busy() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("journal.zsqlite");
+        let journal = directory.path().join("journal.zsqlite-journal");
+        reject_auxiliary_files(&path)?;
+        std::fs::write(&journal, [])?;
+        reject_auxiliary_files(&path)?;
+        // A writer killed before its first journal sync leaves a zeroed header.
+        std::fs::write(&journal, vec![0; 4096 + 4])?;
+        reject_auxiliary_files(&path)?;
+        let mut hot = vec![0; 4096];
+        hot[..8].copy_from_slice(&[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]);
+        std::fs::write(&journal, hot)?;
+        assert!(matches!(
+            reject_auxiliary_files(&path),
+            Err(StoreError::Busy)
+        ));
+        std::fs::remove_file(&journal)?;
+        std::fs::write(directory.path().join("journal.zsqlite-wal"), [1])?;
+        assert!(matches!(
+            reject_auxiliary_files(&path),
+            Err(StoreError::Busy)
+        ));
         Ok(())
     }
 }
