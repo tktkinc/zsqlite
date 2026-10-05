@@ -140,6 +140,17 @@ pub fn configure(path: impl AsRef<Path>, policy: StoragePolicy) -> Result<Inspec
     database.inspect()
 }
 
+/// Selects the directory for decoded-page cache files created after this call;
+/// `None` restores the default, `std::env::temp_dir()`. Android app processes
+/// should pass their cache directory: without `TMPDIR` the default is the
+/// unwritable `/data/local/tmp`, which silently disables caching. Cache files
+/// remain private and unlinked, and existing caches keep their files. Call this
+/// before opening databases, for example before registering the VFS. Returns an
+/// error, leaving the setting unchanged, if no cache file can be created there.
+pub fn set_page_cache_directory(directory: Option<&Path>) -> Result<(), StoreError> {
+    fs::set_page_cache_directory(directory)
+}
+
 /// Creates an empty database whose first seal adopts the best preferred
 /// dictionary among related databases, such as others with the same schema.
 /// Candidates are scored on the related sample reservoirs, excluding pages only

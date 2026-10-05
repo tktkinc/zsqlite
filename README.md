@@ -134,7 +134,9 @@ types enable page-sized or fixed 512-byte–8-MiB frames, plus explicit pack,
 cache, codec, and maintenance limits.
 
 Decoded pages are cached in a private, unlinked temporary file, not retained as
-RAM frames. By default its cap is 20% of the database's logical size, limited to
+RAM frames. `set_page_cache_directory(Some(dir))` moves new cache files out of
+`std::env::temp_dir()`; Android apps should pass their cache directory. By default
+its cap is 20% of the database's logical size, limited to
 half the free space reported by the temporary-file filesystem. The file grows
 only as pages are cached. Callers can instead set a fixed cap, including zero to
 disable it. Filesystem-aligned slots and an in-memory page index/LRU support
