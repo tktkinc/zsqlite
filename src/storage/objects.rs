@@ -142,8 +142,12 @@ pub(super) struct AuthenticatedSegment {
     length: StoredBytes,
 }
 impl AuthenticatedSegment {
+    #[cfg(test)]
     pub(super) fn container(&self) -> &super::segment::Container {
         &self.container
+    }
+    pub(super) fn into_container(self) -> super::segment::Container {
+        self.container
     }
 }
 
@@ -441,7 +445,7 @@ impl CatalogGuard {
         let bytes =
             super::catalog::read_all(self.storage.backend(), PhysicalKey::Manifest(id), limit)?;
         let length = bytes.len() as u64;
-        let container = super::segment::read_bytes(&bytes)?;
+        let container = super::segment::read_bytes(bytes)?;
         if container.id != id {
             return Err(StoreError::Corrupt(0));
         }

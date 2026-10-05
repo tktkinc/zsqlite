@@ -1,4 +1,6 @@
 /target/
+/web/dist/
+/web/node_modules/
 /test-dbs/
 /.agents/
 /.codex/

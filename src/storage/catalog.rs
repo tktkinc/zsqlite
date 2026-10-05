@@ -36,7 +36,14 @@ pub(super) fn read_all(
     let mut bytes = Vec::with_capacity(length.as_usize()?);
     let mut offset = 0;
     while offset < length.get() {
-        let count = (length.get() - offset).min(super::adapter::MAX_BATCH_BYTES);
+        // Bound HTTP response and bridge buffers independently of the manifest
+        // size. Mobile browsers otherwise retain several 64 MiB copies at once.
+        let chunk = if cfg!(target_os = "emscripten") {
+            4 * 1024 * 1024
+        } else {
+            super::adapter::MAX_BATCH_BYTES
+        };
+        let count = (length.get() - offset).min(chunk);
         bytes.extend(read_range(
             backend,
             key,

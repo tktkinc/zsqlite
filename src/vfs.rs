@@ -22,6 +22,9 @@ use std::ptr::{self, null, null_mut};
 use std::slice;
 use std::sync::Mutex;
 
+#[cfg(feature = "static")]
+pub(crate) mod readonly;
+
 const VFS_NAME: &[u8] = b"zsqlite\0";
 static REGISTRATION_LOCK: Mutex<()> = Mutex::new(());
 
