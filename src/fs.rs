@@ -204,7 +204,7 @@ pub(crate) struct ExclusiveLock {
 
 #[derive(Debug)]
 pub(crate) struct SharedLock {
-    _file: File,
+    file: File,
 }
 
 impl ExclusiveLock {
@@ -246,7 +246,15 @@ impl SharedLock {
     pub(crate) fn acquire(path: &Path) -> Result<Self, StoreError> {
         let file = lock_file(path)?;
         lock_shared(&file, false)?;
-        Ok(Self { _file: file })
+        Ok(Self { file })
+    }
+}
+
+impl Drop for SharedLock {
+    fn drop(&mut self) {
+        // A forked child may retain this open-file description until exec.
+        // End this owner's lease now, independent of those inherited fds.
+        let _ = unlock_file(&self.file);
     }
 }
 
@@ -584,6 +592,46 @@ pub(crate) fn install_pagefile(
         .persist_noclobber(destination)
         .map(drop)
         .map_err(|error| error.error)
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn shared_lease_ends_even_if_an_inherited_descriptor_stays_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lease.lock");
+        let lease = SharedLock::acquire(&path)?;
+        // dup and fork share the same open-file description. A child can keep
+        // it alive between fork and exec despite the close-on-exec flag.
+        let inherited = lease.file.try_clone()?;
+        drop(lease);
+        let exclusive = ExclusiveLock::acquire(&path, true)?;
+        drop(exclusive);
+        drop(inherited);
+        Ok(())
+    }
+
+    #[test]
+    fn independent_readers_keep_their_own_leases() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("readers.lock");
+        let first = SharedLock::acquire(&path)?;
+        let inherited = first.file.try_clone()?;
+        let second = SharedLock::acquire(&path)?;
+        drop(first);
+        assert!(matches!(
+            ExclusiveLock::acquire(&path, true),
+            Err(StoreError::Busy)
+        ));
+        drop(second);
+        let exclusive = ExclusiveLock::acquire(&path, true)?;
+        drop(exclusive);
+        drop(inherited);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

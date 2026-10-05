@@ -330,7 +330,7 @@ pub(crate) struct Store {
     sidecar_path: PathBuf,
     coordination: LocalCoordination,
     publication: File,
-    _lifecycle: File,
+    lifecycle: File,
     writable: bool,
     publication_owner: PublicationOwner,
     head: HeadState,
@@ -864,7 +864,7 @@ impl Store {
             path,
             coordination,
             publication,
-            _lifecycle: lifecycle,
+            lifecycle,
             writable,
             publication_owner: PublicationOwner::None,
             head: HeadState {
@@ -2732,6 +2732,9 @@ impl Drop for Store {
         if self.publication_owner.is_locked() {
             self.publication_owner = PublicationOwner::None;
         }
+        // Closing alone can leave the shared lease held by a child between
+        // fork and exec. No live Store operation remains once Drop completes.
+        let _ = unlock_file(&self.lifecycle);
     }
 }
 
@@ -2957,6 +2960,23 @@ pub(crate) fn reject_auxiliary_files(path: &Path) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_lifetime_ends_even_if_an_inherited_descriptor_stays_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lifetime.zsqlite");
+        let store = Store::open(&path, true)?;
+        let inherited = store.lifecycle.try_clone()?;
+        drop(store);
+        let exclusive = crate::fs::ExclusiveLock::acquire(
+            &sidecar_dir(&path).join("locks/lifecycle.lock"),
+            true,
+        )?;
+        drop(exclusive);
+        drop(inherited);
+        Ok(())
+    }
 
     fn page(fill: u8, size: u32) -> Vec<u8> {
         let mut page = vec![fill; size as usize];
