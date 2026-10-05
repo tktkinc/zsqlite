@@ -128,6 +128,11 @@ each pack. Training failure is advisory. Compression competes with raw storage.
 `create_with_dictionary_from(path, related)` starts a database with the related
 databases' best dictionary, scored on their samples excluding each candidate's
 own pages; see [storage](docs/storage.md).
+`convert_to_zsqlite_with_dictionary_from(source, destination, policy, related)`
+does the same for a conversion's first seal, charging the dictionary against the
+source's size so small sources skip dictionaries they cannot repay. Convert the
+largest databases of a family first; they train their own dictionaries and then
+seed the smaller ones.
 
 Page frames at Zstandard level 3 remain the default baseline. Validated policy
 types enable page-sized or fixed 512-byte–8-MiB frames, plus explicit pack,
@@ -245,6 +250,12 @@ zsqlite::release_retention("app.db", pin)?;  // explicit durable-root release
 let work = zsqlite::maintain("app.db")?;     // one bounded, batched repack pass
 
 zsqlite::convert_to_zsqlite("legacy.db", "app.db")?;
+let (_info, seed) = zsqlite::convert_to_zsqlite_with_dictionary_from(
+    "legacy-small.db",
+    "small.db",
+    zsqlite::StoragePolicy::default(),
+    ["app.db"],
+)?;
 zsqlite::export_to_sqlite("app.db", "restored.db")?;
 
 # Ok::<(), zsqlite::StoreError>(())

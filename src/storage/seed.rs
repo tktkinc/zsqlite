@@ -194,13 +194,31 @@ impl Pool {
     }
 }
 
+/// The logical size whose projected payload must repay a seed's own bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SeedTarget {
+    /// A new, empty database expected to grow like its related databases.
+    RelatedMedian,
+    /// A database of known logical size, such as a conversion source.
+    Logical(u64),
+}
+
+/// Projected stored bytes with a dictionary, when they beat plain Zstandard's
+/// `baseline` by at least 5% after charging the dictionary itself once. A small
+/// target cannot repay a large dictionary however well it compresses.
+fn adoption_estimate(score: Score, baseline: u128, dictionary_bytes: usize) -> Option<u128> {
+    let estimate = score.payload * baseline / score.plain + dictionary_bytes as u128;
+    (estimate * 100 <= baseline * 95).then_some(estimate)
+}
+
 /// Choose the related dictionary with the lowest estimated stored size for a
-/// database of the related databases' median logical size: projected payload
-/// plus the dictionary itself, at least 5% below plain Zstandard. Every
-/// candidate is screened on a small sample; the best few are scored in full.
+/// database of the target logical size: projected payload plus the dictionary
+/// itself, at least 5% below plain Zstandard. Every candidate is screened on a
+/// small sample; the best few are scored in full.
 pub(crate) fn choose(
     related: &[PathBuf],
     level: i32,
+    target: SeedTarget,
 ) -> (Option<(DictionaryId, Vec<u8>)>, DictionarySeed) {
     let mut report = DictionarySeed {
         dictionary: None,
@@ -275,16 +293,20 @@ pub(crate) fn choose(
         .values()
         .map(|sample| u128::from(sample.plain))
         .sum();
-    let (Some(target), true) = (sizes.get(sizes.len() / 2), raw > 0) else {
+    let target = match target {
+        SeedTarget::RelatedMedian => sizes.get(sizes.len() / 2).copied(),
+        SeedTarget::Logical(bytes) => (!sizes.is_empty()).then_some(bytes),
+    };
+    let (Some(target), true) = (target, raw > 0) else {
         return (None, report);
     };
-    let baseline = plain * u128::from(*target) / raw;
+    let baseline = plain * u128::from(target) / raw;
     let chosen = finalists
         .into_iter()
         .filter_map(|(_, id, bytes)| {
             let score = pool.score(level, &bytes, &holders[&id], usize::MAX)?;
-            let estimate = score.payload * baseline / score.plain + bytes.len() as u128;
-            (estimate * 100 <= baseline * 95).then_some((estimate, id, bytes))
+            let estimate = adoption_estimate(score, baseline, bytes.len())?;
+            Some((estimate, id, bytes))
         })
         .min_by_key(|(estimate, id, _)| (*estimate, *id))
         .map(|(_, id, bytes)| (id, bytes));
@@ -426,6 +448,134 @@ mod tests {
             record(&catalog.lock()?, b"late"),
             Err(StoreError::InvalidConfiguration(_))
         ));
+        Ok(())
+    }
+
+    /// An ordinary `SQLite` file holding these pages; returns its bytes.
+    fn sqlite_file(path: &Path, pages: &[Vec<u8>]) -> Result<Vec<u8>, std::io::Error> {
+        let mut image = pages.concat();
+        image[..16].copy_from_slice(b"SQLite format 3\0");
+        image[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        image[18] = 1;
+        image[19] = 1;
+        image[21..24].copy_from_slice(&[64, 32, 32]);
+        std::fs::write(path, &image)?;
+        Ok(image)
+    }
+
+    fn related_family(
+        directory: &Path,
+        state: &mut u64,
+    ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+        let common = random(state, 3072);
+        let related: Vec<_> = (0..3)
+            .map(|index| directory.join(format!("related-{index}.zsqlite")))
+            .collect();
+        for path in &related {
+            database(path, &family(&common, state, 320))?;
+        }
+        Ok(related)
+    }
+
+    #[test]
+    fn adoption_charges_the_dictionary_against_the_target_size() {
+        // A dictionary that removes 70% of the payload still costs 768 KiB once.
+        let score = Score {
+            payload: 30,
+            plain: 100,
+        };
+        let dictionary = 768 * 1024;
+        let small = 64 * 1024;
+        assert_eq!(adoption_estimate(score, small, dictionary), None);
+        let large = 64 * 1024 * 1024;
+        assert_eq!(
+            adoption_estimate(score, large, dictionary),
+            Some(large * 3 / 10 + 768 * 1024)
+        );
+        // Break-even needs the savings to cover the dictionary plus 5%.
+        let break_even = 768 * 1024 * 100 / 65;
+        assert!(adoption_estimate(score, break_even + 1, dictionary).is_some());
+        assert!(adoption_estimate(score, break_even - 1024, dictionary).is_none());
+    }
+
+    #[test]
+    fn a_tiny_target_rejects_a_dictionary_a_large_target_adopts() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let related = related_family(directory.path(), &mut 31)?;
+        let (tiny, report) = choose(&related, 3, SeedTarget::Logical(4096));
+        assert!(tiny.is_none(), "one page cannot repay the dictionary");
+        assert_eq!((report.related, report.candidates), (3, 3));
+        let (large, _) = choose(&related, 3, SeedTarget::Logical(64 * 1024 * 1024));
+        let (median, _) = choose(&related, 3, SeedTarget::RelatedMedian);
+        let (id, bytes) = large.ok_or("a large target adopts the dictionary")?;
+        assert!(bytes.len() > 4096);
+        assert_eq!(median.map(|(id, _)| id), Some(id));
+        Ok(())
+    }
+
+    #[test]
+    fn seeded_conversion_adopts_a_related_dictionary_on_its_first_seal() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = |name: &str| directory.path().join(name);
+        let storage = |name: &str| crate::facade::storage_path(&path(name));
+        let mut state = 29;
+        let common = random(&mut state, 3072);
+        // The largest database of the family converts first and trains its own
+        // dictionary from its samples.
+        sqlite_file(&path("large.sqlite"), &family(&common, &mut state, 320))?;
+        crate::convert_to_zsqlite(path("large.sqlite"), path("large.db"))?;
+        let trained = preferred(&storage("large.db"))?;
+        assert!(!trained.is_empty(), "the large conversion trained");
+
+        let small = sqlite_file(&path("small.sqlite"), &family(&common, &mut state, 8))?;
+        crate::create_with_dictionary_from(path("unsealed.db"), std::iter::empty::<PathBuf>())?;
+        // An unsealed database, an ordinary SQLite file and a missing path are
+        // skipped; the source and destination are excluded.
+        let related = [
+            "large.db",
+            "unsealed.db",
+            "large.sqlite",
+            "missing.db",
+            "small.sqlite",
+            "small.db",
+        ]
+        .map(path);
+        let policy = crate::StoragePolicy::default();
+        let (info, report) = crate::convert_to_zsqlite_with_dictionary_from(
+            path("small.sqlite"),
+            path("small.db"),
+            policy,
+            &related,
+        )?;
+        assert_eq!((report.related, report.skipped), (1, 3));
+        let id = report.dictionary.ok_or("no seed chosen")?;
+        assert!(trained.contains(&id));
+        assert_eq!(preferred(&storage("small.db"))?, [id]);
+        assert!(
+            info.frame_distribution
+                .iter()
+                .any(|bin| bin.dictionary_frames > 0)
+        );
+        crate::export_to_sqlite(path("small.db"), path("small-export.sqlite"))?;
+        assert_eq!(std::fs::read(path("small-export.sqlite"))?, small);
+
+        let unseeded = crate::convert_to_zsqlite(path("small.sqlite"), path("unseeded.db"))?;
+        assert_eq!(unseeded.preferred_dictionaries, 0);
+        // Including its own copy of the dictionary, the seeded bundle is smaller.
+        assert!(info.sealed_object_bytes < unseeded.sealed_object_bytes);
+
+        // The source's own length is the target: one page cannot repay it.
+        let tiny = sqlite_file(&path("tiny.sqlite"), &family(&common, &mut state, 1))?;
+        let (info, report) = crate::convert_to_zsqlite_with_dictionary_from(
+            path("tiny.sqlite"),
+            path("tiny.db"),
+            policy,
+            [path("large.db")],
+        )?;
+        assert_eq!((report.related, report.dictionary), (1, None));
+        assert_eq!(info.preferred_dictionaries, 0);
+        crate::export_to_sqlite(path("tiny.db"), path("tiny-export.sqlite"))?;
+        assert_eq!(std::fs::read(path("tiny-export.sqlite"))?, tiny);
         Ok(())
     }
 
