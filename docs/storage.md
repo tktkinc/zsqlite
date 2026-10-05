@@ -126,7 +126,10 @@ smaller than the SQLite page size. The pack target is soft because the last fram
 may cross it. Metadata remains independently bounded.
 
 The plaintext page cache uses a private, unlinked temporary file per Store (the
-VFS shares a Store per process/database). Lookup/LRU metadata remains in RAM;
+VFS shares a Store per process/database). It is created in `std::env::temp_dir()`
+unless the host calls `set_page_cache_directory()` first. Android app processes
+must do so, because without `TMPDIR` the default is the unwritable
+`/data/local/tmp` and every cache would be silently disabled. Lookup/LRU metadata remains in RAM;
 decoded frame payloads do not. Reads check authoritative raw/zero overrides
 first, then page-number cache entries bound to the pinned manifest, before
 resolving a compressed frame. Misses verify the frame and cache only live slots

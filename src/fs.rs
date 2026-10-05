@@ -10,16 +10,59 @@ pub(crate) struct CacheFile {
     block: std::num::NonZeroU64,
     available: Option<u64>,
 }
+/// Host-selected directory for new cache files; `None` uses `std::env::temp_dir()`.
+static PAGE_CACHE_DIRECTORY: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Select where later cache files are created. A probe file is created and
+/// dropped first, so an unusable directory fails here rather than silently
+/// disabling every database's cache at its first sealed read.
+pub(crate) fn set_page_cache_directory(directory: Option<&Path>) -> Result<(), StoreError> {
+    let directory = directory.map(absolute_path).transpose()?;
+    if let Some(directory) = &directory {
+        drop(private_unlinked_file(Some(directory))?);
+    }
+    *PAGE_CACHE_DIRECTORY
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = directory;
+    Ok(())
+}
+
+/// A private file with no name: unlinked at creation (or created without one),
+/// so its decoded pages vanish with the descriptor, even after a crash.
+fn private_unlinked_file(directory: Option<&Path>) -> std::io::Result<File> {
+    #[cfg(test)]
+    LAST_CACHE_DIRECTORY.with(|last| last.replace(directory.map(Path::to_path_buf)));
+    let file = match directory {
+        Some(directory) => tempfile::tempfile_in(directory)?,
+        None => tempfile::tempfile()?,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Unnamed temporary files can inherit a broader mode on Linux.
+        // Restrict access before storing any decoded database pages.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The configured directory of this thread's latest cache-file creation.
+    static LAST_CACHE_DIRECTORY: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl CacheFile {
     pub(crate) fn new() -> std::io::Result<Self> {
-        let file = tempfile::tempfile()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Unnamed temporary files can inherit a broader mode on Linux.
-            // Restrict access before storing any decoded database pages.
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        let directory = PAGE_CACHE_DIRECTORY
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Self::new_in(directory.as_deref())
+    }
+    fn new_in(directory: Option<&Path>) -> std::io::Result<Self> {
+        let file = private_unlinked_file(directory)?;
         // Block geometry improves slot reclamation, and free space bounds
         // automatic sizing. If either is unavailable, cache I/O still fails
         // safely into normal verified reads.
@@ -604,6 +647,70 @@ mod publish_tests {
 mod cache_tests {
     use super::*;
     use crate::domain::{FileOffset, StoredBytes, StoredRange};
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_files_are_created_in_the_configured_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = tempfile::tempdir()?;
+        let cache = CacheFile::new_in(Some(directory.path()))?;
+        let metadata = cache.metadata()?;
+        assert_eq!(metadata.nlink(), 0);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.dev(), directory.path().metadata()?.dev());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd;
+            let link = std::fs::read_link(format!("/proc/self/fd/{}", cache.file.as_raw_fd()))?;
+            assert!(link.starts_with(directory.path().canonicalize()?));
+        }
+        assert!(std::fs::read_dir(directory.path())?.next().is_none());
+
+        // An unwritable directory is honored, not bypassed for the default,
+        // and the setter rejects it without changing the configuration.
+        let sealed = directory.path().join("sealed");
+        std::fs::create_dir(&sealed)?;
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500))?;
+        if std::fs::write(sealed.join("probe"), b"").is_err() {
+            assert!(CacheFile::new_in(Some(&sealed)).is_err());
+            assert!(set_page_cache_directory(Some(&sealed)).is_err());
+            assert!(
+                PAGE_CACHE_DIRECTORY
+                    .read()
+                    .is_ok_and(|current| current.is_none())
+            );
+        }
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700))?;
+
+        // A configured directory reaches the caches a store creates. Choose the
+        // default location so concurrently running tests are unaffected.
+        let configured = std::env::temp_dir();
+        set_page_cache_directory(Some(&configured))?;
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let path = directory.path().join("cached.zsqlite");
+            let mut store = crate::store::Store::open(&path, true)?;
+            let mut page = vec![7; 4096];
+            page[..16].copy_from_slice(b"SQLite format 3\0");
+            page[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+            // The automatic cap is 20% of the logical size; leave room to cache.
+            store.write_at(0, &page.repeat(64))?;
+            store.publish(true)?;
+            store.flush_sidecars()?;
+            LAST_CACHE_DIRECTORY.with(|last| last.replace(None));
+            let mut read = vec![0; 4096];
+            store.read_at(0, &mut read)?;
+            assert_eq!(read, page);
+            assert_eq!(
+                LAST_CACHE_DIRECTORY.with(|last| last.borrow().clone()),
+                Some(configured.clone())
+            );
+            assert!(store.cache_stats().resident_bytes > 0);
+            Ok(())
+        })();
+        set_page_cache_directory(None)?;
+        result
+    }
 
     #[test]
     fn cache_file_is_private_and_holes_do_not_touch_neighbors()
