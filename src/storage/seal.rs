@@ -163,6 +163,16 @@ pub(super) fn seal_with_copies<'g>(
         }
     }
     let mut dictionary_receipts = Vec::<Durable<'g, Dictionary>>::new();
+    if source.is_some() {
+        super::seed::discard(guard);
+    } else if let Some(seed) = super::seed::load(guard, policy.level())
+        && let Ok(receipt) = install_dictionary(guard, &seed)
+    {
+        // A related database's dictionary becomes the retained general fallback.
+        metadata.preferred.push(receipt.id());
+        dictionaries.insert(receipt.id(), seed);
+        dictionary_receipts.push(receipt);
+    }
     if let crate::dictionary::DictionaryTraining::UpTo(_) = endpoint.dictionary.training() {
         let mut reservoir =
             super::samples::Samples::load(guard, endpoint.dictionary.sample_budget());

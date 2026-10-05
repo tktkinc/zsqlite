@@ -49,6 +49,22 @@ impl SampleBudget {
     }
 }
 
+/// The dictionary a new database adopts from related databases at its first seal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DictionarySeed {
+    /// `None` when no candidate beat plain Zstandard by 5%, including its size.
+    pub dictionary: Option<crate::domain::DictionaryId>,
+    pub dictionary_bytes: usize,
+    /// Related databases with a readable finalized sealed head.
+    pub related: usize,
+    /// Related paths that were missing, unsealed, or unreadable.
+    pub skipped: usize,
+    /// Distinct preferred dictionaries considered.
+    pub candidates: usize,
+    /// Distinct related sample bytes used for scoring.
+    pub sample_bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DictionaryTraining {
     Disabled,
