@@ -10,6 +10,9 @@ permissions:
 jobs:
   browser:
     runs-on: ubuntu-latest
+    env:
+      # rust-toolchain.toml selects stable; use the toolchain with the WASM target.
+      RUSTUP_TOOLCHAIN: 1.94.1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
