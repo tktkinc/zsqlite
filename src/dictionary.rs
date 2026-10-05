@@ -177,16 +177,16 @@ mod tests {
                 .map(|size| size.get())
                 .collect::<Vec<_>>()
         };
-        assert!(sizes(819_199).is_empty());
+        assert_eq!(sizes(819_199), Vec::<u32>::new());
         assert_eq!(sizes(819_200), [8192]);
         assert_eq!(sizes(8 * 1024 * 1024 * 4 / 5), [65536, 32768]);
         assert_eq!(sizes(64 * 1024 * 1024 * 4 / 5), [512 * 1024, 256 * 1024]);
         assert_eq!(sizes(MAX_SAMPLE_BYTES * 4 / 5), [768 * 1024, 512 * 1024]);
-        assert!(
+        assert_eq!(
             DictionaryPolicy::new(0, MAX_SAMPLE_BYTES as u64)
                 .unwrap()
-                .candidates(MAX_SAMPLE_BYTES)
-                .is_empty()
+                .candidates(MAX_SAMPLE_BYTES),
+            Vec::new()
         );
         assert_eq!(
             DictionaryPolicy::new(700 * 1024, MAX_SAMPLE_BYTES as u64)
