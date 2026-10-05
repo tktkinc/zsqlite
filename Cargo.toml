@@ -14,6 +14,11 @@ crate-type = ["cdylib", "rlib"]
 name = "zsqlite"
 path = "src/bin/zsqlite.rs"
 
+[[bin]]
+name = "zsqlite-browser"
+path = "src/bin/zsqlite-browser.rs"
+required-features = ["browser"]
+
 [[bench]]
 name = "vfs_performance"
 harness = false
@@ -48,13 +53,14 @@ thiserror = "2.0.16"
 tempfile = "3.21.0"
 zstd = { version = "0.13.3", default-features = false, features = ["zdict_builder"] }
 
-[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "emscripten"))'.dependencies]
 libc = "0.2.189"
 
 [features]
 default = ["loadable"]
 loadable = ["libsqlite3-sys/loadable_extension"]
 static = ["libsqlite3-sys/bundled"]
+browser = ["static"]
 
 [profile.release]
 lto = "thin"

@@ -244,20 +244,50 @@ fn flock(file: &File, operation: libc::c_int) -> Result<(), StoreError> {
     }
 }
 
+// Keep the fallible native lock interface on the private browser filesystem.
+#[cfg_attr(target_os = "emscripten", allow(clippy::unnecessary_wraps))]
 pub(crate) fn lock_exclusive(file: &File, nonblocking: bool) -> Result<(), StoreError> {
-    flock(
-        file,
-        libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 },
-    )
+    #[cfg(not(target_os = "emscripten"))]
+    {
+        flock(
+            file,
+            libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 },
+        )
+    }
+    #[cfg(target_os = "emscripten")]
+    {
+        // Each browser worker owns a private MEMFS and only exposes the sealed
+        // read-only VFS. There are no shared OS files or writers to coordinate.
+        let _ = (file, nonblocking);
+        Ok(())
+    }
 }
+#[cfg_attr(target_os = "emscripten", allow(clippy::unnecessary_wraps))]
 pub(crate) fn lock_shared(file: &File, nonblocking: bool) -> Result<(), StoreError> {
-    flock(
-        file,
-        libc::LOCK_SH | if nonblocking { libc::LOCK_NB } else { 0 },
-    )
+    #[cfg(not(target_os = "emscripten"))]
+    {
+        flock(
+            file,
+            libc::LOCK_SH | if nonblocking { libc::LOCK_NB } else { 0 },
+        )
+    }
+    #[cfg(target_os = "emscripten")]
+    {
+        let _ = (file, nonblocking);
+        Ok(())
+    }
 }
+#[cfg_attr(target_os = "emscripten", allow(clippy::unnecessary_wraps))]
 pub(crate) fn unlock_file(file: &File) -> Result<(), StoreError> {
-    flock(file, libc::LOCK_UN)
+    #[cfg(not(target_os = "emscripten"))]
+    {
+        flock(file, libc::LOCK_UN)
+    }
+    #[cfg(target_os = "emscripten")]
+    {
+        let _ = file;
+        Ok(())
+    }
 }
 
 pub(crate) fn sync_file(file: &File, full_sync: bool) -> std::io::Result<()> {

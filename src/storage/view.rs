@@ -1,6 +1,8 @@
 use super::frame::{FrameMetadata, PageVersion, VerifiedFrame};
 use super::objects::{CatalogGuard, Dictionary, Durable, Manifest, ObjectKey, Pack};
-use super::wire::{Decoder, envelope, open_envelope, u32_bytes, u64_bytes};
+use super::wire::{
+    Decoder, ReadDecoder, envelope, open_envelope, open_envelope_reader, u32_bytes, u64_bytes,
+};
 use crate::StoreError;
 use crate::domain::{
     CompressionDictionary, ContentRoot, DatabaseId, DecodedBytes, DictionaryId, FileOffset,
@@ -246,10 +248,15 @@ impl ViewMetadata {
         Ok(raw)
     }
     fn decode(encoded: &[u8]) -> Result<ValidatedMetadata, StoreError> {
-        Self::decode_raw(&open_envelope(b"ZVIEW001", encoded, VIEW_LIMIT)?)
+        Self::decode_reader(open_envelope_reader(b"ZVIEW001", encoded, VIEW_LIMIT)?)
     }
     fn decode_raw(raw: &[u8]) -> Result<ValidatedMetadata, StoreError> {
-        let mut wire = Decoder::new(raw);
+        Self::decode_reader(ReadDecoder::new(raw, raw.len()))
+    }
+    fn decode_reader(
+        mut wire: ReadDecoder<impl std::io::Read>,
+    ) -> Result<ValidatedMetadata, StoreError> {
+        let raw_length = wire.length();
         let database = DatabaseId::from_bytes(wire.array()?);
         let lineage = LineageId::from_bytes(wire.array()?);
         let page_size = PageSize::new(wire.u32()?)?;
@@ -273,7 +280,7 @@ impl ViewMetadata {
             result.preferred.push(id);
         }
         let frames = wire.u32()?;
-        if frames as usize > raw.len() / 64 {
+        if frames as usize > raw_length / 64 {
             return Err(StoreError::Range);
         }
         for _ in 0..frames {
@@ -281,7 +288,12 @@ impl ViewMetadata {
             let pack = PackId::from_bytes(wire.array()?);
             let offset = FileOffset::new(wire.u64()?);
             let length = wire.u32()? as usize;
-            let metadata = FrameMetadata::decode(wire.take(length)?, id)?;
+            // The frame format bounds decoded data to 8 MiB. Check its maximum
+            // metadata size before allocating a length supplied by the stream.
+            if length > 89 + (8 * 1024 * 1024 / page_size.as_usize()) * 44 {
+                return Err(StoreError::Range);
+            }
+            let metadata = FrameMetadata::decode(&wire.take(length)?, id)?;
             let payload = super::placement::PackRange::stored(StoredRange::new(
                 offset,
                 metadata.payload_bytes(),
@@ -302,7 +314,7 @@ impl ViewMetadata {
             }
         }
         let pages = wire.u32()?;
-        if pages > size.pages() || pages as usize > raw.len() / 40 {
+        if pages > size.pages() || pages as usize > raw_length / 40 {
             return Err(StoreError::Range);
         }
         for _ in 0..pages {
@@ -324,7 +336,7 @@ impl ViewMetadata {
         }
         wire.finish()?;
         let validated = result.validate()?;
-        if validated.decoded_bytes.get() != raw.len() as u64 || root != validated.content_root() {
+        if validated.decoded_bytes.get() != raw_length as u64 || root != validated.content_root() {
             return Err(StoreError::Corrupt(0));
         }
         Ok(validated)
@@ -408,10 +420,10 @@ enum ManifestRecord {
 }
 impl ManifestRecord {
     fn from_segment(
-        authenticated: &super::objects::AuthenticatedSegment,
+        authenticated: super::objects::AuthenticatedSegment,
         budget: u64,
     ) -> Result<Self, StoreError> {
-        let container = authenticated.container();
+        let container = authenticated.into_container();
         let raw = open_envelope(
             b"ZFOOT001",
             &container.footer,
@@ -419,6 +431,10 @@ impl ManifestRecord {
                 .map_err(|_| StoreError::Range)?
                 .min(VIEW_LIMIT),
         )?;
+        let header = container.header;
+        // The compressed footer is no longer needed after authentication and
+        // outer-envelope decoding. Release it before building the resolved maps.
+        drop(container);
         let mut wire = Decoder::new(&raw);
         let root = ContentRoot::from_bytes(wire.array()?);
         let length = wire.u32()? as usize;
@@ -436,14 +452,14 @@ impl ManifestRecord {
         wire.finish()?;
         let patch = match &mut record {
             Self::Checkpoint(patch) => {
-                if container.header.parent() != super::segment::Parent::Checkpoint {
+                if header.parent() != super::segment::Parent::Checkpoint {
                     return Err(StoreError::IdentityMismatch);
                 }
                 patch
             }
             Self::Run(run) => {
-                if container.header.parent() != super::segment::Parent::Previous(run.parent)
-                    || container.header.coverage().full() != run.span
+                if header.parent() != super::segment::Parent::Previous(run.parent)
+                    || header.coverage().full() != run.span
                     || run.root != root
                 {
                     return Err(StoreError::IdentityMismatch);
@@ -452,13 +468,13 @@ impl ManifestRecord {
             }
         };
         validate_frame_ranges(patch)?;
-        if patch.txid != container.header.coverage().full().end() {
+        if patch.txid != header.coverage().full().end() {
             return Err(StoreError::IdentityMismatch);
         }
-        if patch.logical_hash_for(root) != container.header.logical_hash() {
+        if patch.logical_hash_for(root) != header.logical_hash() {
             return Err(StoreError::IdentityMismatch);
         }
-        patch.span = container.header.coverage().full();
+        patch.span = header.coverage().full();
         patch.decoded_bytes = DecodedBytes::new(total - RUN_PREFIX as u64);
         match &record {
             Self::Checkpoint(view) if view.content_root() != root => {
@@ -1008,6 +1024,38 @@ impl PinnedView {
     }
 }
 impl ResolvedPage<'_> {
+    #[cfg(all(feature = "browser", target_os = "emscripten"))]
+    pub(crate) fn accepts_cached(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Zero(page) => {
+                bytes.len() == page.view.logical_size().page_size().as_usize()
+                    && bytes.iter().all(|byte| *byte == 0)
+            }
+            Self::Stored(page) => {
+                let version = &page.location.metadata.pages()[page.slot.index()];
+                bytes.len() == page.view.logical_size().page_size().as_usize()
+                    && super::frame::checksum(version.page, version.txid, bytes) == version.checksum
+            }
+        }
+    }
+    #[cfg(all(feature = "browser", target_os = "emscripten"))]
+    pub(crate) fn read_and_cache(
+        &self,
+        mut admit: impl FnMut(PageNumber, &[u8]),
+    ) -> Result<Vec<u8>, StoreError> {
+        match self {
+            Self::Zero(_) => self.read(),
+            Self::Stored(page) => {
+                let frame = page.fetch()?;
+                // Just as in the native cache, admit all live slots only after
+                // authenticating and verifying every page in the decoded frame.
+                for (version, bytes) in page.cache_pages(&frame)? {
+                    admit(version.page, bytes);
+                }
+                page.extract(&frame)
+            }
+        }
+    }
     pub fn read(&self) -> Result<Vec<u8>, StoreError> {
         match self {
             Self::Zero(page) => Ok(vec![0; page.view.metadata.size.page_size().as_usize()]),
@@ -1156,7 +1204,7 @@ pub(super) fn load_metadata(
         let remaining = (VIEW_LIMIT as u64)
             .checked_sub(decoded_bytes)
             .ok_or(StoreError::Range)?;
-        let record = ManifestRecord::from_segment(&container, remaining)?;
+        let record = ManifestRecord::from_segment(container, remaining)?;
         let used = match &record {
             ManifestRecord::Checkpoint(view) => view.decoded_bytes.get(),
             ManifestRecord::Run(run) => run.decoded_bytes(),

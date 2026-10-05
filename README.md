@@ -9,6 +9,14 @@ See [storage invariants and interfaces](docs/storage.md) and
 [transcript replay methodology](docs/transcript-replay.md). The adapter contract
 and lazy recovery are documented in [pluggable sealed storage](docs/storage-backends.md).
 
+The [TypeScript browser library](docs/browser.md) offers SQLite-style queries
+and reusable prepared statements over WASM, with HTTP/S3 or app-provided storage.
+It reads finalized sealed heads from a Web Worker, using byte ranges or ordinary
+GETs. Run `npm --prefix web ci`, then `bash web/build.sh` after activating Emscripten.
+Run `node web/serve.mjs --store library=/path/to/archive.db` and open
+<http://127.0.0.1:8080/> for ranked full-text results with snippets, source links,
+persistent disk caching, database sizes and a SQL console.
+
 ## Storage model
 
 A logical `.db` name is a small read-only SQLite notice database. Selecting the
@@ -195,7 +203,8 @@ It reads authenticated metadata, dictionaries and the SQLite header frame, then
 fetches other frames on demand. It rejects existing destinations and open local
 instances, and fences superseded pagefiles with a fresh attachment token.
 Unsealed pagefile changes and transactions remaining only in WAL are outside
-this recovery boundary. There is no S3 adapter, compressed-object cache, automatic
+this recovery boundary. The browser package supplies a read-only HTTP bucket
+transport. There is no native S3 adapter, compressed-object cache, automatic
 offloading, or self-contained read-only bundle implementation.
 
 `storage.fork("experiment")` creates an independent writable head sharing the

@@ -184,6 +184,27 @@ impl Storage {
             .map(|key| String::from_utf8(key.clone()).map_err(|_| StoreError::Corrupt(0)))
             .collect()
     }
+    /// Open the selected head's latest finalized seal without claiming an
+    /// attachment, creating a pagefile, or publishing anything to the backend.
+    /// The caller must keep remote objects available for the reader's lifetime;
+    /// local leases only coordinate clients sharing this coordination directory.
+    pub fn open_sealed(&self) -> Result<super::PinnedView, StoreError> {
+        let catalog = Catalog::configured(self.clone(), PathBuf::new());
+        let guard = catalog.lock()?;
+        let header = guard.state().sealed.ok_or(StoreError::NoSealedHead)?;
+        let view = guard.pin(crate::domain::ManifestId::from_bytes(
+            header.parent_physical_digest,
+        ))?;
+        guard.validate_descriptor(&header, &view)?;
+        Ok(view)
+    }
+    /// Register a VFS serving a fixed, immutable snapshot of this sealed head.
+    /// `SQLite` must open it with READONLY. Decoded pages use a bounded RAM cache.
+    /// As with the ordinary VFS, registration lasts for the process lifetime.
+    #[cfg(feature = "static")]
+    pub fn register_read_only_vfs(&self, name: &str, cache_bytes: usize) -> Result<(), StoreError> {
+        crate::vfs::readonly::register(name, self.open_sealed()?, cache_bytes)
+    }
     pub(crate) fn bind(&self, path: &Path) -> Result<PathBuf, StoreError> {
         let path = canonical(&crate::facade::storage_path(path))?;
         crate::facade::validate_notice(&path)?;

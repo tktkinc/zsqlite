@@ -24,6 +24,11 @@ pub enum ObjectKey {
     Index(IndexId),
 }
 impl ObjectKey {
+    /// Stable filename used by the filesystem and HTTP bucket layouts.
+    #[must_use]
+    pub fn file_name(self) -> String {
+        self.name()
+    }
     pub(crate) fn name(self) -> String {
         let (id, extension) = match self {
             Self::Blob(id) => (*id.as_bytes(), "blob"),
@@ -90,6 +95,20 @@ pub struct RootRecord {
     bytes: Vec<u8>,
 }
 impl RootRecord {
+    /// Decode a checksummed `catalog-head` file from the filesystem/bucket layout.
+    pub fn from_file_bytes(bytes: &[u8]) -> Result<Self, BackendError> {
+        if bytes.len() < 72
+            || bytes.len() > MAX_ROOT_BYTES + 72
+            || &bytes[..8] != b"ZHEAD001"
+            || blake3::hash(&bytes[..bytes.len() - 32]).as_bytes() != &bytes[bytes.len() - 32..]
+        {
+            return Err(BackendError::InvalidData);
+        }
+        Self::new(
+            Revision::new(bytes[8..40].to_vec())?,
+            bytes[40..bytes.len() - 32].to_vec(),
+        )
+    }
     pub fn new(revision: Revision, bytes: Vec<u8>) -> Result<Self, BackendError> {
         if bytes.len() > MAX_ROOT_BYTES {
             return Err(BackendError::Range);
@@ -314,16 +333,7 @@ impl FilesystemBackend {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        if bytes.len() < 72
-            || &bytes[..8] != b"ZHEAD001"
-            || blake3::hash(&bytes[..bytes.len() - 32]).as_bytes() != &bytes[bytes.len() - 32..]
-        {
-            return Err(BackendError::InvalidData);
-        }
-        Ok(Some(RootRecord::new(
-            Revision::new(bytes[8..40].to_vec())?,
-            bytes[40..bytes.len() - 32].to_vec(),
-        )?))
+        RootRecord::from_file_bytes(&bytes).map(Some)
     }
 }
 struct FilesystemWriter<'a> {

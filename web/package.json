@@ -1,0 +1,33 @@
+{
+  "name": "@zsqlite/browser",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    },
+    "./worker": {
+      "types": "./dist/engine.d.mts",
+      "import": "./dist/engine.mjs"
+    }
+  },
+  "types": "./dist/index.d.mts",
+  "scripts": {
+    "build": "bash build.sh",
+    "serve": "node serve.mjs",
+    "test": "npm run build:typescript && tsc -p tests/tsconfig.json && node --test tests/*.test.mjs",
+    "test:browser": "node tests/browser.mjs",
+    "build:typescript": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0",
+    "typescript": "7.0.2",
+    "ws": "8.22.0"
+  },
+  "files": [
+    "dist",
+    "src"
+  ]
+}

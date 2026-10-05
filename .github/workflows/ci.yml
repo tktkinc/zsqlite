@@ -8,6 +8,43 @@ permissions:
   contents: read
 
 jobs:
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: clippy
+          targets: wasm32-unknown-emscripten
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Emscripten
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          "$RUNNER_TEMP/emsdk/emsdk" install 4.0.23
+          "$RUNNER_TEMP/emsdk/emsdk" activate 4.0.23
+      - run: npm ci
+        working-directory: web
+      - name: Build and check WASM
+        run: |
+          source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+          cargo clippy --target wasm32-unknown-emscripten --no-default-features --features browser --bin zsqlite-browser -- -D warnings
+          bash web/build.sh
+      - run: npm test
+        working-directory: web
+      - run: npx playwright install --with-deps chromium
+        working-directory: web
+      - run: npm run test:browser
+        working-directory: web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zsqlite-browser
+          path: web/dist/
   rust:
     strategy:
       fail-fast: false

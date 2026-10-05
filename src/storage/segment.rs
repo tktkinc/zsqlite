@@ -174,7 +174,7 @@ pub(super) fn read(file: &File) -> Result<Container, StoreError> {
     })
 }
 
-pub(super) fn read_bytes(bytes: &[u8]) -> Result<Container, StoreError> {
+pub(super) fn read_bytes(mut bytes: Vec<u8>) -> Result<Container, StoreError> {
     if !((HEADER_SIZE + 16) as u64..=LIMIT).contains(&(bytes.len() as u64)) {
         return Err(StoreError::Range);
     }
@@ -189,14 +189,17 @@ pub(super) fn read_bytes(bytes: &[u8]) -> Result<Container, StoreError> {
     {
         return Err(StoreError::Corrupt(0));
     }
-    let footer = bytes[HEADER_SIZE..bytes.len() - 16].to_vec();
     let mut hash = blake3::Hasher::new();
     hash.update(encoded);
-    hash.update(&footer);
+    hash.update(&bytes[HEADER_SIZE..bytes.len() - 16]);
+    let id = ManifestId::from_bytes(*hash.finalize().as_bytes());
+    let end = bytes.len() - 16;
+    bytes.copy_within(HEADER_SIZE..end, 0);
+    bytes.truncate(end - HEADER_SIZE);
     Ok(Container {
         header,
-        footer,
-        id: ManifestId::from_bytes(*hash.finalize().as_bytes()),
+        footer: bytes,
+        id,
     })
 }
 

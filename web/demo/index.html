@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Knowledge search · zsqlite</title>
+  <script src="/debug.js"></script>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="masthead">
+    <a class="brand" href="/" aria-label="zsqlite home"><span class="mark">z</span><span>zsqlite <small>KNOWLEDGE STORES</small></span></a>
+    <span class="badge">READ ONLY · BROWSER WASM</span>
+  </header>
+  <main>
+    <section class="intro">
+      <div><p class="eyebrow">YOUR KNOWLEDGE STORE, OVER HTTP</p><h1>Find what you’re looking for.</h1><p>Search the full text. Read a preview. Go straight to the source.</p></div>
+      <div class="connection-state"><span id="state-dot" class="dot"></span><span id="connection-state">Starting…</span></div>
+    </section>
+    <form id="connection-form" class="connection-bar">
+      <label>Knowledge store<select id="store" aria-label="Knowledge store"></select></label>
+      <label>HTTP transport<select id="transport" aria-label="HTTP transport"><option value="auto">Auto · prefer ranges</option><option value="get">Ordinary GET only</option><option value="range">Range requests only</option></select></label>
+      <button id="connect" type="submit" class="primary">Open store</button>
+      <p id="transport-note">Fetch the compressed data a query needs; reuse cached data between visits.</p>
+    </form>
+    <details class="cache-settings"><summary>Cache settings</summary><div class="cache-controls">
+      <label>Memory budget<select id="memory-budget"><option value="64">64 MiB</option><option value="128">128 MiB</option><option value="256" selected>256 MiB</option><option value="512">512 MiB</option><option value="1024">1 GiB</option></select></label>
+      <label>Disk budget<select id="disk-budget"><option value="0">Disabled</option><option value="1">1 GiB</option><option value="2" selected>2 GiB</option><option value="4">4 GiB</option><option value="8">8 GiB</option></select></label>
+      <button id="keep-cache" type="button" class="secondary">Keep on disk</button><button id="clear-cache" type="button" class="secondary" disabled>Clear disk cache</button>
+      <p id="cache-note">Disk cache stays between visits. Change budgets, then click Reconnect.</p>
+    </div></details>
+    <p id="debug-status" class="debug-status" role="status">Browser diagnostics starting…</p>
+    <div id="error" class="error" role="alert" hidden></div>
+    <section class="store-heading"><div><h2 id="store-title">Opening your store</h2><p id="store-description">Loading the sealed database…</p></div><span id="store-date"></span></section>
+    <div class="db-stats" aria-label="Database statistics">
+      <div><span>Compressed storage</span><strong id="db-compressed">—</strong></div><div><span>Uncompressed SQLite</span><strong id="db-logical">—</strong></div><div><span>Compression ratio</span><strong id="db-ratio">—</strong></div><div><span>SQLite pages</span><strong id="db-pages">—</strong></div>
+    </div>
+    <section class="search-panel" aria-label="Search the knowledge store">
+      <form id="search-form"><label for="search" class="sr-only">Search the knowledge store</label><div class="search-box"><input id="search" type="search" placeholder="Search Chicago, jazz, hiking…" autocomplete="off" disabled><button type="submit" id="search-button" class="primary" disabled>Search</button></div></form>
+      <div class="search-help"><span>Use quotes for an exact phrase, or * for a word prefix.</span><button id="clear-search" class="text-button" type="button">Clear search</button></div>
+    </section>
+    <div id="search-welcome" class="search-welcome"><span class="book-symbol" aria-hidden="true">⌕</span><p>Your next answer starts with a search.</p></div>
+    <section id="search-results" class="search-results" aria-label="Search results" hidden>
+      <div class="results-heading"><h2 id="results-title"></h2><p id="results-summary" role="status" aria-live="polite"></p><div class="search-metrics" aria-label="Search performance"><span id="search-time"></span><span id="search-downloaded"></span><span id="search-cached" title="Bytes read from RAM and disk caches for this search. Repeated reads count again; this is not the size of unique cached data."></span></div></div>
+      <ol id="results-list" class="results-list"></ol>
+      <nav id="pagination" class="pagination" aria-label="Search result pages"><button id="previous-page" class="secondary" type="button">← Previous</button><span id="page-label"></span><button id="next-page" class="secondary" type="button">Next →</button></nav>
+    </section>
+    <details class="sql-console" id="sql-console">
+      <summary><span>Try a SQL query</span><span class="subtle">Inspect tables, query content, explore the schema</span></summary>
+      <div class="console-body"><div class="schema-bar"><span>Tables</span><div id="tables"></div><button id="schema" class="text-button" disabled>Show schema</button></div>
+        <form id="sql-form"><label class="sr-only" for="sql">Read-only SQL query</label><textarea id="sql" spellcheck="false">SELECT id, title, path
+FROM entries
+WHERE present = 1
+ORDER BY id
+LIMIT 20;</textarea><div class="query-bar"><span>One read-only statement · up to 200 results</span><button id="run" type="submit" class="primary" disabled>Run query</button></div></form>
+        <p id="query-summary" class="query-summary"></p><div id="query-result" class="result-table"></div>
+      </div>
+    </details>
+    <footer class="stats"><span id="status" role="status" aria-live="polite">Starting the browser worker…</span><div><span id="requests">0 requests</span><span id="received">0 B received</span><span id="cache">Cache starting…</span><span id="disk-cache"></span><span id="cache-hits"></span></div></footer>
+  </main>
+  <script type="module" src="/app.mjs"></script>
+</body>
+</html>
