@@ -208,6 +208,8 @@ impl SharedLock {
 }
 
 fn lock_file(path: &Path) -> Result<File, StoreError> {
+    #[cfg(test)]
+    io_counts::bump(|counts| counts.lock_files += 1);
     // Local flock works on a read-only descriptor. Existing bundles remain
     // readable on read-only mounts; missing lease files require a writable
     // catalogue and are created only while holding catalogue exclusion.
@@ -313,8 +315,51 @@ pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf, StoreError> {
 }
 
 pub(crate) fn sync_dir(path: &Path) -> Result<(), StoreError> {
+    #[cfg(test)]
+    io_counts::bump(|counts| counts.directory_syncs += 1);
     File::open(path)?.sync_all()?;
     Ok(())
+}
+
+/// `std::fs::create_dir_all`, counted in tests. Succeeds for existing directories.
+pub(crate) fn create_dir_all(path: impl AsRef<Path>) -> std::io::Result<()> {
+    #[cfg(test)]
+    io_counts::bump(|counts| counts.directory_creations += 1);
+    std::fs::create_dir_all(path)
+}
+
+/// Test-only per-thread counts of coordination-directory work, so tests can
+/// assert that an operation leaves the filesystem alone.
+#[cfg(test)]
+pub(crate) mod io_counts {
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(crate) struct IoCounts {
+        /// Directory fsyncs through `sync_dir`.
+        pub(crate) directory_syncs: u64,
+        /// `create_dir_all` calls, including ones that find the directory present.
+        pub(crate) directory_creations: u64,
+        /// Lock or lease files opened by path, including newly created ones.
+        pub(crate) lock_files: u64,
+    }
+    thread_local! {
+        static COUNTS: std::cell::Cell<IoCounts> = const {
+            std::cell::Cell::new(IoCounts {
+                directory_syncs: 0,
+                directory_creations: 0,
+                lock_files: 0,
+            })
+        };
+    }
+    pub(crate) fn bump(update: impl FnOnce(&mut IoCounts)) {
+        COUNTS.with(|counts| {
+            let mut value = counts.get();
+            update(&mut value);
+            counts.set(value);
+        });
+    }
+    pub(crate) fn snapshot() -> IoCounts {
+        COUNTS.with(std::cell::Cell::get)
+    }
 }
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
@@ -331,7 +376,7 @@ pub(crate) fn create_dir_all_synced(path: &Path) -> Result<(), StoreError> {
         missing.push(current.to_path_buf());
         current = current.parent().ok_or(StoreError::Range)?;
     }
-    std::fs::create_dir_all(&path)?;
+    create_dir_all(&path)?;
     for directory in missing {
         sync_dir(&directory)?;
         sync_parent_dir(&directory)?;

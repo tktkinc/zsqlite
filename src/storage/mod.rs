@@ -39,7 +39,7 @@ mod view;
 pub(crate) mod wire;
 pub(crate) use cache::PageCache;
 pub use repack::PackOccupancy;
-pub(crate) use repack::{eligible_packs, repack};
+pub(crate) use repack::{eligible_packs, has_repack_candidates, repack};
 pub use retention::{DurablePin, GcReport, MaintenanceReport, RetentionName};
 pub(crate) use seal::{ManifestMode, SealEndpoint, seal};
 pub(crate) use view::DurableView;

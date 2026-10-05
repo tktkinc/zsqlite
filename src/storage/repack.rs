@@ -275,6 +275,32 @@ pub(crate) fn repack<'g>(
     build_candidate(guard, view, policy, dictionary, &selected).map(Some)
 }
 
+/// Packs below the occupancy threshold that fit the maintenance budget. This
+/// depends only on the view's metadata, not on catalog or reader state.
+fn occupancy_candidates(
+    view: &PinnedView,
+    policy: LayoutPolicy,
+) -> Result<Vec<RepackPlan>, StoreError> {
+    if policy.maintenance_input().get() == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(plans(view)?
+        .into_iter()
+        .filter(|pack| {
+            pack.reclaimable_bytes() > pack.frame_bytes / 2
+                && pack.live_frame_decoded_bytes.get() <= policy.maintenance_input().get()
+        })
+        .collect())
+}
+
+/// Whether any pack could be repacked if no fork, root or reader retained it.
+pub(crate) fn has_repack_candidates(
+    view: &PinnedView,
+    policy: LayoutPolicy,
+) -> Result<bool, StoreError> {
+    Ok(!occupancy_candidates(view, policy)?.is_empty())
+}
+
 /// Advisory preflight only: this does not authorize publication or deletion.
 /// Repeat selection after acquiring publication exclusion before doing work.
 pub(crate) fn eligible_packs(
@@ -282,17 +308,14 @@ pub(crate) fn eligible_packs(
     view: &PinnedView,
     policy: LayoutPolicy,
 ) -> Result<Vec<RepackPlan>, StoreError> {
-    if policy.maintenance_input().get() == 0 {
-        return Ok(Vec::new());
+    let candidates = occupancy_candidates(view, policy)?;
+    if candidates.is_empty() {
+        return Ok(candidates);
     }
     let retained = guard.retained_packs_except(view.id())?;
-    let mut candidates: Vec<_> = plans(view)?
+    let mut candidates: Vec<_> = candidates
         .into_iter()
-        .filter(|pack| {
-            pack.reclaimable_bytes() > pack.frame_bytes / 2
-                && pack.live_frame_decoded_bytes.get() <= policy.maintenance_input().get()
-                && !retained.contains(&pack.pack)
-        })
+        .filter(|pack| !retained.contains(&pack.pack))
         .collect();
     candidates.sort_by(|left, right| {
         // Highest reclaimable bytes per unit of surviving frame work first.

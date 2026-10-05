@@ -312,6 +312,18 @@ Idle maintenance first checks eligibility without reserving publication, then
 selects again under publication exclusion if work exists. An idle reader with
 fully live packs therefore does not compete with writers for that lock.
 
+Each writable VFS Store runs a background tick every second. The Store resolves
+its catalog binding once, and a namespace open syncs its coordination directory
+only when it creates a subdirectory. A collection pass that finds nothing
+collectible, and nothing kept alive only by a reader lease, is not repeated
+while the published catalog revision and the Store's view stay the same. Lease
+releases publish nothing, so a pass that saw lease-only objects runs again on
+the next tick. Objects orphaned by another process's interrupted seal are also
+unpublished; a full pass still runs every five minutes. Repack eligibility is
+recomputed only when the view or layout policy changes, from in-memory occupancy,
+before any catalog lock. An idle tick therefore reads the catalog root record
+and performs no directory creation, lock-file open, write or sync.
+
 ## Statistics
 
 `statistics::connection_statistics` reads V1 VFS file-control counters

@@ -343,7 +343,7 @@ impl CatalogGuard {
             .collect()
     }
     pub(super) fn reachable_packs(&self) -> Result<BTreeSet<PackId>, StoreError> {
-        let (live, _, _) = self.trace_logical()?;
+        let (live, _, _, _) = self.trace_logical()?;
         Ok(live
             .into_iter()
             .filter_map(|key| {
@@ -355,11 +355,14 @@ impl CatalogGuard {
             })
             .collect())
     }
-    #[allow(clippy::type_complexity)] // live, active, and retained logical dependency sets
+    /// Live, active, retained, and published-or-active (not lease-only)
+    /// logical dependency sets.
+    #[allow(clippy::type_complexity)]
     fn trace_logical(
         &self,
     ) -> Result<
         (
+            BTreeSet<ObjectKey>,
             BTreeSet<ObjectKey>,
             BTreeSet<ObjectKey>,
             BTreeSet<ObjectKey>,
@@ -406,6 +409,9 @@ impl CatalogGuard {
             named.extend(view.metadata.dependencies(view.id()));
         }
         live.extend(named.iter().copied());
+        // Everything above is retained by the catalog or the active header.
+        // Reader leases below can be released without a catalog publication.
+        let held = live.clone();
         for entry in std::fs::read_dir(self.root().join("readers"))? {
             let entry = entry?;
             let id = ManifestId::from_bytes(parse_hex(
@@ -432,10 +438,19 @@ impl CatalogGuard {
                 Err(error) => return Err(error),
             }
         }
-        Ok((live, current, named))
+        Ok((live, current, named, held))
     }
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn collect(&mut self, budget: usize) -> Result<GcReport, StoreError> {
+        Ok(self.collect_with_leases(budget)?.0)
+    }
+    /// Also reports whether any object outlived the trace only through a reader
+    /// lease. Such objects become collectible when the lease is released, with
+    /// no catalog publication to signal it.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn collect_with_leases(
+        &mut self,
+        budget: usize,
+    ) -> Result<(GcReport, bool), StoreError> {
         use super::adapter::{BackendError, ObjectKey as Physical};
         if self.state().uncertain {
             return Err(BackendError::Uncertain("reload before collection".into()).into());
@@ -446,7 +461,7 @@ impl CatalogGuard {
             return Err(BackendError::Stale.into());
         }
         *self.state_mut() = reloaded;
-        let (logical, current, named) = self.trace_logical()?;
+        let (logical, current, named, held) = self.trace_logical()?;
         let uncertain_heads = self.state().has_pending()?;
         let inventory = self.inventory()?;
         // Immutable lengths remain stable under catalog exclusion. Reuse each
@@ -462,6 +477,7 @@ impl CatalogGuard {
             Ok(length)
         };
         let mut physical = self.state().index_objects();
+        let mut held_physical = physical.clone();
         let mut current_physical = BTreeSet::new();
         let mut named_physical = BTreeSet::new();
         let mut leased = BTreeSet::new();
@@ -478,37 +494,44 @@ impl CatalogGuard {
         }
         physical.extend(leased.iter().copied());
         for key in &logical {
-            let object =
-                match key {
-                    ObjectKey::Manifest(id) => {
-                        let _receipt = self.validate::<Manifest>(*id, 512 * 1024 * 1024)?;
-                        Physical::Manifest(*id)
+            let object = match key {
+                ObjectKey::Manifest(id) => {
+                    let _receipt = self.validate::<Manifest>(*id, 512 * 1024 * 1024)?;
+                    Physical::Manifest(*id)
+                }
+                ObjectKey::Dictionary(id) => {
+                    let _receipt = self.validate::<Dictionary>(
+                        *id,
+                        u64::from(crate::dictionary::MAX_DICTIONARY_BYTES),
+                    )?;
+                    Physical::Dictionary(*id)
+                }
+                ObjectKey::Pack(pack) => {
+                    let placement = self.placement(*pack)?;
+                    let extent = placement.preferred().extent;
+                    let object = Physical::Blob(extent.blob());
+                    let length = stat(object)?.ok_or(BackendError::Missing(object))?;
+                    if length.get() != extent.blob_length().get() {
+                        return Err(StoreError::Corrupt(0));
                     }
-                    ObjectKey::Dictionary(id) => {
-                        let _receipt = self.validate::<Dictionary>(
-                            *id,
-                            u64::from(crate::dictionary::MAX_DICTIONARY_BYTES),
-                        )?;
-                        Physical::Dictionary(*id)
-                    }
-                    ObjectKey::Pack(pack) => {
-                        let placement = self.placement(*pack)?;
-                        let extent = placement.preferred().extent;
-                        let object = Physical::Blob(extent.blob());
-                        let length = stat(object)?.ok_or(BackendError::Missing(object))?;
-                        if length.get() != extent.blob_length().get() {
-                            return Err(StoreError::Corrupt(0));
+                    if uncertain_heads {
+                        let representations = placement
+                            .representations
+                            .iter()
+                            .map(|representation| Physical::Blob(representation.extent.blob()));
+                        if held.contains(key) {
+                            held_physical.extend(representations.clone());
                         }
-                        if uncertain_heads {
-                            physical.extend(placement.representations.iter().map(
-                                |representation| Physical::Blob(representation.extent.blob()),
-                            ));
-                        }
-                        object
+                        physical.extend(representations);
                     }
-                    ObjectKey::Staging(_) => return Err(StoreError::Corrupt(0)),
-                };
+                    object
+                }
+                ObjectKey::Staging(_) => return Err(StoreError::Corrupt(0)),
+            };
             physical.insert(object);
+            if held.contains(key) {
+                held_physical.insert(object);
+            }
             if current.contains(key) {
                 current_physical.insert(object);
             }
@@ -531,6 +554,8 @@ impl CatalogGuard {
                 }
             }
         }
+        let lease_held = logical.iter().any(|key| !held.contains(key))
+            || leased.iter().any(|key| !held_physical.contains(key));
         let mut report = GcReport {
             objects: inventory.len(),
             ..GcReport::default()
@@ -613,7 +638,7 @@ impl CatalogGuard {
             report.partially_obsolete_bytes += super::repack::estimated_obsolete_bytes(&view)?;
         }
         if deletable.is_empty() {
-            return Ok(report);
+            return Ok((report, lease_held));
         }
         let deleting: BTreeSet<_> = deletable.iter().map(|(key, _)| *key).collect();
         // Remove discovery records and retire representations before physical
@@ -657,7 +682,7 @@ impl CatalogGuard {
                 report.deleted_bytes += length;
             }
         }
-        Ok(report)
+        Ok((report, lease_held))
     }
 }
 

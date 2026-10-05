@@ -32,7 +32,9 @@ macro_rules! kinds {
 }
 kinds!(Pack, PackId, "pack"; Dictionary, DictionaryId, "dict"; Manifest, ManifestId, "view");
 
-#[derive(Debug)]
+/// A cheap, cloneable binding of one sidecar to its storage namespace. It holds
+/// no catalog state; every `lock` reloads the published state.
+#[derive(Clone, Debug)]
 pub(crate) struct Catalog {
     root: Arc<PathBuf>,
     active_path: Arc<PathBuf>,
@@ -41,7 +43,22 @@ pub(crate) struct Catalog {
 impl Catalog {
     pub(crate) fn open(root: &Path, create: bool) -> Result<Self, StoreError> {
         let storage = super::Storage::for_sidecar(root, create)?;
-        Ok(Self::configured(storage, root.with_extension("")))
+        Ok(Self::for_sidecar(storage, root))
+    }
+    /// Bind a sidecar to a namespace already resolved by `Storage::for_sidecar`.
+    pub(crate) fn for_sidecar(storage: super::Storage, root: &Path) -> Self {
+        Self::configured(storage, root.with_extension(""))
+    }
+    /// The published catalog revision, read without catalog exclusion. A
+    /// revision never repeats, so equality means no publication intervened.
+    pub(crate) fn published_revision(
+        &self,
+    ) -> Result<Option<super::adapter::Revision>, StoreError> {
+        Ok(self
+            .storage
+            .backend()
+            .read_root()?
+            .map(|root| root.revision().clone()))
     }
     pub(super) fn configured(storage: super::Storage, active_path: PathBuf) -> Self {
         Self {
@@ -157,6 +174,10 @@ impl CatalogGuard {
     }
     pub(super) fn storage(&self) -> &super::Storage {
         &self.storage
+    }
+    /// The catalog revision this guard loaded or last published.
+    pub(crate) fn revision(&self) -> Option<super::adapter::Revision> {
+        self.state().revision.clone()
     }
     pub(super) fn state(&self) -> Ref<'_, super::catalog::State> {
         self.state.borrow()

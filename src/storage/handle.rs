@@ -64,6 +64,9 @@ impl Storage {
         coordination: impl AsRef<Path>,
     ) -> Result<Self, StoreError> {
         let coordination = absolute_path(coordination.as_ref())?;
+        // Existing directories were made durable by whoever created them, so
+        // only a call that adds an entry pays for a directory sync.
+        let mut created = false;
         for directory in [
             "locks",
             "readers",
@@ -71,9 +74,15 @@ impl Storage {
             "physical-readers",
             "staging",
         ] {
-            std::fs::create_dir_all(coordination.join(directory))?;
+            let directory = coordination.join(directory);
+            if !directory.is_dir() {
+                crate::fs::create_dir_all(&directory)?;
+                created = true;
+            }
         }
-        sync_dir(&coordination)?;
+        if created {
+            sync_dir(&coordination)?;
+        }
         let coordination = coordination.canonicalize()?;
         Ok(Self {
             inner: Arc::new(StorageInner {
@@ -357,7 +366,7 @@ impl Storage {
         guard.record_local_attachment(AttachmentId::from_bytes(nonce))?;
         #[cfg(test)]
         super::faults::check(super::faults::Point::BootstrapClaimed)?;
-        std::fs::create_dir_all(crate::backend::sidecar_dir(&path))?;
+        crate::fs::create_dir_all(crate::backend::sidecar_dir(&path))?;
         sync_parent_dir(&crate::backend::sidecar_dir(&path))?;
         // Use a no-replace rename: a crash cannot leave a hardlink alias to the
         // writable pagefile, and a competing destination is never overwritten.

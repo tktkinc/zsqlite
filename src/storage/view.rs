@@ -996,7 +996,7 @@ impl PinnedView {
             .into_iter()
             .map(|key| Ok((key, guard.logical_length(key)?)))
             .collect::<Result<_, StoreError>>()?;
-        std::fs::create_dir_all(guard.root().join("object-readers"))?;
+        crate::fs::create_dir_all(guard.root().join("object-readers"))?;
         let object_leases = lengths
             .keys()
             .map(|key| SharedLock::acquire(&key.lease_path(guard)?))

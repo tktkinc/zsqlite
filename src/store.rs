@@ -370,6 +370,8 @@ impl ActiveBase<'_, '_> {
 pub(crate) struct Store {
     path: PathBuf,
     sidecar_path: PathBuf,
+    /// Resolved once: opening a catalog per call re-resolves the backend.
+    catalog: crate::storage::Catalog,
     coordination: LocalCoordination,
     publication: File,
     _lifecycle: File,
@@ -387,7 +389,29 @@ pub(crate) struct Store {
     pending_truncate_pages: Option<u32>,
     pending_dirty: bool,
     bootstrap: Option<BootstrapFile>,
+    idle: IdleMaintenance,
 }
+
+/// What earlier background passes proved, so idle ticks can skip them.
+#[derive(Debug, Default)]
+struct IdleMaintenance {
+    /// Collection found nothing collectible and nothing held only by a reader
+    /// lease at this catalog revision and view.
+    collection: Option<SettledCollection>,
+    /// No pack of this view qualified for repacking on occupancy alone.
+    repack: Option<(crate::domain::ManifestId, crate::layout::LayoutPolicy)>,
+}
+
+#[derive(Debug)]
+struct SettledCollection {
+    revision: Option<crate::storage::adapter::Revision>,
+    view: Option<crate::domain::ManifestId>,
+    at: std::time::Instant,
+}
+
+/// Idle ticks still run a full collection pass this often. Objects orphaned by
+/// another process's interrupted seal appear without a catalog publication.
+const COLLECTION_RECHECK: Duration = Duration::from_mins(5);
 
 impl Store {
     pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -553,6 +577,7 @@ impl Store {
     ) -> Self {
         Self {
             sidecar_path: sidecar_dir(&path),
+            catalog: coordination.catalog(),
             path,
             coordination,
             publication,
@@ -589,6 +614,7 @@ impl Store {
             pending_truncate_pages: None,
             pending_dirty: false,
             bootstrap: None,
+            idle: IdleMaintenance::default(),
         }
     }
 
@@ -1537,8 +1563,7 @@ impl Store {
     }
     #[allow(clippy::too_many_lines)]
     fn reload(&mut self) -> Result<(), StoreError> {
-        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-        let catalog_guard = catalog.lock()?;
+        let catalog_guard = self.catalog.lock()?;
         let mut options = OpenOptions::new();
         options.read(true).write(self.writable);
         let current = options.open(&self.path)?;
@@ -1671,8 +1696,7 @@ impl Store {
         if self.head.txid < self.active.header.start_txid {
             return Ok(());
         }
-        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-        let guard = catalog.lock()?;
+        let guard = self.catalog.lock()?;
         let size = LogicalBytes::new(self.head.logical_size, PageSize::new(self.head.page_size)?)?;
         let txid = TransactionId::new(self.head.txid)?;
         let pages = self
@@ -1721,8 +1745,7 @@ impl Store {
         let Some(view) = self.view.as_ref() else {
             return Ok(());
         };
-        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-        let guard = catalog.lock()?;
+        let guard = self.catalog.lock()?;
         // Compaction is an LSM metadata merge. Payload packs are immutable and
         // frame payload bytes are neither read, decoded, nor rewritten.
         if view.is_checkpoint() {
@@ -1749,8 +1772,7 @@ impl Store {
             }
         }
         if let Some(view) = &self.view {
-            let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-            view.verify(&catalog.lock()?)?;
+            view.verify(&self.catalog.lock()?)?;
         }
         Ok(())
     }
@@ -1776,8 +1798,7 @@ impl Store {
             .map_or(Ok((0, 0)), crate::storage::PinnedView::object_bytes)?;
         let file_metadata = self.active.file.metadata()?;
         let logical_page_count = page_count(self.head.logical_size, self.head.page_size)?;
-        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-        let mut guard = catalog.lock()?;
+        let mut guard = self.catalog.lock()?;
         Ok(Inspect {
             manifest: self
                 .view
@@ -1888,8 +1909,7 @@ impl Store {
         let result = (|| {
             self.flush_sidecars()?;
             let view = self.view.as_ref().ok_or(StoreError::UnknownPageSize)?;
-            let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-            catalog.lock()?.retain(name, view, replace)
+            self.catalog.lock()?.retain(name, view, replace)
         })();
         self.release_maintenance();
         result
@@ -1900,10 +1920,7 @@ impl Store {
         pin: crate::storage::DurablePin,
     ) -> Result<(), StoreError> {
         self.acquire_maintenance()?;
-        let result = (|| {
-            let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-            catalog.lock()?.release(pin)
-        })();
+        let result = (|| self.catalog.lock()?.release(pin))();
         self.release_maintenance();
         result
     }
@@ -1912,8 +1929,7 @@ impl Store {
         &self,
         name: &crate::storage::RetentionName,
     ) -> Result<crate::storage::PinnedView, StoreError> {
-        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-        let guard = catalog.lock()?;
+        let guard = self.catalog.lock()?;
         let pin = guard.read_root(name)?;
         guard.pin_retained(&pin)
     }
@@ -1922,8 +1938,7 @@ impl Store {
         &mut self,
         budget: usize,
     ) -> Result<crate::storage::GcReport, StoreError> {
-        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-        catalog.lock()?.collect(budget)
+        self.catalog.lock()?.collect(budget)
     }
 
     pub(crate) fn background_flush_due(&self) -> bool {
@@ -1941,6 +1956,9 @@ impl Store {
                 >= u64::from(self.active.header.policy.max_stale_seconds)
     }
 
+    /// One background tick. With nothing to seal and nothing changed since an
+    /// earlier pass proved there is no collection or repacking to do, a tick
+    /// reads the published catalog revision and writes nothing.
     pub(crate) fn try_background_maintenance(&mut self) -> Result<(), StoreError> {
         if self.has_pending() || self.publication_owner.phase() == PublicationPhase::Checkpoint {
             return Ok(());
@@ -1951,10 +1969,48 @@ impl Store {
             self.release_maintenance();
             result?;
         }
-        if self.layout.deletion_budget() > 0 {
+        if self.layout.deletion_budget() > 0 && !self.collection_settled()? {
             self.collect_garbage(self.layout.deletion_budget())?;
         }
+        if self.repack_settled()? {
+            return Ok(());
+        }
         self.repack_once().map(|_| ())
+    }
+
+    fn view_id(&self) -> Option<crate::domain::ManifestId> {
+        self.view.as_ref().map(crate::storage::PinnedView::id)
+    }
+
+    /// Collection outcomes change only with a catalog publication (seals,
+    /// repacks, roots, heads, retirements), this store's view, or a reader
+    /// lease release. A settled pass saw no lease-only objects, so the first
+    /// two suffice; the periodic recheck covers unpublished orphans.
+    fn collection_settled(&self) -> Result<bool, StoreError> {
+        let Some(settled) = &self.idle.collection else {
+            return Ok(false);
+        };
+        if settled.view != self.view_id() || settled.at.elapsed() >= COLLECTION_RECHECK {
+            return Ok(false);
+        }
+        Ok(self.catalog.published_revision()? == settled.revision)
+    }
+
+    /// Repack eligibility needs at least one pack below the occupancy threshold,
+    /// which depends only on the pinned view's metadata and the layout policy.
+    fn repack_settled(&mut self) -> Result<bool, StoreError> {
+        let Some(view) = &self.view else {
+            return Ok(false);
+        };
+        let key = (view.id(), self.layout);
+        if self.idle.repack == Some(key) {
+            return Ok(true);
+        }
+        if crate::storage::has_repack_candidates(view, self.layout)? {
+            return Ok(false);
+        }
+        self.idle.repack = Some(key);
+        Ok(true)
     }
 
     pub(crate) fn repack_once(&mut self) -> Result<crate::storage::MaintenanceReport, StoreError> {
@@ -1968,8 +2024,7 @@ impl Store {
         // there is no pack to rewrite. This advisory check holds only catalogue
         // exclusion; repack() selects again under both locks below.
         {
-            let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-            let guard = catalog.lock()?;
+            let guard = self.catalog.lock()?;
             if crate::storage::eligible_packs(
                 &guard,
                 self.view.as_ref().ok_or(StoreError::Corrupt(0))?,
@@ -1987,8 +2042,7 @@ impl Store {
             if self.has_pending() || self.head.txid >= self.active.header.start_txid {
                 return Ok(crate::storage::MaintenanceReport::default());
             }
-            let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-            let guard = catalog.lock()?;
+            let guard = self.catalog.lock()?;
             let view = self.view.as_ref().ok_or(StoreError::Corrupt(0))?;
             let Some(candidate) =
                 crate::storage::repack(&guard, view, self.layout, self.dictionary_policy())?
@@ -2087,10 +2141,17 @@ impl Store {
         // Payload reachability changes only under catalogue exclusion. Ordinary
         // main-image writes do not change the immutable header's base manifest.
         // Do not reserve SQLite publication for a read/GC-only catalogue pass.
-        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-        match catalog.try_lock() {
+        match self.catalog.try_lock() {
             Ok(mut guard) => {
-                let _report = guard.collect(limit)?;
+                self.idle.collection = None;
+                let (report, lease_held) = guard.collect_with_leases(limit)?;
+                if report.collectible_bytes == 0 && !lease_held {
+                    self.idle.collection = Some(SettledCollection {
+                        revision: guard.revision(),
+                        view: self.view_id(),
+                        at: std::time::Instant::now(),
+                    });
+                }
                 Ok(())
             }
             Err(StoreError::Busy) => Ok(()),
@@ -2379,6 +2440,62 @@ mod tests {
                 .to_be_bytes(),
         );
         image
+    }
+
+    #[test]
+    fn idle_background_ticks_leave_the_filesystem_alone() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::fs::io_counts::snapshot;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("idle.zsqlite");
+        let idle_ticks = |store: &mut Store| -> Result<(), Box<dyn std::error::Error>> {
+            let before = snapshot();
+            for _ in 0..5 {
+                store.try_background_maintenance()?;
+            }
+            assert_eq!(
+                snapshot(),
+                before,
+                "idle ticks did catalog or directory work"
+            );
+            Ok(())
+        };
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &[page(1, 4096), page(2, 4096)].concat())?;
+        store.publish(true)?;
+        store.flush_sidecars()?;
+        store.try_background_maintenance()?;
+        idle_ticks(&mut store)?;
+
+        // A reader keeps the first seal's pack alive after the next seal.
+        let reader = Store::open_existing_read_only(&path)?;
+        store.write_at(0, &[page(3, 4096), page(4, 4096)].concat())?;
+        store.publish(true)?;
+        store.flush_sidecars()?;
+        store.try_background_maintenance()?;
+        store.try_background_maintenance()?;
+        let held = store.gc_report(0)?;
+        assert!(held.reader_retained_bytes > 0);
+        assert_eq!(held.collectible_bytes, 0);
+        // Releasing a lease publishes nothing, yet the next tick collects.
+        drop(reader);
+        assert!(store.gc_report(0)?.collectible_bytes > 0);
+        store.try_background_maintenance()?;
+        assert_eq!(store.gc_report(0)?.collectible_bytes, 0);
+        store.try_background_maintenance()?;
+        idle_ticks(&mut store)?;
+
+        // Another process's publication is noticed without a local change.
+        let mut other = Store::open_existing(&path)?;
+        other.write_at(0, &page(5, 4096))?;
+        other.publish(true)?;
+        other.flush_sidecars()?;
+        drop(other);
+        store.refresh()?;
+        let before = snapshot();
+        store.try_background_maintenance()?;
+        assert_ne!(snapshot(), before, "a new publication must be traced");
+        Ok(())
     }
 
     #[test]
