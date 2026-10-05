@@ -1330,7 +1330,16 @@ impl Store {
                 parse_page_size(page).unwrap_or(0),
             ));
         }
-        if !self.pending_raw_originals.contains_key(&page_no) {
+        // Rollback truncates appended records and returns to the immutable base view. Only a
+        // committed mutable record overwritten in place needs an undo copy. Keeping zero/base
+        // pages here made a conversion allocate another full database before its first commit.
+        if self
+            .active
+            .active_records
+            .get(&page_no)
+            .is_some_and(|offset| *offset < self.head.active_commit_end)
+            && !self.pending_raw_originals.contains_key(&page_no)
+        {
             let original = self.read_page(page_no)?;
             self.pending_raw_originals.insert(page_no, original);
         }
@@ -3071,6 +3080,54 @@ mod tests {
         let mut output = vec![0; 4096];
         store.read_at(0, &mut output)?;
         assert_eq!(output, first);
+        Ok(())
+    }
+
+    #[test]
+    fn appended_pages_need_no_payload_undo_copies() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path().join("conversion.zsqlite"), true)?;
+        let bytes = page(3, 4096);
+        // A conversion writes every source page before its first publication. Payload undo
+        // memory must stay zero as the source grows; only page indexes grow with the image.
+        for number in 0..8192 {
+            store.write_at(number * 4096, &bytes)?;
+        }
+        assert!(store.pending_raw_originals.is_empty());
+        store.discard_pending();
+        assert_eq!(store.logical_size(), 0);
+        assert!(store.active.active_records.is_empty());
+
+        store.write_at(0, &bytes)?;
+        store.publish(true)?;
+        store.write_at(0, &page(4, 4096))?;
+        store.write_at(4096, &bytes)?;
+        assert_eq!(store.pending_raw_originals.len(), 1);
+        store.discard_pending();
+        assert_eq!(store.logical_size(), 4096);
+        let mut actual = vec![0; 4096];
+        store.read_at(0, &mut actual)?;
+        assert_eq!(actual, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_of_sealed_page_appends_restores_the_base_without_undo_copies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path().join("sealed-rollback.zsqlite"), true)?;
+        let bytes = page(3, 4096);
+        store.write_at(0, &bytes)?;
+        store.publish(true)?;
+        store.flush_sidecars()?;
+        store.write_at(0, &page(4, 4096))?;
+        store.write_at(4096, &bytes)?;
+        assert!(store.pending_raw_originals.is_empty());
+        store.discard_pending();
+        assert_eq!(store.logical_size(), 4096);
+        let mut actual = vec![0; 4096];
+        store.read_at(0, &mut actual)?;
+        assert_eq!(actual, bytes);
         Ok(())
     }
 
