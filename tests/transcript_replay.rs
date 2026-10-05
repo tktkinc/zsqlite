@@ -297,7 +297,10 @@ fn current_transcript_mutations_churn_indexes_and_restore_typed_rows() -> Result
             .iter()
             .any(|query| query.table.ends_with("_data"))
     );
-    assert!(db.rows("PRAGMA foreign_key_check")?.is_empty());
+    assert_eq!(
+        db.rows("PRAGMA foreign_key_check")?,
+        Vec::<Vec<String>>::new()
+    );
     Ok(())
 }
 

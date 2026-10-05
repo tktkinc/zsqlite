@@ -92,7 +92,7 @@ fn root_cas_and_immutable_put_contract() -> TestResult {
         )?];
         assert_eq!(backend.read_ranges(&ranges)?, vec![b"ayl".to_vec()]);
         assert_eq!(backend.inventory(None, 1)?, vec![key]);
-        assert!(backend.inventory(Some(key), 1)?.is_empty());
+        assert_eq!(backend.inventory(Some(key), 1)?, Vec::<ObjectKey>::new());
         assert!(
             backend
                 .put(key, StoredBytes::new(6), &mut &b"payload"[..])
@@ -439,7 +439,7 @@ fn staged_objects_are_invisible_until_consumed_finish() -> TestResult {
         let mut writer = backend.begin_write()?;
         writer.write_all(b"first ")?;
         writer.write_all(b"second")?;
-        assert!(backend.inventory(None, 10)?.is_empty());
+        assert_eq!(backend.inventory(None, 10)?, Vec::<ObjectKey>::new());
         let key = ObjectKey::Blob(BlobId::from_bytes(
             *blake3::hash(b"first second").as_bytes(),
         ));
