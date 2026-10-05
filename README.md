@@ -222,7 +222,9 @@ Content and lineage hashes are computed at sealing, not on each mutable
 publication. Packs derive identity from ordered frame IDs and layout metadata;
 blobs derive identity from ordered pack extents. Adapter-owned staged writers
 stream payloads and finalize under the completed key. Filesystem finalization
-installs the same temporary file without copying it. Objects have no 512 MiB cap;
+installs the same temporary file without copying it, by hard link or, where
+links are refused (Android app sandboxes), an equally atomic no-clobber rename.
+Notices, conversion and export installs use the same rule. Objects have no 512 MiB cap;
 read, decoding, and metadata budgets remain bounded.
 
 ## Rust API

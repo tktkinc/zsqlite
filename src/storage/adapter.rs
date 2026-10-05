@@ -7,7 +7,7 @@
 use crate::domain::{
     BackendId, BlobId, DictionaryId, IndexId, ManifestId, StoredBytes, StoredRange,
 };
-use crate::fs::{ExclusiveLock, read_exact_at, sync_dir};
+use crate::fs::{ExclusiveLock, Published, publish_noclobber, read_exact_at, sync_dir};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -302,16 +302,15 @@ impl FilesystemBackend {
             let mut temporary = tempfile::NamedTempFile::new_in(&root)?;
             temporary.write_all(&nonce()?)?;
             temporary.as_file().sync_all()?;
-            match std::fs::hard_link(temporary.path(), &identity_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                // Android denies `link` (see the object-install site); fall back to rename, guarded so
-                // a first writer wins rather than clobbering an identity another writer just installed.
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    if !identity_path.exists() {
-                        std::fs::rename(temporary.path(), &identity_path)?;
-                    }
+            // The first opener's identity wins. Neither a link nor the no-clobber
+            // rename used where links are refused (Android) replaces it.
+            match publish_noclobber(temporary.path(), &identity_path) {
+                Ok(Published::Linked) => {}
+                Ok(Published::Renamed) => {
+                    // The staging name now is the identity; do not unlink it on drop.
+                    let _ = temporary.keep();
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
             sync_dir(&root).map_err(storage_io)?;
@@ -357,27 +356,24 @@ impl Write for FilesystemWriter<'_> {
 }
 impl ObjectWriter for FilesystemWriter<'_> {
     fn finish(self: Box<Self>, key: ObjectKey, length: StoredBytes) -> Result<(), BackendError> {
-        let staging = &self.staging;
+        let Self { backend, staging } = *self;
         if length.get() == 0 || staging.as_file().metadata()?.len() != length.get() {
             return Err(BackendError::Range);
         }
         staging.as_file().sync_all()?;
         #[cfg(test)]
         super::faults::check(super::faults::Point::ObjectDataSynced)?;
-        match std::fs::hard_link(staging.path(), self.backend.object_path(key)) {
-            Ok(()) => {}
-            // SELinux on Android denies `link` for app domains (`getenforce` = Enforcing), so hard-link
-            // fails with EPERM/EACCES on the phone. Install by atomic `rename` instead: the object is
-            // content-addressed and immutable, so replacing it with identical bytes is safe, and rename
-            // is atomic on the same filesystem. Non-Android hosts keep the hard-link + de-dup path.
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                staging.as_file().sync_all()?;
-                std::fs::rename(staging.path(), self.backend.object_path(key))?;
-                sync_dir(&self.backend.root.join("objects")).map_err(storage_io)?;
-                return Ok(());
+        // Content-addressed objects are never replaced. Where links are refused
+        // (Android), a no-clobber rename installs the same synced inode; an
+        // existing object must still hold exactly the staged bytes.
+        match publish_noclobber(staging.path(), &backend.object_path(key)) {
+            Ok(Published::Linked) => {}
+            Ok(Published::Renamed) => {
+                // The staging name now is the object; do not unlink it on drop.
+                let _ = staging.keep();
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let file = std::fs::File::open(self.backend.object_path(key))?;
+                let file = std::fs::File::open(backend.object_path(key))?;
                 if file.metadata()?.len() != length.get() {
                     return Err(BackendError::IdentityMismatch(key));
                 }
@@ -399,7 +395,7 @@ impl ObjectWriter for FilesystemWriter<'_> {
         }
         #[cfg(test)]
         super::faults::check(super::faults::Point::ObjectLinked)?;
-        sync_dir(&self.backend.root.join("objects")).map_err(storage_io)?;
+        sync_dir(&backend.root.join("objects")).map_err(storage_io)?;
         #[cfg(test)]
         super::faults::check(super::faults::Point::ObjectDirectorySynced)?;
         Ok(())

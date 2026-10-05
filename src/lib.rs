@@ -90,7 +90,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::fs::{absolute_path, read_exact_at, sync_parent_dir};
+use crate::fs::{Published, absolute_path, publish_noclobber, read_exact_at, sync_parent_dir};
 
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -265,7 +265,9 @@ pub fn export_to_sqlite(
     output.sync_all()?;
     let length = output.metadata()?.len();
     drop(output);
-    std::fs::hard_link(&staging, &destination).map_err(|error| {
+    // A link, or the no-clobber rename used where links are refused, never
+    // replaces an existing destination.
+    let published = publish_noclobber(&staging, &destination).map_err(|error| {
         if error.kind() == ErrorKind::AlreadyExists {
             StoreError::DestinationExists(destination.clone())
         } else {
@@ -274,11 +276,11 @@ pub fn export_to_sqlite(
     })?;
     sync_parent_dir(&destination)?;
 
-    // The destination link is now the committed result. Staging cleanup is
+    // The destination name is now the committed result. Staging cleanup is
     // post-commit housekeeping and must not turn success into an ambiguous
     // error while leaving the complete destination in place.
     cleanup.disarm();
-    if std::fs::remove_file(&staging).is_ok() {
+    if published == Published::Linked && std::fs::remove_file(&staging).is_ok() {
         let _ = sync_parent_dir(&destination);
     }
     Ok(length)
@@ -337,7 +339,9 @@ fn install_staged_bundle(staging: &Path, destination: &Path) -> Result<(), Store
     // Publish the complete recognizable active file first. Until the sidecar
     // arrives, a racing VFS open fails closed; it cannot create a new database
     // inside a sidecar directory that this installer is about to replace.
-    std::fs::hard_link(&file_staging, &destination_paths[0]).map_err(|error| {
+    // Where links are refused (Android), a no-clobber rename publishes the
+    // same inode without ever aliasing it.
+    let published = publish_noclobber(&file_staging, &destination_paths[0]).map_err(|error| {
         if error.kind() == ErrorKind::AlreadyExists {
             StoreError::DestinationExists(destination.to_path_buf())
         } else {
@@ -345,14 +349,19 @@ fn install_staged_bundle(staging: &Path, destination: &Path) -> Result<(), Store
         }
     })?;
     installed.paths.push(destination_paths[0].clone());
+    if published == Published::Renamed {
+        file_cleanup.disarm();
+    }
     sync_parent_dir(destination)?;
 
-    // Remove the publication helper before making the sidecar visible. Thus a
-    // complete installed bundle never has an aliased active file, even if the
-    // process dies before the original conversion staging bundle is cleaned.
-    std::fs::remove_file(&file_staging)?;
-    file_cleanup.disarm();
-    sync_parent_dir(destination)?;
+    // Remove a link's publication helper before making the sidecar visible.
+    // Thus a complete installed bundle never has an aliased active file, even
+    // if the process dies before the original conversion staging is cleaned.
+    if published == Published::Linked {
+        std::fs::remove_file(&file_staging)?;
+        file_cleanup.disarm();
+        sync_parent_dir(destination)?;
+    }
 
     // The namespace moves as a unit; its machine-local attachment reservation
     // must describe the destination before the sidecar becomes visible.
@@ -494,6 +503,65 @@ mod tests {
             assert_eq!(std::fs::read(output)?, bytes);
         }
         assert_eq!(std::fs::read(source)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn refused_hard_links_still_install_every_bundle_file() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use storage::adapter::ObjectKey;
+        // Android's SELinux policy refuses link() to apps. Every install site
+        // must use the no-clobber rename instead and leave no staging names.
+        let _refused = crate::fs::refuse_links();
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.sqlite");
+        let bytes = (1..=6).flat_map(sqlite_page).collect::<Vec<_>>();
+        std::fs::write(&source, &bytes)?;
+        let destination = directory.path().join("converted.db");
+        convert_to_zsqlite(&source, &destination)?;
+        let output = directory.path().join("export.sqlite");
+        export_to_sqlite(&destination, &output)?;
+        assert_eq!(std::fs::read(&output)?, bytes);
+        assert!(matches!(
+            export_to_sqlite(&destination, &output),
+            Err(StoreError::DestinationExists(_))
+        ));
+        let created = directory.path().join("created.db");
+        create_with_dictionary_from(&created, [&destination])?;
+        facade::validate_notice(&facade::storage_path(&created))?;
+
+        let mut names = std::fs::read_dir(directory.path())?
+            .map(|entry| Ok(entry?.file_name().into_string().map_err(|_| "name")?))
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "converted.db",
+                "converted.db.zsqlite",
+                "converted.db.zsqlite.d",
+                "created.db",
+                "created.db.zsqlite",
+                "created.db.zsqlite.d",
+                "export.sqlite",
+                "source.sqlite",
+            ]
+        );
+        let sidecar = backend::sidecar_dir(&facade::storage_path(&destination));
+        assert_eq!(std::fs::read(sidecar.join("backend.identity"))?.len(), 32);
+        for entry in std::fs::read_dir(sidecar.join("objects"))? {
+            let name = entry?.file_name().into_string().map_err(|_| "name")?;
+            ObjectKey::parse(&name).map_err(|_| format!("stray object entry {name}"))?;
+        }
+
+        // Re-installing an existing object compares bytes rather than replacing it.
+        let backend = FilesystemBackend::open(directory.path().join("objects-only"))?;
+        let key = ObjectKey::Blob(domain::BlobId::from_bytes([7; 32]));
+        let length = domain::StoredBytes::new(5);
+        backend.put(key, length, &mut &b"first"[..])?;
+        backend.put(key, length, &mut &b"first"[..])?;
+        assert!(backend.put(key, length, &mut &b"other"[..]).is_err());
+        assert_eq!(std::fs::read(backend.object_path(key))?, b"first");
         Ok(())
     }
 

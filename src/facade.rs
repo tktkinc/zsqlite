@@ -1,6 +1,6 @@
 //! Ordinary-SQLite facade files for logical `.db` paths.
 
-use crate::fs::{read_exact_at, sync_parent_dir, write_all_at};
+use crate::fs::{publish_noclobber, read_exact_at, sync_parent_dir, write_all_at};
 use crate::store::StoreError;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -88,8 +88,11 @@ pub(crate) fn ensure_notice(storage: &Path) -> Result<(), StoreError> {
         file.sync_all()?;
         make_read_only(&file)?;
         file.sync_all()?;
-        match std::fs::hard_link(&staging, &path) {
-            Ok(()) => {}
+        // Never replace an existing notice. Where links are refused (Android),
+        // the no-clobber rename consumes the staging name; the removal below
+        // then finds nothing, which is not an error.
+        match publish_noclobber(&staging, &path) {
+            Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 if !notice_matches(&path)? {
                     return Err(StoreError::InvalidConfiguration(

@@ -403,14 +403,26 @@ pub(crate) fn install_pagefile(
     staging: tempfile::NamedTempFile,
     destination: &Path,
 ) -> std::io::Result<()> {
+    rename_noclobber(staging.path(), destination)
+}
+
+/// Atomically rename within one directory, failing with `AlreadyExists`
+/// instead of replacing an existing destination.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+pub(crate) fn rename_noclobber(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let source = std::ffi::CString::new(staging.path().as_os_str().as_bytes())?;
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
     let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
     // SAFETY: valid NUL-terminated paths borrowed for the syscall. Both names
     // are in the same directory and exclusion forbids replacing a destination.
     #[cfg(target_os = "macos")]
     let result =
         unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    // `RENAME_NOREPLACE` is typed `i32` in Android's libc but `u32` in glibc; cast so the
+    // `renameat2` flags argument matches on both.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[allow(clippy::unnecessary_cast)]
+    let flags = libc::RENAME_NOREPLACE as u32;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: Both CStrings own terminated path bytes through the syscall;
     // renameat2 borrows them synchronously and retains no Rust pointers.
@@ -420,15 +432,103 @@ pub(crate) fn install_pagefile(
             source.as_ptr(),
             libc::AT_FDCWD,
             destination.as_ptr(),
-            // `RENAME_NOREPLACE` is typed `i32` in Android's libc but `u32` in glibc; cast so the
-            // `renameat2` flags argument matches on both.
-            libc::RENAME_NOREPLACE as u32,
+            flags,
         )
     };
     if result != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+pub(crate) fn rename_noclobber(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(ErrorKind::Unsupported.into())
+}
+
+/// How [`publish_noclobber`] gave a staged file its destination name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Published {
+    /// Hard link: the staging name still exists and remains the caller's to remove.
+    Linked,
+    /// No-clobber rename: the staging name is gone.
+    Renamed,
+}
+
+/// Atomically publish a complete, already-synced staged file under a name in
+/// the same directory, failing with `AlreadyExists` rather than replacing it.
+///
+/// `link()` and a no-clobber rename (`renameat2(RENAME_NOREPLACE)`, macOS
+/// `renamex_np(RENAME_EXCL)`) give the same guarantees here: at every crash
+/// point the destination name is either absent or names the complete synced
+/// inode, and an existing destination is never overwritten. Callers sync the
+/// directory afterwards either way. The only difference is whether the staging
+/// name survives, which callers handle through the returned [`Published`].
+/// Android's `SELinux` policy denies `link()` to app domains (EACCES, with an
+/// audit record per attempt), so Android renames directly. Elsewhere a link
+/// refused with EPERM/EACCES/ENOTSUP falls back to the no-clobber rename.
+pub(crate) fn publish_noclobber(staging: &Path, destination: &Path) -> std::io::Result<Published> {
+    if !cfg!(target_os = "android") {
+        match hard_link(staging, destination) {
+            Ok(()) => return Ok(Published::Linked),
+            Err(error) if !link_refused(&error) => return Err(error),
+            Err(error) => {
+                return match rename_noclobber(staging, destination) {
+                    Ok(()) => Ok(Published::Renamed),
+                    Err(fallback) if fallback.kind() == ErrorKind::Unsupported => Err(error),
+                    Err(fallback) => Err(fallback),
+                };
+            }
+        }
+    }
+    rename_noclobber(staging, destination)?;
+    Ok(Published::Renamed)
+}
+
+fn hard_link(staging: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if LINKS_REFUSED.with(std::cell::Cell::get) {
+        return Err(ErrorKind::PermissionDenied.into());
+    }
+    std::fs::hard_link(staging, destination)
+}
+
+/// The filesystem or security policy refuses hard links outright, as opposed
+/// to a destination conflict or an ordinary I/O failure.
+fn link_refused(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    if let Some(code) = error.raw_os_error() {
+        return code == libc::ENOTSUP || code == libc::EOPNOTSUPP;
+    }
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    static LINKS_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: make every [`publish_noclobber`] link attempt on this thread fail
+/// as Android's `SELinux` policy does, forcing the no-clobber rename fallback.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct RefuseLinks;
+#[cfg(test)]
+pub(crate) fn refuse_links() -> RefuseLinks {
+    LINKS_REFUSED.with(|refused| refused.set(true));
+    RefuseLinks
+}
+#[cfg(test)]
+impl Drop for RefuseLinks {
+    fn drop(&mut self) {
+        LINKS_REFUSED.with(|refused| refused.set(false));
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
@@ -441,6 +541,63 @@ pub(crate) fn install_pagefile(
         .persist_noclobber(destination)
         .map(drop)
         .map_err(|error| error.error)
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+
+    #[test]
+    fn refused_links_fall_back_to_a_no_clobber_rename() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let staged = |name: &str, bytes: &[u8]| -> std::io::Result<PathBuf> {
+            let path = directory.path().join(name);
+            std::fs::write(&path, bytes)?;
+            Ok(path)
+        };
+        let destination = directory.path().join("destination");
+
+        let linked = staged("linked", b"linked")?;
+        let expected = if cfg!(target_os = "android") {
+            Published::Renamed
+        } else {
+            Published::Linked
+        };
+        assert_eq!(publish_noclobber(&linked, &destination)?, expected);
+        assert_eq!(linked.exists(), expected == Published::Linked);
+        std::fs::remove_file(&destination)?;
+
+        let _refused = refuse_links();
+        let renamed = staged("renamed", b"first")?;
+        assert_eq!(
+            publish_noclobber(&renamed, &destination)?,
+            Published::Renamed
+        );
+        assert!(!renamed.exists());
+        let conflict = staged("conflict", b"second")?;
+        let error = publish_noclobber(&conflict, &destination).expect_err("no clobber");
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination)?, b"first");
+        assert_eq!(std::fs::read(&conflict)?, b"second");
+        Ok(())
+    }
+
+    #[test]
+    fn only_link_refusals_select_the_rename_fallback() {
+        let refused = [libc::EPERM, libc::EACCES, libc::ENOTSUP, libc::EOPNOTSUPP];
+        for code in refused {
+            assert!(link_refused(&std::io::Error::from_raw_os_error(code)));
+        }
+        for code in [
+            libc::EEXIST,
+            libc::ENOENT,
+            libc::EIO,
+            libc::ENOSPC,
+            libc::EXDEV,
+        ] {
+            assert!(!link_refused(&std::io::Error::from_raw_os_error(code)));
+        }
+    }
 }
 
 #[cfg(test)]

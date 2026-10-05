@@ -332,7 +332,8 @@ dictionary reuse, offline roots and leases, stale releases, whole-pack GC,
 bounded repacking, all SQLite page sizes, truncate/regrow, rollback/WAL,
 concurrency and exact export/reopen.
 
-Test-only injection covers object sync/link/install, manifest finalization,
+Test-only injection covers object sync/link/install, refused hard links (the
+no-clobber rename fallback), manifest finalization,
 active sync/rename/directory sync, state publication and root replacement.
 Subprocess abrupt exits cover every seal publication boundary. I/O-error tests
 assert that possibly visible publication never triggers unsafe cleanup or an
