@@ -208,11 +208,50 @@ pub trait ObjectWriter: Write + Send {
     fn finish(self: Box<Self>, key: ObjectKey, length: StoredBytes) -> Result<(), BackendError>;
 }
 
+/// How soon sealed snapshots must catch up with local commits. Commits are
+/// already durable in the local active file; a seal publishes them to the
+/// backend as a recovery point. Seal once writes have been quiet for `settle`,
+/// and never leave a commit unsealed for longer than `max_age`. Deadlines are
+/// kept by processes with the database open through the VFS; a database closed
+/// with unsealed commits is sealed when one next opens it after the deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SealSchedule {
+    settle: std::time::Duration,
+    max_age: std::time::Duration,
+}
+impl SealSchedule {
+    pub fn new(
+        settle: std::time::Duration,
+        max_age: std::time::Duration,
+    ) -> Result<Self, crate::StoreError> {
+        if settle > max_age {
+            return Err(crate::StoreError::InvalidConfiguration(
+                "seal settle time must not exceed the maximum unsealed age",
+            ));
+        }
+        Ok(Self { settle, max_age })
+    }
+    #[must_use]
+    pub const fn settle(self) -> std::time::Duration {
+        self.settle
+    }
+    #[must_use]
+    pub const fn max_age(self) -> std::time::Duration {
+        self.max_age
+    }
+}
+
 /// Implement this trait outside zsqlite to provide a storage transport. The
 /// backend does not parse database manifests, select packs, or decide liveness.
 /// Calls are synchronous to match `SQLite`; an adapter may own a runtime internally.
 pub trait StorageBackend: Send + Sync {
     fn identity(&self) -> BackendId;
+    /// When committed writes must be sealed into this backend. The default
+    /// requests nothing: local commits are durable, so only a byte rollover
+    /// target or an explicit flush seals.
+    fn seal_schedule(&self) -> Option<SealSchedule> {
+        None
+    }
     /// Begin streaming without knowing the final content-derived key or length.
     fn begin_write(&self) -> Result<Box<dyn ObjectWriter + '_>, BackendError>;
     /// Convenience for an already named object. Consume exactly `length` bytes
@@ -769,6 +808,9 @@ impl ObjectWriter for FaultWriter<'_> {
 impl StorageBackend for FaultBackend {
     fn identity(&self) -> BackendId {
         self.inner.identity()
+    }
+    fn seal_schedule(&self) -> Option<SealSchedule> {
+        self.inner.seal_schedule()
     }
     fn begin_write(&self) -> Result<Box<dyn ObjectWriter + '_>, BackendError> {
         self.check(Operation::Put)?;

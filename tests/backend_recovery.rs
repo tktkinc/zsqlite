@@ -206,6 +206,218 @@ fn create_native(path: &Path) -> TestResult {
     Ok(())
 }
 
+#[test]
+fn adoption_is_immediately_writable_while_paused_and_keeps_new_writes() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("adopt.db");
+    create_native(&path)?;
+    let info = zsqlite::adopt_to_zsqlite(&path)?;
+    assert_eq!(info.sealed_object_bytes, 0);
+    assert_eq!(info.conversion.as_ref().unwrap().converted_bytes, 0);
+    let physical = directory.path().join("adopt.db.zsqlite");
+    let source = sidecar(&physical).join(".source");
+    assert!(source.exists());
+    assert!(zsqlite::pause_conversion(&path)?.paused);
+    let initial = zsqlite::conversion_step(&path)?;
+    assert_eq!(initial.converted_bytes, 0);
+    {
+        let connection = Connection::open_zsqlite(&path)?;
+        assert_eq!(connection.integer("SELECT count(*) FROM events")?, 80);
+        connection.execute("PRAGMA journal_mode=WAL; UPDATE events SET payload=x'1234' WHERE id=1; INSERT INTO events VALUES(100, x'5678'); PRAGMA wal_checkpoint(TRUNCATE);")?;
+        assert_eq!(
+            connection.integer("SELECT length(payload) FROM events WHERE id=1")?,
+            2
+        );
+        assert_eq!(connection.integer("SELECT count(*) FROM events")?, 81);
+    }
+    assert!(zsqlite::conversion_status(&path)?.unwrap().paused);
+    assert_eq!(zsqlite::conversion_step(&path)?.converted_bytes, 0);
+    assert!(!zsqlite::resume_conversion(&path)?.paused);
+    while !zsqlite::conversion_step(&path)?.complete {}
+    assert!(!source.exists());
+    {
+        let connection = Connection::open_zsqlite(&path)?;
+        assert_eq!(
+            connection.integer("SELECT length(payload) FROM events WHERE id=1")?,
+            2
+        );
+        assert_eq!(connection.integer("SELECT count(*) FROM events")?, 81);
+        assert_eq!(
+            connection.integer(
+                "SELECT count(*) FROM pragma_integrity_check WHERE integrity_check <> 'ok'"
+            )?,
+            0
+        );
+    }
+    zsqlite::flush(&path)?;
+    zsqlite::verify(&path)?;
+    let exported = directory.path().join("export.sqlite");
+    zsqlite::export_to_sqlite(&path, &exported)?;
+    let connection = Connection::open_native(&exported)?;
+    assert_eq!(connection.integer("SELECT count(*) FROM events")?, 81);
+    assert_eq!(
+        connection.integer("SELECT length(payload) FROM events WHERE id=1")?,
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn conversion_progress_survives_reopen_and_pause_is_durable() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("chunks.db");
+    create_native(&path)?;
+    {
+        let connection = Connection::open_native(&path)?;
+        connection.execute("INSERT INTO events VALUES(101, zeroblob(10000000));")?;
+    }
+    zsqlite::adopt_to_zsqlite(&path)?;
+    let first = zsqlite::conversion_step(&path)?;
+    assert!(!first.complete);
+    assert_eq!(first.converted_bytes, 8 * 1024 * 1024);
+    zsqlite::pause_conversion(&path)?;
+    assert_eq!(
+        zsqlite::conversion_step(&path)?.converted_bytes,
+        first.converted_bytes
+    );
+    assert_eq!(
+        zsqlite::conversion_status(&path)?.unwrap().converted_bytes,
+        first.converted_bytes
+    );
+    zsqlite::collect(&path, 100)?;
+    zsqlite::resume_conversion(&path)?;
+    let complete = zsqlite::conversion_step(&path)?;
+    assert!(complete.complete);
+    assert_eq!(complete.converted_bytes, complete.total_bytes);
+    let connection = Connection::open_zsqlite(&path)?;
+    assert_eq!(
+        connection.integer("SELECT length(payload) FROM events WHERE id=101")?,
+        10_000_000
+    );
+    Ok(())
+}
+
+#[test]
+fn adoption_refuses_a_native_writer_and_can_be_retried() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("locked.db");
+    create_native(&path)?;
+    let connection = Connection::open_native(&path)?;
+    connection.execute("BEGIN IMMEDIATE; UPDATE events SET payload=x'11' WHERE id=1;")?;
+    assert!(matches!(
+        zsqlite::adopt_to_zsqlite(&path),
+        Err(zsqlite::StoreError::Busy)
+    ));
+    connection.execute("COMMIT")?;
+    drop(connection);
+    zsqlite::adopt_to_zsqlite(&path)?;
+    zsqlite::pause_conversion(&path)?;
+    let connection = Connection::open_zsqlite(&path)?;
+    assert_eq!(
+        connection.integer("SELECT length(payload) FROM events WHERE id=1")?,
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn background_conversion_resumes_with_an_open_connection_and_concurrent_writes() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("background.db");
+    create_native(&path)?;
+    {
+        let connection = Connection::open_native(&path)?;
+        connection.execute("INSERT INTO events VALUES(101, zeroblob(10000000));")?;
+    }
+    zsqlite::adopt_to_zsqlite(&path)?;
+    zsqlite::pause_conversion(&path)?;
+    let connection = Connection::open_zsqlite(&path)?;
+    connection.execute("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+    connection.execute("UPDATE events SET payload=x'1234' WHERE id=1;")?;
+    assert_eq!(
+        zsqlite::conversion_status(&path)?.unwrap().converted_bytes,
+        0
+    );
+    zsqlite::resume_conversion(&path)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut writes = 0;
+    loop {
+        connection.execute("UPDATE events SET payload=x'123456' WHERE id=1;")?;
+        writes += 1;
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        assert_eq!(
+            connection.integer("SELECT length(payload) FROM events WHERE id=1")?,
+            3
+        );
+        let status = zsqlite::conversion_status(&path)?.unwrap();
+        assert!(status.last_error.is_none(), "{status:?}");
+        if status.complete {
+            break;
+        }
+        assert!(Instant::now() < deadline, "conversion stalled: {status:?}");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(writes > 0);
+    assert_eq!(
+        connection
+            .integer("SELECT count(*) FROM pragma_integrity_check WHERE integrity_check <> 'ok'")?,
+        0
+    );
+    drop(connection);
+    let connection = Connection::open_zsqlite(&path)?;
+    assert_eq!(connection.integer("SELECT count(*) FROM events")?, 81);
+    assert_eq!(
+        connection.integer("SELECT length(payload) FROM events WHERE id=1")?,
+        3
+    );
+    Ok(())
+}
+
+#[test]
+fn adoption_backfills_a_persistent_uncheckpointed_native_wal() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("native-wal.db");
+    create_native(&path)?;
+    {
+        let connection = Connection::open_native(&path)?;
+        connection.execute("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+        let mut persist = 1_i32;
+        // SAFETY: the connection is owned by this thread; SQLite borrows the
+        // correctly typed flag only during file_control and retains no pointer.
+        let rc = unsafe {
+            ffi::sqlite3_file_control(
+                connection.0,
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_PERSIST_WAL,
+                (&raw mut persist).cast(),
+            )
+        };
+        assert_eq!(rc, ffi::SQLITE_OK);
+        // SAFETY: this db_config option takes an int and an optional int output;
+        // the exclusive connection remains live and no pointer is retained.
+        let rc = unsafe {
+            ffi::sqlite3_db_config(
+                connection.0,
+                ffi::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                1_i32,
+                null_mut::<i32>(),
+            )
+        };
+        assert_eq!(rc, ffi::SQLITE_OK);
+        connection.execute("INSERT INTO events VALUES(99, x'123456');")?;
+    }
+    assert!(wal_path(&path).metadata()?.len() > 32);
+    zsqlite::adopt_to_zsqlite(&path)?;
+    zsqlite::pause_conversion(&path)?;
+    let connection = Connection::open_zsqlite(&path)?;
+    assert_eq!(connection.integer("SELECT count(*) FROM events")?, 81);
+    assert_eq!(
+        connection.integer("SELECT length(payload) FROM events WHERE id=99")?,
+        3
+    );
+    Ok(())
+}
+
 fn managed_delete(path: &Path) -> TestResult<i32> {
     zsqlite::register_static_vfs()
         .map_err(|code| format!("VFS registration failed with SQLite code {code}"))?;

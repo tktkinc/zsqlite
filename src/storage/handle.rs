@@ -336,6 +336,7 @@ impl Storage {
             page_size: header.page_size,
             history: header.base_history,
             commit_unix: 0,
+            first_commit_unix: 0,
             record_count: 0,
             truncate_pages: None,
         };
@@ -437,12 +438,14 @@ impl Database {
         result
     }
     pub fn flush(&self) -> Result<Inspect, StoreError> {
-        let mut store = self.store()?;
-        store.acquire_maintenance()?;
-        let result = store.flush_sidecars();
-        store.release_maintenance();
-        result?;
-        store.inspect()
+        loop {
+            let work = self.store()?.prepare_flush_work()?;
+            let Some(work) = work else {
+                return self.store()?.inspect();
+            };
+            let prepared = work.prepare()?;
+            self.store()?.finish_work(prepared)?;
+        }
     }
     pub fn compact(&self) -> Result<Inspect, StoreError> {
         let mut store = self.store()?;
@@ -474,7 +477,11 @@ impl Database {
     /// Repack a bounded batch with one metadata checkpoint, then collect
     /// unreachable objects within the configured deletion budget.
     pub fn maintain(&self) -> Result<super::MaintenanceReport, StoreError> {
-        self.store()?.repack_once()
+        let Some(work) = self.store()?.prepare_repack_work()? else {
+            return Ok(super::MaintenanceReport::default());
+        };
+        let prepared = work.prepare()?;
+        self.store()?.finish_repack_work(prepared)
     }
     pub fn relocate(
         &self,

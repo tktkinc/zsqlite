@@ -1,12 +1,19 @@
-use super::frame::{EncodedFrame, FrameEncoder, FrameMetadata, PageVersion, install_dictionary};
-use super::objects::{CatalogGuard, Dictionary, Durable, Pack};
-use super::view::{FrameLocation, ManifestBuilder, PinnedView, ViewMetadata};
+use super::frame::{EncodedFrame, FrameMetadata};
+#[cfg(test)]
+use super::frame::{FrameEncoder, PageVersion, install_dictionary};
+#[cfg(test)]
+use super::objects::Dictionary;
+use super::objects::{CatalogGuard, Durable, Pack};
+use super::view::{FrameLocation, ViewMetadata};
+#[cfg(test)]
+use super::view::{ManifestBuilder, PinnedView};
 use crate::StoreError;
 use crate::domain::{
-    DatabaseId, FileOffset, HistoryHash, LineageId, LogicalBytes, PageNumber, StoredRange,
-    TransactionId,
+    DatabaseId, FileOffset, HistoryHash, LineageId, LogicalBytes, StoredRange, TransactionId,
 };
-use crate::layout::LayoutPolicy;
+#[cfg(test)]
+use crate::{domain::PageNumber, layout::LayoutPolicy};
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -22,6 +29,7 @@ pub(crate) struct SealEndpoint {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 pub(crate) enum ManifestMode {
     Incremental,
     Rollup,
@@ -31,9 +39,9 @@ pub(super) struct PackWriter<'g> {
     guard: &'g CatalogGuard,
     builder: super::placement::BlobWriter<'g>,
     identity: super::pack::Identity,
-    offset: u64,
-    metadata_bytes: u64,
-    frames: Vec<(FileOffset, FrameMetadata)>,
+    pub(super) offset: u64,
+    pub(super) metadata_bytes: u64,
+    pub(super) frames: Vec<(FileOffset, FrameMetadata)>,
     cohort: [u8; 32],
 }
 impl<'g> PackWriter<'g> {
@@ -50,7 +58,7 @@ impl<'g> PackWriter<'g> {
             cohort: [0; 32],
         })
     }
-    fn append(&mut self, frame: EncodedFrame) -> Result<(), StoreError> {
+    pub(super) fn append(&mut self, frame: EncodedFrame) -> Result<(), StoreError> {
         let (metadata, payload) = frame.into_parts();
         let metadata_bytes = metadata.encoded_len() as u64 + 64;
         self.metadata_bytes = self
@@ -77,7 +85,10 @@ impl<'g> PackWriter<'g> {
         self.frames.push((offset, metadata));
         Ok(())
     }
-    fn finish(mut self, metadata: &mut ViewMetadata) -> Result<Durable<'g, Pack>, StoreError> {
+    pub(super) fn finish(
+        mut self,
+        metadata: &mut ViewMetadata,
+    ) -> Result<Durable<'g, Pack>, StoreError> {
         let pack = self.identity.finish(self.offset)?;
         self.builder.complete_pack(pack, 32)?;
         let (_, extents) = self.builder.finish()?;
@@ -100,6 +111,7 @@ impl<'g> PackWriter<'g> {
 /// Changed pages only. The source lease retains unchanged dependencies until the
 /// durable complete manifest is published. Empty and first seals share this path.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn seal<'g>(
     guard: &'g CatalogGuard,
     source: Option<&PinnedView>,
@@ -122,6 +134,7 @@ pub(crate) fn seal<'g>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(test)]
 pub(super) fn seal_with_copies<'g>(
     guard: &'g CatalogGuard,
     source: Option<&PinnedView>,

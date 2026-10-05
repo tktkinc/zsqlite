@@ -291,13 +291,30 @@ update spanning the backend catalog and local active file. The existing endpoint
 index selects the widest checkpoint at the exact logical endpoint, so repacking
 requires no new format or lookup layer.
 
-Source comparison precedes head installation. The local
-implementation currently builds while publication/catalogue locks remain held;
-it does not promise nonblocking background compression. `compact()`
-only merges metadata runs and preserves every payload location.
-Idle maintenance first checks eligibility without reserving publication, then
-selects again under publication exclusion if work exists. An idle reader with
-fully live packs therefore does not compete with writers for that lock.
+Source comparison precedes head installation. Sealing copies committed mutable
+page bytes to private scratch under publication exclusion; repacking pins its
+immutable source and selects a bounded batch under catalogue exclusion. Page
+compression, partial-frame decoding/recompression, dictionary training, and
+sample serialization then run outside publication/catalogue locks and the
+shared Store mutex. Publication revalidates the active header and exact logical
+head, rejecting a candidate if intervening writes, policy changes, or a new
+sealed base made it stale. Object installation, metadata encoding, and head
+publication still hold catalogue/publication exclusion. `compact()` only merges
+metadata runs and preserves every payload location. Idle readers with fully
+live packs do not reserve publication just to discover there is no work.
+
+In-place adoption stores an immutable native base in the sidecar's `.source`
+file. The checksummed active header records its original length and SQLite
+header digest; a checksummed `conversion.info` records its identity and size.
+Committed active records and the lowest truncate boundary override this raw
+base. Conversion builds separate 8 MiB prefixes outside database locks and
+retains each published prefix in a catalog root. A durable pause marker prevents
+publication of an in-flight chunk. The complete source checkpoint is attached
+by the ordinary pending/final-head protocol with a replacement active file that
+preserves newer records, logical size, transaction counter, and truncate state.
+Recovery finishes an interrupted attachment before retiring `.source` and its
+temporary retention root. New writes stay durable in the active file during
+source migration; subsequent ordinary seals include them after attachment.
 
 ## Statistics
 

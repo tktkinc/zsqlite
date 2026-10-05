@@ -7,12 +7,15 @@ use zsqlite::storage::adapter::{
     BackendError, DeletePermit, ObjectKey, ObjectRange, Publication, Revision, RootRecord,
     StorageBackend,
 };
-use zsqlite::{MemoryBackend, Storage};
+use zsqlite::{MemoryBackend, SealSchedule, Storage};
 type TestResult = Result<(), Box<dyn std::error::Error>>;
-struct ExternalAdapter(Arc<dyn StorageBackend>);
+struct ExternalAdapter(Arc<dyn StorageBackend>, Option<SealSchedule>);
 impl StorageBackend for ExternalAdapter {
     fn identity(&self) -> BackendId {
         self.0.identity()
+    }
+    fn seal_schedule(&self) -> Option<SealSchedule> {
+        self.1
     }
     fn begin_write(
         &self,
@@ -63,7 +66,7 @@ fn root_cas_and_immutable_put_contract() -> TestResult {
         Arc::new(zsqlite::FilesystemBackend::open(directory.path())?),
     ];
     for backend in backends {
-        let backend = ExternalAdapter(backend);
+        let backend = ExternalAdapter(backend, None);
         let first = backend.compare_exchange_root(None, b"first")?;
         assert!(matches!(first, Publication::Applied(_)));
         assert!(matches!(
@@ -247,7 +250,7 @@ mod sqlite {
             };
             let measured = Arc::new(zsqlite::storage::FaultBackend::new(backend));
             let storage = Storage::new(
-                Arc::new(ExternalAdapter(measured.clone())),
+                Arc::new(ExternalAdapter(measured.clone(), None)),
                 directory.path().join("coord"),
             )?;
             let name = if filesystem {
@@ -305,9 +308,41 @@ mod sqlite {
     }
 
     #[test]
+    fn a_backend_seal_schedule_seals_an_idle_open_database() -> TestResult {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir()?;
+        let schedule = SealSchedule::new(Duration::ZERO, Duration::from_secs(1))?;
+        let storage = Storage::new(
+            Arc::new(ExternalAdapter(
+                Arc::new(MemoryBackend::new()?),
+                Some(schedule),
+            )),
+            directory.path().join("coord"),
+        )?;
+        storage.register_vfs("scheduled-seal")?;
+        let path = directory.path().join("scheduled.zsqlite");
+        let connection = Connection::open(&path, "scheduled-seal")?;
+        connection
+            .exec("CREATE TABLE items(id INTEGER PRIMARY KEY); INSERT INTO items VALUES(7);")?;
+        // The connection stays open and idle: nothing but the scheduler seals.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let sealed = loop {
+            match storage.open_sealed() {
+                Err(zsqlite::StoreError::NoSealedHead) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => break result?,
+            }
+        };
+        assert!(sealed.logical_size().get() > 0);
+        assert_eq!(connection.integer("SELECT id FROM items")?, 7);
+        Ok(())
+    }
+
+    #[test]
     fn external_adapter_runs_divergent_sqlite_forks_in_shared_storage() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let adapter = Arc::new(ExternalAdapter(Arc::new(MemoryBackend::new()?)));
+        let adapter = Arc::new(ExternalAdapter(Arc::new(MemoryBackend::new()?), None));
         let storage = Storage::new(adapter, directory.path().join("coord"))?;
         storage.register_vfs("fork-source")?;
         let source = directory.path().join("source.zsqlite");
@@ -361,7 +396,7 @@ mod sqlite {
         let directory = tempfile::tempdir()?;
         let memory = Arc::new(MemoryBackend::new()?);
         let measured = Arc::new(zsqlite::storage::FaultBackend::new(memory));
-        let adapter = Arc::new(ExternalAdapter(measured.clone()));
+        let adapter = Arc::new(ExternalAdapter(measured.clone(), None));
         let storage = Storage::new(adapter.clone(), directory.path().join("coord"))?;
         let source = directory.path().join("original.zsqlite");
         let database = storage.create(&source)?;
@@ -435,7 +470,7 @@ fn staged_objects_are_invisible_until_consumed_finish() -> TestResult {
         Arc::new(zsqlite::FilesystemBackend::open(directory.path())?),
     ];
     for backend in backends {
-        let backend = ExternalAdapter(backend);
+        let backend = ExternalAdapter(backend, None);
         let mut writer = backend.begin_write()?;
         writer.write_all(b"first ")?;
         writer.write_all(b"second")?;

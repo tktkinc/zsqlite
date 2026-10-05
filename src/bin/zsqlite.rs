@@ -6,6 +6,8 @@ enum Command {
     Flush(PathBuf),
     Compact(PathBuf),
     Convert(PathBuf, PathBuf),
+    Adopt(PathBuf),
+    Conversion(String, PathBuf),
     Export(PathBuf, PathBuf),
 }
 
@@ -41,12 +43,72 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 info.logical_size, info.sealed_object_bytes
             );
         }
+        Command::Adopt(path) => {
+            let info = zsqlite::adopt_to_zsqlite(&path)?;
+            println!(
+                "ready: {} logical bytes; background conversion can be monitored, paused, or resumed",
+                info.logical_size
+            );
+            run_conversion(&path)?;
+        }
+        Command::Conversion(action, path) => match action.as_str() {
+            "status" => print_conversion(
+                &zsqlite::conversion_status(&path)?
+                    .ok_or("database has no background conversion")?,
+            ),
+            "pause" => print_conversion(&zsqlite::pause_conversion(&path)?),
+            "resume" => {
+                print_conversion(&zsqlite::resume_conversion(&path)?);
+                run_conversion(&path)?;
+            }
+            "run" => run_conversion(&path)?,
+            _ => return Err(usage().into()),
+        },
         Command::Export(database, output) => {
             let bytes = zsqlite::export_to_sqlite(database, output)?;
             println!("exported: {bytes} bytes");
         }
     }
     Ok(())
+}
+
+fn print_conversion(status: &zsqlite::ConversionStatus) {
+    let state = if status.complete {
+        "complete"
+    } else if status.paused {
+        "paused"
+    } else if status.running {
+        "running"
+    } else {
+        "ready"
+    };
+    let tenths = u128::from(status.converted_bytes) * 1000 / u128::from(status.total_bytes.max(1));
+    println!(
+        "conversion: {state}; {}/{} bytes ({}.{}%); worker_active={}",
+        status.converted_bytes,
+        status.total_bytes,
+        tenths / 10,
+        tenths % 10,
+        status.running
+    );
+    if let Some(error) = &status.last_error {
+        println!("conversion_error: {error}");
+    }
+}
+
+fn run_conversion(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        match zsqlite::conversion_step(path) {
+            Ok(status) => {
+                print_conversion(&status);
+                if status.complete || status.paused {
+                    return Ok(());
+                }
+            }
+            Err(zsqlite::StoreError::Busy) => std::thread::sleep(std::time::Duration::from_secs(1)),
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn print_inspect(info: &zsqlite::Inspect) {
@@ -60,6 +122,9 @@ fn print_inspect(info: &zsqlite::Inspect) {
     println!("head_history: {}", zsqlite::format::hex(&info.head_history));
     println!("pack_count: {}", info.pack_count);
     println!("active: {}", info.active);
+    if let Some(conversion) = &info.conversion {
+        print_conversion(conversion);
+    }
     println!("file_bytes: {}", info.file_bytes);
     println!("file_allocated_bytes: {}", info.file_allocated_bytes);
     println!("sealed_object_bytes: {}", info.sealed_object_bytes);
@@ -117,8 +182,6 @@ fn print_inspect(info: &zsqlite::Inspect) {
             pack.reclaimable_bytes()
         );
     }
-    println!("settle_seconds: {}", info.policy.settle().as_secs());
-    println!("max_stale_seconds: {}", info.policy.max_stale().as_secs());
     println!(
         "rollover_bytes: {}",
         info.policy
@@ -152,11 +215,22 @@ fn parse_args() -> Result<Command, String> {
         ("flush", [database]) => Ok(Command::Flush(database.clone())),
         ("compact", [database]) => Ok(Command::Compact(database.clone())),
         ("convert", [source, output]) => Ok(Command::Convert(source.clone(), output.clone())),
+        ("convert", [database]) => Ok(Command::Adopt(database.clone())),
+        ("conversion", [action, database])
+            if ["status", "pause", "resume", "run"]
+                .iter()
+                .any(|value| action == *value) =>
+        {
+            Ok(Command::Conversion(
+                action.to_string_lossy().into_owned(),
+                database.clone(),
+            ))
+        }
         ("export", [database, output]) => Ok(Command::Export(database.clone(), output.clone())),
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage: zsqlite <inspect|verify|flush|compact> <database.db>\n       zsqlite convert <sqlite-database> <database.db>\n       zsqlite export <database.db> <sqlite-database>".into()
+    "usage: zsqlite <inspect|verify|flush|compact> <database.db>\n       zsqlite convert <database.db>\n       zsqlite convert <sqlite-database> <database.db>\n       zsqlite conversion <status|pause|resume|run> <database.db>\n       zsqlite export <database.db> <sqlite-database>".into()
 }

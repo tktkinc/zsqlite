@@ -26,6 +26,9 @@ A logical `.db` name is a small read-only SQLite notice database. Selecting the
 database.db                           SQLite notice, not application data
 database.db.zsqlite                   raw active pagefile
 database.db.zsqlite.d/
+  .source                             immutable native base during adoption
+  conversion.info                     source identity and size
+  conversion.paused                   durable pause marker, when paused
   objects/<digest>.segment            metadata run or checkpoint only
   objects/<digest>.blob               complete logical packs + extent index
   objects/<digest>.dict               shared dictionary
@@ -101,10 +104,12 @@ power-loss durability.
 
 Readers pin their selected manifest and its exact physical dependencies.
 New readers may resolve a logical parent through a wider rollup without changing
-the child; existing pins keep their old files alive. The local implementation still
-serializes sealing/repacking with Store publication and its process mutex;
-compression can delay same-process readers. It is not an asynchronous
-object-storage uploader.
+the child; existing pins keep their old files alive. Page compression, dictionary
+training, and sample serialization run on private page snapshots or pinned
+immutable inputs outside publication/catalogue locks and the shared Store mutex.
+Snapshot capture and metadata/object installation still serialize access. A
+candidate is discarded if the live state changes before publication. Object
+uploads remain synchronous during installation.
 
 ## Dictionaries, layouts, and collection
 
@@ -254,13 +259,14 @@ database, or use SQLite's online-backup protocol. The notice, active pagefile,
 sidecar directory, and any live SQLite auxiliary files must be captured from
 one pinned point in time; `database.db` by itself contains no application data.
 
-`configure()` persists settle, maximum-staleness, target segment size, and
-dictionary sizing policy. Active files seal at a configured byte target,
-on either time trigger, or on an explicit `flush`. Defaults are a 5 minute
-settle interval, 1 hour maximum active age, no byte target, a 768 KiB dictionary
-ceiling, and a 96 MiB sample budget. Existing bundles retain their persisted
-limits until reconfigured. The reservoir is advisory and stored compressed;
-training and serialization use additional transient memory beyond the sample budget.
+`configure()` persists target segment size and dictionary sizing policy.
+Commits are durable in the active file, so sealing is not needed locally: active
+files seal at a configured byte target, on an explicit `flush`, or when the
+storage backend's `seal_schedule()` asks for it, such as a backend that replicates
+sealed snapshots. Defaults are no byte target, no schedule, a 768 KiB dictionary
+ceiling, and a 96 MiB sample budget. Older bundles' stored settle and staleness
+timers are ignored. The reservoir is advisory and stored compressed; training and
+serialization use additional transient memory beyond the sample budget.
 
 ## CLI
 
@@ -272,6 +278,50 @@ zsqlite compact database.db
 zsqlite convert legacy.db database.db
 zsqlite export database.db restored.db
 ```
+
+## In-place conversion
+
+`zsqlite convert app.db` adopts an existing native `.db` without copying its
+pages. Build this command with `--no-default-features --features static` so it
+can use native SQLite's checkpoint API. Close native clients and prevent new
+native opens throughout the handoff. SQLite checkpoints and syncs the WAL and
+obtains exclusive access. The converter keeps that lock while moving the
+database to `app.db.zsqlite.d/.source`, then closes its native connection and
+installs the notice and active pagefile. Repeating the command completes an
+interrupted handoff.
+
+The database is immediately readable and writable through `vfs=zsqlite` after
+the handoff. New commits use the durable raw active file and SQLite's WAL. They
+override the original source, including zero writes and truncation. While the
+source is being converted, changed pages stay in the active file; sealing them
+into new packs becomes available after the source is attached as a sealed base.
+
+The CLI then converts the immutable source in 8 MiB chunks. Writable VFS opens
+also schedule conversion; applications can drive one chunk explicitly with
+`conversion_step()`. Each completed prefix has a durable catalog root, so a
+restart resumes from the last published chunk. The raw source remains available
+until the whole compressed base is durably attached, preserving newer active
+writes. Pausing affects source conversion while reads and writes continue.
+
+```text
+zsqlite conversion status app.db
+zsqlite conversion pause app.db
+zsqlite conversion resume app.db
+zsqlite conversion run app.db
+```
+
+`status` reports total and converted bytes, whether a worker is active, paused
+or complete, and the latest conversion error. `pause` durably stops publication
+at a chunk boundary; an in-flight compression result is discarded. `resume`
+clears the pause marker and drives the remaining chunks. With an open writable
+VFS connection, an external resume is noticed within the worker's retry interval.
+
+The Rust equivalents are `adopt_to_zsqlite()` (or
+`adopt_to_zsqlite_with_policy()`), `conversion_status()`, `pause_conversion()`,
+`resume_conversion()`, and `conversion_step()`. `Inspect::conversion` exposes
+the same progress. The two-path `convert_to_zsqlite(source, destination)` and
+CLI `convert source destination` continue to produce a fully sealed separate
+database and leave the source in place.
 
 The optional ZIM importer is a separate local experiment under
 `experiments/zim-import`, not a dependency of the library or CLI.

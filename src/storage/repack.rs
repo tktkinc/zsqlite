@@ -1,11 +1,16 @@
 use super::frame::FrameMetadata;
 use super::objects::CatalogGuard;
+#[cfg(test)]
 use super::seal::{SealEndpoint, seal_with_copies};
 use super::view::PinnedView;
 use crate::StoreError;
-use crate::domain::{DecodedBytes, FrameId, ManifestId, PackId, StoredBytes};
+#[cfg(test)]
+use crate::domain::ManifestId;
+use crate::domain::{DecodedBytes, FrameId, PackId, StoredBytes};
 use crate::layout::LayoutPolicy;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
 pub struct PackOccupancy {
@@ -180,6 +185,9 @@ pub(crate) struct RepackPlan {
     live_frame_decoded_bytes: DecodedBytes,
 }
 impl RepackPlan {
+    pub(crate) fn pack(&self) -> PackId {
+        self.pack
+    }
     fn reclaimable_bytes(&self) -> u64 {
         self.frame_bytes - self.live_record_bytes + self.partial_obsolete_bytes
     }
@@ -243,11 +251,13 @@ pub(super) fn estimated_obsolete_bytes(view: &PinnedView) -> Result<u64, StoreEr
 
 /// Physical rewrite tied to a source view, not an unconditional new head.
 #[must_use]
+#[cfg(test)]
 pub(crate) struct RepackCandidate<'g> {
     source: ManifestId,
     manifest: super::view::DurableView<'g>,
     report: super::MaintenanceReport,
 }
+#[cfg(test)]
 impl<'g> RepackCandidate<'g> {
     /// Must be called while publication exclusion is held. Any intervening
     /// sealed view makes this candidate stale, even if it has the same history.
@@ -262,6 +272,7 @@ impl<'g> RepackCandidate<'g> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn repack<'g>(
     guard: &'g CatalogGuard,
     view: &PinnedView,
@@ -317,6 +328,7 @@ pub(crate) fn eligible_packs(
         .collect())
 }
 
+#[cfg(test)]
 fn build_candidate<'g>(
     guard: &'g CatalogGuard,
     view: &PinnedView,

@@ -8,6 +8,7 @@
 //! alive for the lifetime of this permanently registered shim.
 mod parent;
 mod runtime;
+mod scheduler;
 
 use libsqlite3_sys as ffi;
 use parent::ParentFile;

@@ -44,6 +44,7 @@ fn active_state_rejects_every_single_bit_mutation() {
         page_size: 4_096,
         history: [0x52; 32],
         commit_unix: 1_700_000_000,
+        first_commit_unix: 1_699_999_000,
         record_count: 17,
         truncate_pages: Some(12),
     };
@@ -58,8 +59,6 @@ fn active_state_rejects_every_single_bit_mutation() {
 
 fn storage_policy() -> StoragePolicyRecord {
     StoragePolicyRecord {
-        settle_seconds: 300,
-        max_stale_seconds: 3_600,
         rollover_bytes: 64 * 1024 * 1024,
         dictionary: DictionaryPolicyRecord {
             dictionary_bytes: 65_536,
@@ -71,6 +70,8 @@ fn storage_policy() -> StoragePolicyRecord {
 #[test]
 fn active_header_rejects_every_single_bit_mutation() {
     let header = ActiveHeader {
+        source_bytes: 0,
+        source_header_digest: [0; 32],
         attachment_id: [1; 32],
         layout: zsqlite::layout::LayoutPolicy::default(),
         database_id: [0x51; 32],

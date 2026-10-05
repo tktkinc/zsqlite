@@ -13,7 +13,7 @@ pub(super) struct Samples {
     dirty: bool,
 }
 impl Samples {
-    fn new(budget: SampleBudget) -> Self {
+    pub(super) fn new(budget: SampleBudget) -> Self {
         Self {
             pages: BTreeMap::new(),
             bytes: 0,
@@ -126,9 +126,17 @@ impl Samples {
                 .collect(),
         })
     }
+    #[cfg(test)]
     pub(super) fn persist(&self, guard: &CatalogGuard) -> Result<(), StoreError> {
+        if let Some(bytes) = self.encode()? {
+            super::retention::atomic_write(&guard.root().join("dictionary.samples"), &bytes)?;
+        }
+        Ok(())
+    }
+    /// Serialize/compress before taking publication or catalogue exclusion.
+    pub(super) fn encode(&self) -> Result<Option<Vec<u8>>, StoreError> {
         if !self.dirty {
-            return Ok(());
+            return Ok(None);
         }
         let mut raw = Vec::with_capacity(self.bytes + self.pages.len() * 4 + 12);
         u64_bytes(&mut raw, self.fresh as u64);
@@ -143,8 +151,7 @@ impl Samples {
             );
             raw.extend(bytes);
         }
-        let bytes = envelope(b"ZSAMPLE1", &raw)?;
-        super::retention::atomic_write(&guard.root().join("dictionary.samples"), &bytes)
+        Ok(Some(envelope(b"ZSAMPLE1", &raw)?))
     }
 }
 

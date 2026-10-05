@@ -3,6 +3,11 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 mod backend;
+mod conversion;
+pub use conversion::{
+    ConversionStatus, adopt_to_zsqlite, adopt_to_zsqlite_with_policy, conversion_status,
+    conversion_step, pause_conversion, resume_conversion,
+};
 pub mod dictionary;
 pub mod domain;
 mod facade;
@@ -17,7 +22,7 @@ mod vfs;
 pub use dictionary::{DictionaryPolicy, DictionarySeed};
 pub use storage::{
     Database, DurablePin, FilesystemBackend, GcReport, MaintenanceReport, MemoryBackend,
-    PinnedView, RetentionName, Storage, StorageBackend,
+    PinnedView, RetentionName, SealSchedule, Storage, StorageBackend,
 };
 pub use store::{Inspect, StoragePolicy, StoreError};
 

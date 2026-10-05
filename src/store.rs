@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const ACTIVE_STATE_A_OFFSET: u64 = ACTIVE_HEADER_SIZE as u64;
@@ -80,10 +80,10 @@ pub enum StoreError {
     InvalidConfiguration(&'static str),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Byte rollover, dictionary and layout policy persisted with a database.
+/// Seal timing is not persisted: it belongs to the storage backend.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StoragePolicy {
-    settle: Duration,
-    max_stale: Duration,
     /// Seal the active file at a committed boundary once its raw records
     /// reach this many bytes. Zero disables size-triggered sealing.
     rollover_bytes: u64,
@@ -91,34 +91,7 @@ pub struct StoragePolicy {
     layout: crate::layout::LayoutPolicy,
 }
 
-impl Default for StoragePolicy {
-    fn default() -> Self {
-        Self {
-            settle: Duration::from_mins(5),
-            max_stale: Duration::from_hours(1),
-            rollover_bytes: 0,
-            dictionary: DictionaryPolicy::default(),
-            layout: crate::layout::LayoutPolicy::default(),
-        }
-    }
-}
-
 impl StoragePolicy {
-    pub fn with_timing(
-        mut self,
-        settle: Duration,
-        max_stale: Duration,
-    ) -> Result<Self, StoreError> {
-        if settle.subsec_nanos() != 0 || max_stale.subsec_nanos() != 0 {
-            return Err(StoreError::InvalidConfiguration(
-                "maintenance durations must be whole seconds",
-            ));
-        }
-        self.settle = settle;
-        self.max_stale = max_stale;
-        self.encode()?;
-        Ok(self)
-    }
     pub fn with_rollover(
         mut self,
         bytes: Option<std::num::NonZeroU64>,
@@ -131,14 +104,6 @@ impl StoragePolicy {
     pub fn with_dictionary(mut self, dictionary: DictionaryPolicy) -> Self {
         self.dictionary = dictionary;
         self
-    }
-    #[must_use]
-    pub const fn settle(self) -> Duration {
-        self.settle
-    }
-    #[must_use]
-    pub const fn max_stale(self) -> Duration {
-        self.max_stale
     }
     #[must_use]
     pub const fn rollover_bytes(self) -> Option<std::num::NonZeroU64> {
@@ -158,13 +123,7 @@ impl StoragePolicy {
         self.layout
     }
     fn encode(self) -> Result<StoragePolicyRecord, StoreError> {
-        let seconds = |value: Duration| {
-            u32::try_from(value.as_secs())
-                .map_err(|_| StoreError::InvalidConfiguration("duration is too large"))
-        };
         let record = StoragePolicyRecord {
-            settle_seconds: seconds(self.settle)?,
-            max_stale_seconds: seconds(self.max_stale)?,
             rollover_bytes: self.rollover_bytes,
             dictionary: DictionaryPolicyRecord {
                 dictionary_bytes: self.dictionary.dictionary_bytes(),
@@ -177,9 +136,7 @@ impl StoragePolicy {
 
     fn decode(value: StoragePolicyRecord, layout: crate::layout::LayoutPolicy) -> Self {
         Self {
-            settle: Duration::from_secs(u64::from(value.settle_seconds)),
             layout,
-            max_stale: Duration::from_secs(u64::from(value.max_stale_seconds)),
             rollover_bytes: value.rollover_bytes,
             dictionary: DictionaryPolicy::new(
                 value.dictionary.dictionary_bytes,
@@ -214,6 +171,7 @@ pub struct Inspect {
     pub pack_occupancy: Vec<crate::storage::PackOccupancy>,
     pub retention: crate::storage::GcReport,
     pub policy: StoragePolicy,
+    pub conversion: Option<crate::conversion::ConversionStatus>,
 }
 
 enum LocalRead {
@@ -381,15 +339,362 @@ pub(crate) struct Store {
     page_cache: crate::storage::PageCache,
     read_io: crate::statistics::HandleIoStats,
     active: ActiveFile,
+    source: Option<File>,
     pending_raw_pages: BTreeSet<u32>,
     pending_raw_originals: BTreeMap<u32, Vec<u8>>,
     pending_size: u64,
     pending_truncate_pages: Option<u32>,
     pending_dirty: bool,
     bootstrap: Option<BootstrapFile>,
+    background: Background,
+}
+
+/// Receives a store's next background-maintenance deadline whenever it may
+/// have moved; `None` means nothing is due. Called with the store borrowed.
+pub(crate) type MaintenanceNotifier = Box<dyn Fn(Option<Instant>) + Send>;
+
+/// Background work is armed by events, not polled: a backend seal deadline
+/// after commits, and a bounded collection and repack pass after an open, a
+/// seal, a released retention root, or a pass that used its whole budget.
+#[derive(Default)]
+struct Background {
+    follow_up: bool,
+    retry_after: Option<SystemTime>,
+    notifier: Option<MaintenanceNotifier>,
+}
+
+/// A busy or failed background pass is retried no sooner than this.
+const MAINTENANCE_RETRY: Duration = Duration::from_secs(1);
+
+#[allow(clippy::large_enum_variant)] // One transient job; no indirection needed for its small snapshot.
+enum SealKind {
+    Active {
+        header: ActiveHeader,
+        head: HeadState,
+        restore: PublicationPhase,
+    },
+    Source {
+        before: u64,
+        after: u64,
+        sidecar: PathBuf,
+        _worker: crate::fs::ExclusiveLock,
+    },
+}
+pub(crate) struct SealWork {
+    input: crate::storage::SealInput,
+    kind: SealKind,
+}
+pub(crate) struct PreparedWork {
+    seal: crate::storage::PreparedSeal,
+    kind: SealKind,
+    source_view: Option<crate::storage::PinnedView>,
+}
+impl SealWork {
+    pub(crate) fn prepare(self) -> Result<PreparedWork, StoreError> {
+        let seal = self.input.prepare()?;
+        let source_view = if let SealKind::Source {
+            before, sidecar, ..
+        } = &self.kind
+        {
+            // Chunk installation and its durable progress root do not mutate
+            // the active database. SQL publication and the Store mutex remain
+            // free; the converter's own controls serialize pause/publication.
+            let _control = crate::conversion::control_lock(sidecar)?;
+            if crate::conversion::paused(sidecar) {
+                return Err(StoreError::Busy);
+            }
+            let catalog = crate::storage::Catalog::open(sidecar, false)?;
+            let guard = catalog.lock()?;
+            let prefix = crate::conversion::prefix(&guard)?;
+            if prefix.as_ref().map_or(0, |view| view.logical_size().get()) != *before {
+                return Err(StoreError::Busy);
+            }
+            let durable = seal.install(&guard)?;
+            let view = guard.pin(durable.id())?;
+            let _pin = guard.retain(crate::conversion::root_name()?, &view, true)?;
+            Some(view)
+        } else {
+            None
+        };
+        Ok(PreparedWork {
+            seal,
+            kind: self.kind,
+            source_view,
+        })
+    }
+}
+impl PreparedWork {
+    pub(crate) fn repack_report(&self) -> Option<crate::storage::MaintenanceReport> {
+        self.seal.report()
+    }
 }
 
 impl Store {
+    pub(crate) fn database_id(&self) -> DatabaseId {
+        self.active.header.database_id
+    }
+    pub(crate) fn header(&self) -> ActiveHeader {
+        self.active.header
+    }
+    pub(crate) fn source_needs_initialization(&self) -> bool {
+        self.head.txid == 0 && self.head.logical_size == 0 && self.source.is_none()
+    }
+
+    pub(crate) fn initialize_source(
+        &mut self,
+        info: &crate::conversion::SourceInfo,
+    ) -> Result<(), StoreError> {
+        if !self.source_needs_initialization() || info.database != self.database_id() {
+            return Err(StoreError::IdentityMismatch);
+        }
+        self.acquire_maintenance()?;
+        let result = (|| {
+            let source = File::open(crate::conversion::source_path(&self.sidecar_path))?;
+            let mut bytes = [0; 100];
+            read_exact_at(&source, 0, &mut bytes)?;
+            if source.metadata()?.len() != info.bytes
+                || blake3::hash(&bytes).as_bytes() != &info.header
+            {
+                return Err(StoreError::IdentityMismatch);
+            }
+            let mut permissions = source.metadata()?.permissions();
+            permissions.set_readonly(true);
+            source.set_permissions(permissions)?;
+            source.sync_all()?;
+            let mut header = self.active.header;
+            header.page_size = info.page_size;
+            header.source_bytes = info.bytes;
+            header.source_header_digest = info.header;
+            let state = ActiveState {
+                database_id: info.database,
+                sequence: 1,
+                txid: 1,
+                logical_size: info.bytes,
+                page_size: info.page_size,
+                history: genesis_history(),
+                commit_unix: unix_time(),
+                first_commit_unix: unix_time(),
+                record_count: 0,
+                truncate_pages: None,
+            };
+            let staging = active_staging_path(&self.path, random_bytes()?);
+            let _cleanup = CleanupFile(staging.clone());
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&staging)?;
+            write_all_at(&file, 0, &header.encode())?;
+            write_all_at(&file, ACTIVE_STATE_A_OFFSET, &state.encode())?;
+            file.set_len(ACTIVE_METADATA_END)?;
+            file.sync_all()?;
+            #[cfg(test)]
+            crate::storage::faults::check(crate::storage::faults::Point::ActiveDataSynced)?;
+            std::fs::rename(&staging, &self.path)?;
+            #[cfg(test)]
+            crate::storage::faults::check(crate::storage::faults::Point::ActiveRenamed)
+                .map_err(StoreError::PublicationUncertain)?;
+            sync_parent_dir(&self.path)?;
+            #[cfg(test)]
+            crate::storage::faults::check(crate::storage::faults::Point::ActiveDirectorySynced)
+                .map_err(StoreError::PublicationUncertain)?;
+            self.load_local(file, header, None)
+        })();
+        self.release_maintenance();
+        result
+    }
+
+    pub(crate) fn prepare_source_work(&mut self) -> Result<Option<SealWork>, StoreError> {
+        if self.source.is_none() || crate::conversion::paused(&self.sidecar_path) {
+            return Ok(None);
+        }
+        if self.has_pending() || self.publication_owner.phase() == PublicationPhase::Checkpoint {
+            return Err(StoreError::Busy);
+        }
+        let worker = crate::fs::ExclusiveLock::acquire(
+            &self.sidecar_path.join("locks/conversion-worker.lock"),
+            true,
+        )?;
+        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
+        let guard = catalog.lock()?;
+        let prefix = crate::conversion::prefix(&guard)?;
+        if prefix.as_ref().is_some_and(|view| {
+            view.endpoint().0.as_bytes() != &self.database_id()
+                || view.endpoint().1.get() != 1
+                || view.logical_size().page_size().get() != self.head.page_size
+        }) {
+            return Err(StoreError::IdentityMismatch);
+        }
+        let before = prefix.as_ref().map_or(0, |view| view.logical_size().get());
+        let total = self.active.header.source_bytes;
+        if before > total {
+            return Err(StoreError::Corrupt(0));
+        }
+        let after = before
+            .saturating_add(crate::conversion::CHUNK_BYTES)
+            .min(total);
+        let page_size = crate::domain::PageSize::new(self.head.page_size)?;
+        let txid = crate::domain::TransactionId::new(1)?;
+        let first = before / u64::from(page_size.get()) + 1;
+        let last = after / u64::from(page_size.get());
+        let pages = (first..=last)
+            .map(|page| {
+                Ok((
+                    crate::domain::PageNumber::new(
+                        u32::try_from(page).map_err(|_| StoreError::Range)?,
+                    )?,
+                    txid,
+                ))
+            })
+            .collect::<Result<_, StoreError>>()?;
+        let endpoint = crate::storage::SealEndpoint {
+            database: crate::domain::DatabaseId::from_bytes(self.database_id()),
+            lineage: crate::domain::LineageId::from_bytes(self.database_id()),
+            dictionary: self.dictionary_policy(),
+            size: crate::domain::LogicalBytes::new(after, page_size)?,
+            txid,
+            history: crate::domain::HistoryHash::from_bytes(
+                prefix
+                    .as_ref()
+                    .map_or_else(genesis_history, |view| *view.endpoint().2.as_bytes()),
+            ),
+            truncate: None,
+        };
+        let file = self
+            .source
+            .as_ref()
+            .ok_or(StoreError::Corrupt(0))?
+            .try_clone()?;
+        let input = crate::storage::SealInput::new(
+            &guard,
+            prefix.as_ref(),
+            endpoint,
+            pages,
+            file,
+            self.layout,
+        )?
+        .source_prefix();
+        Ok(Some(SealWork {
+            input,
+            kind: SealKind::Source {
+                before,
+                after,
+                sidecar: self.sidecar_path.clone(),
+                _worker: worker,
+            },
+        }))
+    }
+
+    fn finish_source_work(
+        &mut self,
+        view: crate::storage::PinnedView,
+        after: u64,
+    ) -> Result<(), StoreError> {
+        if after < self.active.header.source_bytes {
+            self.rearm();
+            return Ok(());
+        }
+        // Pause and chunk publication serialize independently of SQL access.
+        let _control = crate::conversion::control_lock(&self.sidecar_path)?;
+        if crate::conversion::paused(&self.sidecar_path) {
+            return Err(StoreError::Busy);
+        }
+        if self.has_pending() {
+            return Err(StoreError::Busy);
+        }
+        self.acquire_maintenance()?;
+        let result = (|| {
+            if self.source.is_none() {
+                return Ok(());
+            }
+            let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
+            let guard = catalog.lock()?;
+            let prefix = crate::conversion::prefix(&guard)?.ok_or(StoreError::Corrupt(0))?;
+            if prefix.id() != view.id() || prefix.logical_size().get() != after {
+                return Err(StoreError::Busy);
+            }
+            if after == self.active.header.source_bytes {
+                self.install_source_base(&guard, view)?;
+                guard.release(guard.read_root(&crate::conversion::root_name()?)?)?;
+                // Old Store readers own open source descriptors. POSIX unlink
+                // leaves those usable until they refresh onto the sealed base.
+                match std::fs::remove_file(crate::conversion::source_path(&self.sidecar_path)) {
+                    Ok(()) => sync_parent_dir(&crate::conversion::source_path(&self.sidecar_path))?,
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let _ = std::fs::remove_file(self.sidecar_path.join("conversion.error"));
+            Ok(())
+        })();
+        self.release_maintenance();
+        self.rearm();
+        result
+    }
+
+    fn install_source_base(
+        &mut self,
+        guard: &crate::storage::CatalogGuard,
+        view: crate::storage::PinnedView,
+    ) -> Result<(), StoreError> {
+        use std::io::{Seek, SeekFrom};
+        let mut header = self.active.header;
+        header.source_bytes = 0;
+        header.source_header_digest = [0; 32];
+        header.start_txid = 2;
+        header.parent_physical_digest = *view.id().as_bytes();
+        header.base_logical_size = view.logical_size().get();
+        header.base_history = *view.endpoint().2.as_bytes();
+        let state = ActiveState {
+            database_id: header.database_id,
+            sequence: 1,
+            txid: self.head.txid,
+            logical_size: self.head.logical_size,
+            page_size: self.head.page_size,
+            history: header.base_history,
+            commit_unix: self.head.last_dirty_unix,
+            first_commit_unix: self.head.oldest_dirty_unix,
+            record_count: self.active.active_records.len() as u64,
+            truncate_pages: self.active.truncate_pages,
+        };
+        let staging = active_staging_path(&self.path, random_bytes()?);
+        let _cleanup = CleanupFile(staging.clone());
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        write_all_at(&file, 0, &header.encode())?;
+        write_all_at(&file, ACTIVE_STATE_A_OFFSET, &state.encode())?;
+        file.set_len(ACTIVE_METADATA_END)?;
+        file.seek(SeekFrom::Start(ACTIVE_METADATA_END))?;
+        let mut old = self.active.file.try_clone()?;
+        old.seek(SeekFrom::Start(ACTIVE_METADATA_END))?;
+        let length = self.head.active_commit_end - ACTIVE_METADATA_END;
+        let copied = std::io::copy(&mut std::io::Read::take(old, length), &mut file)?;
+        if copied != length {
+            return Err(std::io::Error::from(ErrorKind::UnexpectedEof).into());
+        }
+        file.sync_all()?;
+        #[cfg(test)]
+        crate::storage::faults::check(crate::storage::faults::Point::ActiveDataSynced)?;
+        guard.prepare_seal(&header)?;
+        std::fs::rename(&staging, &self.path).map_err(StoreError::PublicationUncertain)?;
+        #[cfg(test)]
+        crate::storage::faults::check(crate::storage::faults::Point::ActiveRenamed)
+            .map_err(StoreError::PublicationUncertain)?;
+        sync_parent_dir(&self.path).map_err(|error| match error {
+            StoreError::Io(error) => StoreError::PublicationUncertain(error),
+            other => other,
+        })?;
+        #[cfg(test)]
+        crate::storage::faults::check(crate::storage::faults::Point::ActiveDirectorySynced)
+            .map_err(StoreError::PublicationUncertain)?;
+        self.load_local(file, header, Some(view))?;
+        guard.finish_seal(&header)?;
+        Ok(())
+    }
+
     pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::open_mode(path.as_ref(), false, true)
     }
@@ -500,6 +805,8 @@ impl Store {
             base_logical_size: 0,
             policy,
             layout: crate::layout::LayoutPolicy::default(),
+            source_bytes: 0,
+            source_header_digest: [0; 32],
         };
         write_all_at(&file, 0, &header.encode())?;
         write_all_at(
@@ -513,6 +820,7 @@ impl Store {
                 page_size: 0,
                 history: genesis_history(),
                 commit_unix: 0,
+                first_commit_unix: 0,
                 record_count: 0,
                 truncate_pages: None,
             }
@@ -570,6 +878,7 @@ impl Store {
                 last_dirty_unix: 0,
             },
             view: None,
+            source: None,
             layout: crate::layout::LayoutPolicy::default(),
             page_cache: crate::storage::PageCache::new(
                 crate::layout::LayoutPolicy::default().cache(),
@@ -589,6 +898,11 @@ impl Store {
             pending_truncate_pages: None,
             pending_dirty: false,
             bootstrap: None,
+            // A newly opened writer sweeps for objects orphaned by a crash.
+            background: Background {
+                follow_up: writable,
+                ..Background::default()
+            },
         }
     }
 
@@ -1224,6 +1538,10 @@ impl Store {
             page_size: self.head.page_size,
             history: resulting_history,
             commit_unix: now,
+            first_commit_unix: match self.head.oldest_dirty_unix {
+                0 => now,
+                first => first,
+            },
             record_count: u64::try_from(self.active.active_records.len())
                 .map_err(|_| StoreError::Range)?,
             truncate_pages: match (self.active.truncate_pages, self.pending_truncate_pages) {
@@ -1261,6 +1579,7 @@ impl Store {
             self.head.oldest_dirty_unix = now;
         }
         self.head.last_dirty_unix = now;
+        self.rearm();
         if retain_publication {
             self.publication_owner
                 .transition(PublicationPhase::Checkpoint);
@@ -1276,7 +1595,6 @@ impl Store {
         } else {
             self.release_publication();
             publication_sync.map_err(StoreError::PublicationUncertain)?;
-            self.rollover_at_size_target()?;
             return Ok(());
         }
         publication_sync.map_err(StoreError::PublicationUncertain)
@@ -1371,6 +1689,8 @@ impl Store {
             base_logical_size: self.head.logical_size,
             policy,
             layout: self.layout,
+            source_bytes: self.active.header.source_bytes,
+            source_header_digest: self.active.header.source_header_digest,
         };
         if let Some(catalog) = catalog {
             catalog.prepare_seal(&header)?;
@@ -1394,6 +1714,7 @@ impl Store {
                 page_size: self.head.page_size,
                 history: sealed_history,
                 commit_unix: 0,
+                first_commit_unix: 0,
                 record_count: 0,
                 truncate_pages: None,
             }
@@ -1475,6 +1796,14 @@ impl Store {
             return Ok(Some(LocalRead::Zero(size)));
         }
         let Some(view) = self.view.as_ref() else {
+            if let Some(source) = &self.source {
+                let offset = u64::from(page_no - 1) * u64::from(size.get());
+                if offset < self.active.header.source_bytes {
+                    let mut bytes = vec![0; size.as_usize()];
+                    read_exact_at(source, offset, &mut bytes)?;
+                    return Ok(Some(LocalRead::Raw(bytes)));
+                }
+            }
             return Ok(Some(LocalRead::Zero(size)));
         };
         if page_no > view.logical_size().pages() {
@@ -1557,7 +1886,24 @@ impl Store {
                 header.parent_physical_digest,
             ))?)
         };
-        self.load_local(current, header, view)
+        self.load_local(current, header, view)?;
+        if self.writable
+            && header.source_bytes == 0
+            && header.parent_physical_digest != [0; 32]
+            && crate::conversion::SourceInfo::read(&self.sidecar_path)?.is_some()
+            && crate::conversion::source_path(&self.sidecar_path).exists()
+        {
+            // A crash can interrupt final attachment after the new header is
+            // visible. Make its rename durable before retiring the raw base.
+            sync_parent_dir(&self.path)?;
+            if let Some(_prefix) = crate::conversion::prefix(&catalog_guard)? {
+                catalog_guard
+                    .release(catalog_guard.read_root(&crate::conversion::root_name()?)?)?;
+            }
+            std::fs::remove_file(crate::conversion::source_path(&self.sidecar_path))?;
+            sync_parent_dir(&crate::conversion::source_path(&self.sidecar_path))?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::large_types_passed_by_value, clippy::too_many_lines)]
@@ -1613,6 +1959,20 @@ impl Store {
             active_records,
             truncate_pages: state.truncate_pages,
         };
+        self.source = if header.source_bytes == 0 {
+            None
+        } else {
+            let file = File::open(crate::conversion::source_path(&self.sidecar_path))?;
+            let mut sqlite_header = [0; 100];
+            read_exact_at(&file, 0, &mut sqlite_header)?;
+            if file.metadata()?.len() != header.source_bytes
+                || blake3::hash(&sqlite_header).as_bytes() != &header.source_header_digest
+                || parse_page_size(&sqlite_header) != Some(header.page_size)
+            {
+                return Err(StoreError::IdentityMismatch);
+            }
+            Some(file)
+        };
         self.head = HeadState {
             page_size: state.page_size,
             logical_size: state.logical_size,
@@ -1624,7 +1984,10 @@ impl Store {
                 active_state_offset(state.sequence)
             },
             active_commit_end: expected_active_end,
-            oldest_dirty_unix: state.commit_unix,
+            oldest_dirty_unix: match state.first_commit_unix {
+                0 => state.commit_unix,
+                first => first,
+            },
             last_dirty_unix: state.commit_unix,
         };
         self.view = view;
@@ -1637,10 +2000,16 @@ impl Store {
         self.pending_raw_originals.clear();
         self.bootstrap = None;
         self.synchronize_read_cache();
+        // Another process's commits or seal may have moved the seal deadline.
+        self.rearm();
         Ok(())
     }
 
     pub(crate) fn flush_sidecars(&mut self) -> Result<(), StoreError> {
+        while self.source.is_some() {
+            let work = self.prepare_source_work()?.ok_or(StoreError::Busy)?;
+            self.finish_work(work.prepare()?)?;
+        }
         self.begin_write()?;
         if self.has_pending() {
             self.publish(true)?;
@@ -1656,6 +2025,23 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn prepare_flush_work(&mut self) -> Result<Option<SealWork>, StoreError> {
+        if self.publication_owner.phase() == PublicationPhase::Checkpoint {
+            return Err(StoreError::Busy);
+        }
+        if self.has_pending() {
+            self.publish(true)?;
+        }
+        self.refresh()?;
+        if self.source.is_some() {
+            return self
+                .prepare_source_work()?
+                .map(Some)
+                .ok_or(StoreError::Busy);
+        }
+        self.prepare_active_work()
+    }
+
     fn dictionary_policy(&self) -> DictionaryPolicy {
         DictionaryPolicy::new(
             self.active.header.policy.dictionary.dictionary_bytes,
@@ -1665,52 +2051,132 @@ impl Store {
     }
 
     fn seal_active(&mut self) -> Result<(), StoreError> {
+        if self.source.is_some() {
+            return Err(StoreError::Busy);
+        }
+        let Some(work) = self.prepare_active_work()? else {
+            return Ok(());
+        };
+        self.finish_work(work.prepare()?)
+    }
+
+    fn prepare_active_work(&mut self) -> Result<Option<SealWork>, StoreError> {
         use crate::domain::{
             DatabaseId, HistoryHash, LineageId, LogicalBytes, PageNumber, PageSize, TransactionId,
         };
         if self.head.txid < self.active.header.start_txid {
-            return Ok(());
+            return Ok(None);
         }
-        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-        let guard = catalog.lock()?;
-        let size = LogicalBytes::new(self.head.logical_size, PageSize::new(self.head.page_size)?)?;
-        let txid = TransactionId::new(self.head.txid)?;
-        let pages = self
-            .active
-            .active_records
-            .keys()
-            .copied()
-            .filter(|page| *page <= size.pages())
-            .map(|page| Ok((PageNumber::new(page)?, txid)))
-            .collect::<Result<Vec<_>, StoreError>>()?;
-        let endpoint = crate::storage::SealEndpoint {
-            dictionary: self.dictionary_policy(),
-            database: DatabaseId::from_bytes(self.active.header.database_id),
-            lineage: LineageId::from_bytes(self.active.header.database_id),
-            size,
-            txid,
-            history: HistoryHash::from_bytes(self.head.history),
-            truncate: self.active.truncate_pages,
+        let restore = self.publication_owner.phase();
+        self.acquire_maintenance()?;
+        let result = (|| {
+            let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
+            let guard = catalog.lock()?;
+            let size =
+                LogicalBytes::new(self.head.logical_size, PageSize::new(self.head.page_size)?)?;
+            let txid = TransactionId::new(self.head.txid)?;
+            let pages = self
+                .active
+                .active_records
+                .keys()
+                .copied()
+                .filter(|page| *page <= size.pages())
+                .map(|page| Ok((PageNumber::new(page)?, txid)))
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            let endpoint = crate::storage::SealEndpoint {
+                dictionary: self.dictionary_policy(),
+                database: DatabaseId::from_bytes(self.active.header.database_id),
+                lineage: LineageId::from_bytes(self.active.header.database_id),
+                size,
+                txid,
+                history: HistoryHash::from_bytes(self.head.history),
+                truncate: self.active.truncate_pages,
+            };
+            let snapshot = tempfile::tempfile()?;
+            for (page, _) in &pages {
+                write_all_at(
+                    &snapshot,
+                    u64::from(page.get() - 1) * u64::from(self.head.page_size),
+                    &self.read_mutable_page(page.get())?,
+                )?;
+            }
+            let input = crate::storage::SealInput::new(
+                &guard,
+                self.view.as_ref(),
+                endpoint,
+                pages,
+                snapshot,
+                self.layout,
+            )?;
+            Ok(Some(SealWork {
+                input,
+                kind: SealKind::Active {
+                    header: self.active.header,
+                    head: self.head,
+                    restore,
+                },
+            }))
+        })();
+        // Private page bytes and reader leases replace publication exclusion.
+        self.publication_owner = PublicationOwner::None;
+        result
+    }
+
+    pub(crate) fn finish_work(&mut self, work: PreparedWork) -> Result<(), StoreError> {
+        if let SealKind::Source { after, .. } = &work.kind {
+            return self
+                .finish_source_work(work.source_view.ok_or(StoreError::Corrupt(0))?, *after);
+        }
+        let SealKind::Active {
+            header,
+            head,
+            restore,
+        } = work.kind
+        else {
+            unreachable!()
         };
-        let durable = crate::storage::seal(
-            &guard,
-            self.view.as_ref(),
-            endpoint,
-            &pages,
-            |page| self.read_mutable_page(page.get()),
-            self.layout,
-            crate::storage::ManifestMode::Incremental,
-        )?;
-        let publication = self.prepare_view_publication(&guard, durable)?;
-        let mut guard = self.finish_view_publication(guard, publication)?;
-        let _report = guard.collect(self.layout.deletion_budget())?;
-        Ok(())
+        if self.has_pending() {
+            return Err(StoreError::Busy);
+        }
+        self.acquire_maintenance()?;
+        let result = (|| {
+            if self.active.header != header || self.head != head {
+                return Err(StoreError::Busy);
+            }
+            let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
+            let guard = catalog.lock()?;
+            let repack = work.seal.report().is_some();
+            let durable = work.seal.install(&guard)?;
+            let publication = self.prepare_view_publication(&guard, durable)?;
+            let mut guard = self.finish_view_publication(guard, publication)?;
+            drop(work.seal);
+            // A seal can strand objects and leave packs sparse; follow it with a
+            // bounded background collection and repack pass.
+            self.background.follow_up = true;
+            if !repack {
+                let _report = guard.collect(self.layout.deletion_budget())?;
+            }
+            drop(guard);
+            Ok(())
+        })();
+        if result.is_ok() && restore != PublicationPhase::Unlocked {
+            self.publication_owner.transition(restore);
+        } else {
+            self.release_maintenance();
+        }
+        self.rearm();
+        result
     }
 
     pub(crate) fn compact(&mut self) -> Result<(), StoreError> {
         self.acquire_maintenance()?;
         let result = self.compact_inner();
         self.release_maintenance();
+        if result.is_ok() {
+            // A checkpoint manifest strands the metadata runs it replaces.
+            self.background.follow_up = true;
+            self.rearm();
+        }
         result
     }
 
@@ -1823,11 +2289,15 @@ impl Store {
                 .as_ref()
                 .map_or(0, crate::storage::PinnedView::dictionary_bytes),
             policy: StoragePolicy::decode(self.active.header.policy, self.layout),
+            conversion: crate::conversion::status(&guard, &self.active.header)?,
         })
     }
 
     pub(crate) fn set_storage_policy(&mut self, policy: StoragePolicy) -> Result<(), StoreError> {
         self.begin_write()?;
+        if self.source.is_some() {
+            return Err(StoreError::Busy);
+        }
         if self.head.txid >= self.active.header.start_txid {
             self.seal_active()?;
         }
@@ -1884,6 +2354,11 @@ impl Store {
         name: crate::storage::RetentionName,
         replace: bool,
     ) -> Result<crate::storage::DurablePin, StoreError> {
+        if name == crate::conversion::root_name()? {
+            return Err(StoreError::InvalidConfiguration(
+                "retention name is reserved for source conversion",
+            ));
+        }
         self.acquire_maintenance()?;
         let result = (|| {
             self.flush_sidecars()?;
@@ -1899,12 +2374,22 @@ impl Store {
         &mut self,
         pin: crate::storage::DurablePin,
     ) -> Result<(), StoreError> {
+        if pin.name() == &crate::conversion::root_name()? {
+            return Err(StoreError::InvalidConfiguration(
+                "retention name is reserved for source conversion",
+            ));
+        }
         self.acquire_maintenance()?;
         let result = (|| {
             let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
             catalog.lock()?.release(pin)
         })();
         self.release_maintenance();
+        if result.is_ok() {
+            // A released root can leave objects collectible and packs sparse.
+            self.background.follow_up = true;
+            self.rearm();
+        }
         result
     }
 
@@ -1926,98 +2411,213 @@ impl Store {
         catalog.lock()?.collect(budget)
     }
 
-    pub(crate) fn background_flush_due(&self) -> bool {
-        if self.has_pending() || self.head.txid < self.active.header.start_txid {
-            return false;
+    /// When unsealed commits must be sealed: at once past the byte rollover
+    /// target (checkpoint publications defer that check), otherwise when the
+    /// backend's schedule requires it. Local commits are already durable.
+    fn seal_deadline(&self) -> Option<SystemTime> {
+        if self.source.is_some() {
+            return Some(SystemTime::now());
+        }
+        if self.head.txid < self.active.header.start_txid {
+            return None;
         }
         let target = self.active.header.policy.rollover_bytes;
         if target != 0 && self.head.active_commit_end >= target {
-            return true;
+            return Some(SystemTime::now());
         }
-        let now = unix_time();
-        now.saturating_sub(self.head.last_dirty_unix)
-            >= u64::from(self.active.header.policy.settle_seconds)
-            || now.saturating_sub(self.head.oldest_dirty_unix)
-                >= u64::from(self.active.header.policy.max_stale_seconds)
+        let schedule = self.coordination.seal_schedule()?;
+        let at = |unix: u64| UNIX_EPOCH + Duration::from_secs(unix);
+        Some(
+            (at(self.head.last_dirty_unix) + schedule.settle())
+                .min(at(self.head.oldest_dirty_unix) + schedule.max_age()),
+        )
     }
 
+    /// The next time background work is due, if any.
+    fn next_maintenance(&self) -> Option<Instant> {
+        if !self.writable {
+            return None;
+        }
+        let follow_up = self.background.follow_up.then(SystemTime::now);
+        let due = self.seal_deadline().into_iter().chain(follow_up).min()?;
+        let due = self
+            .background
+            .retry_after
+            .map_or(due, |retry| due.max(retry));
+        Some(Instant::now() + due.duration_since(SystemTime::now()).unwrap_or_default())
+    }
+
+    fn rearm(&self) {
+        if let Some(notifier) = &self.background.notifier {
+            notifier(self.next_maintenance());
+        }
+    }
+
+    /// Report this store's background deadlines to `notifier`, starting now.
+    pub(crate) fn set_maintenance_notifier(&mut self, notifier: MaintenanceNotifier) {
+        self.background.notifier = Some(notifier);
+        self.rearm();
+    }
+
+    /// Run due background work: a seal the backend's schedule or the rollover
+    /// target requires, then a bounded collection and repack pass if an event
+    /// armed one. A busy or failed pass is retried after a short delay.
+    #[cfg(test)]
     pub(crate) fn try_background_maintenance(&mut self) -> Result<(), StoreError> {
+        let result = (|| {
+            if let Some(work) = self.prepare_background_work()? {
+                self.finish_work(work.prepare()?)?;
+            }
+            self.background_pass()
+        })();
+        self.finish_background(result)
+    }
+
+    pub(crate) fn prepare_background_work(&mut self) -> Result<Option<SealWork>, StoreError> {
         if self.has_pending() || self.publication_owner.phase() == PublicationPhase::Checkpoint {
-            return Ok(());
+            return Err(StoreError::Busy);
         }
-        if self.background_flush_due() {
-            self.acquire_maintenance()?;
-            let result = self.flush_sidecars();
-            self.release_maintenance();
-            result?;
+        self.refresh()?;
+        if self.source.is_some() {
+            return self.prepare_source_work();
         }
-        if self.layout.deletion_budget() > 0 {
-            self.collect_garbage(self.layout.deletion_budget())?;
+        if self
+            .seal_deadline()
+            .is_some_and(|due| due <= SystemTime::now())
+        {
+            return self.prepare_active_work();
         }
-        self.repack_once().map(|_| ())
+        if self.background.follow_up {
+            return self.prepare_repack_work();
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn finish_background(
+        &mut self,
+        result: Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.background.retry_after = result
+            .is_err()
+            .then(|| SystemTime::now() + MAINTENANCE_RETRY);
+        self.rearm();
+        match result {
+            Err(StoreError::Busy) => Ok(()),
+            other => other,
+        }
+    }
+
+    pub(crate) fn complete_background_work(
+        &mut self,
+        work: Result<Option<PreparedWork>, StoreError>,
+    ) -> Result<(), StoreError> {
+        let result = (|| {
+            if let Some(work) = work? {
+                self.finish_work(work)?;
+            }
+            self.background_pass()
+        })();
+        if let Err(error) = &result
+            && self.source.is_some()
+            && !matches!(error, StoreError::Busy)
+        {
+            let _ = crate::conversion::record_error(&self.sidecar_path, &error.to_string());
+        }
+        self.finish_background(result)
+    }
+
+    fn background_pass(&mut self) -> Result<(), StoreError> {
+        if self.has_pending() || self.publication_owner.phase() == PublicationPhase::Checkpoint {
+            return Err(StoreError::Busy);
+        }
+        if self.source.is_some() {
+            return Err(StoreError::Busy);
+        }
+        if self.background.follow_up {
+            let budget = self.layout.deletion_budget();
+            let deleted = if budget == 0 {
+                0
+            } else {
+                self.collect_garbage(budget)?
+            };
+            let eligible = if self.head.txid < self.active.header.start_txid {
+                if let Some(view) = &self.view {
+                    let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
+                    !crate::storage::eligible_packs(&catalog.lock()?, view, self.layout)?.is_empty()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            self.background.follow_up = (budget > 0 && deleted >= budget) || eligible;
+        }
+        Ok(())
     }
 
     pub(crate) fn repack_once(&mut self) -> Result<crate::storage::MaintenanceReport, StoreError> {
+        let Some(work) = self.prepare_repack_work()? else {
+            return Ok(crate::storage::MaintenanceReport::default());
+        };
+        self.finish_repack_work(work.prepare()?)
+    }
+
+    pub(crate) fn finish_repack_work(
+        &mut self,
+        work: PreparedWork,
+    ) -> Result<crate::storage::MaintenanceReport, StoreError> {
+        let mut report = work.repack_report().ok_or(StoreError::Corrupt(0))?;
+        self.finish_work(work)?;
+        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
+        report.gc = catalog.lock()?.collect(self.layout.deletion_budget())?;
+        Ok(report)
+    }
+
+    pub(crate) fn prepare_repack_work(&mut self) -> Result<Option<SealWork>, StoreError> {
         if self.has_pending()
             || self.head.txid >= self.active.header.start_txid
             || self.view.is_none()
         {
-            return Ok(crate::storage::MaintenanceReport::default());
+            return Ok(None);
         }
-        // Idle readers must not repeatedly reserve SQLite publication when
-        // there is no pack to rewrite. This advisory check holds only catalogue
-        // exclusion; repack() selects again under both locks below.
-        {
-            let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-            let guard = catalog.lock()?;
-            if crate::storage::eligible_packs(
-                &guard,
-                self.view.as_ref().ok_or(StoreError::Corrupt(0))?,
-                self.layout,
-            )?
-            .is_empty()
-            {
-                return Ok(crate::storage::MaintenanceReport::default());
-            }
+        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
+        let guard = catalog.lock()?;
+        let view = self.view.as_ref().ok_or(StoreError::Corrupt(0))?;
+        let selected = crate::storage::eligible_packs(&guard, view, self.layout)?;
+        if selected.is_empty() {
+            return Ok(None);
         }
-        self.acquire_maintenance()?;
-        let result = (|| {
-            // Refresh under publication exclusion before creating the candidate.
-            // An active write epoch cannot be discarded by a physical rewrite.
-            if self.has_pending() || self.head.txid >= self.active.header.start_txid {
-                return Ok(crate::storage::MaintenanceReport::default());
-            }
-            let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-            let guard = catalog.lock()?;
-            let view = self.view.as_ref().ok_or(StoreError::Corrupt(0))?;
-            let Some(candidate) =
-                crate::storage::repack(&guard, view, self.layout, self.dictionary_policy())?
-            else {
-                return Ok(crate::storage::MaintenanceReport::default());
-            };
-            let (durable, mut report) =
-                candidate.revalidate(self.view.as_ref().ok_or(StoreError::Corrupt(0))?)?;
-            let publication = self.prepare_view_publication(&guard, durable)?;
-            let mut guard = self.finish_view_publication(guard, publication)?;
-            report.gc = guard.collect(self.layout.deletion_budget())?;
-            Ok(report)
-        })();
-        self.release_maintenance();
-        result
-    }
-
-    fn rollover_at_size_target(&mut self) -> Result<(), StoreError> {
-        let target = self.active.header.policy.rollover_bytes;
-        if target == 0
-            || self.head.txid < self.active.header.start_txid
-            || self.head.active_commit_end < target
-        {
-            return Ok(());
-        }
-        self.acquire_maintenance()?;
-        let result = self.flush_sidecars();
-        self.release_maintenance();
-        result
+        let endpoint = crate::storage::SealEndpoint {
+            database: view.endpoint().0,
+            lineage: crate::domain::LineageId::from_bytes(self.database_id()),
+            dictionary: DictionaryPolicy::new(0, self.dictionary_policy().sample_bytes())?,
+            size: view.logical_size(),
+            txid: view.endpoint().1,
+            history: view.endpoint().2,
+            truncate: None,
+        };
+        let input = crate::storage::SealInput::new(
+            &guard,
+            Some(view),
+            endpoint,
+            Vec::new(),
+            tempfile::tempfile()?,
+            self.layout,
+        )?
+        .repack(
+            selected
+                .iter()
+                .map(crate::storage::RepackPlan::pack)
+                .collect(),
+        );
+        Ok(Some(SealWork {
+            input,
+            kind: SealKind::Active {
+                header: self.active.header,
+                head: self.head,
+                restore: self.publication_owner.phase(),
+            },
+        }))
     }
 
     pub(crate) fn acquire_maintenance(&mut self) -> Result<(), StoreError> {
@@ -2057,6 +2657,15 @@ impl Store {
     fn page_txid_map(&self) -> Result<Vec<u64>, StoreError> {
         let pages = page_count(self.head.logical_size, self.head.page_size)?;
         let mut map = vec![0; pages as usize];
+        if self.source.is_some() {
+            let source_pages = self.active.header.source_bytes / u64::from(self.head.page_size);
+            for txid in map
+                .iter_mut()
+                .take(usize::try_from(source_pages).map_err(|_| StoreError::Range)?)
+            {
+                *txid = 1;
+            }
+        }
         if let Some(view) = &self.view {
             for (page, txid) in view.versions() {
                 if page.get() <= pages {
@@ -2083,19 +2692,13 @@ impl Store {
         Ok(map)
     }
 
-    fn collect_garbage(&mut self, limit: usize) -> Result<(), StoreError> {
+    /// The number of objects deleted. Another catalogue holder is `Busy`.
+    fn collect_garbage(&mut self, limit: usize) -> Result<usize, StoreError> {
         // Payload reachability changes only under catalogue exclusion. Ordinary
         // main-image writes do not change the immutable header's base manifest.
         // Do not reserve SQLite publication for a read/GC-only catalogue pass.
         let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
-        match catalog.try_lock() {
-            Ok(mut guard) => {
-                let _report = guard.collect(limit)?;
-                Ok(())
-            }
-            Err(StoreError::Busy) => Ok(()),
-            Err(error) => Err(error),
-        }
+        Ok(catalog.try_lock()?.collect(limit)?.deleted_objects)
     }
 
     fn release_publication(&mut self) {
@@ -2111,6 +2714,9 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
+        if let Some(notifier) = self.background.notifier.take() {
+            notifier(None);
+        }
         if self.has_pending() {
             self.discard_mutable_pending();
         }
@@ -2213,9 +2819,7 @@ fn active_staging_path(path: &Path, id: [u8; 16]) -> PathBuf {
 }
 
 pub(crate) fn validate_policy(value: StoragePolicyRecord) -> Result<(), StoreError> {
-    if value.settle_seconds == 0
-        || value.max_stale_seconds < value.settle_seconds
-        || (value.rollover_bytes != 0 && value.rollover_bytes < 1024 * 1024)
+    if (value.rollover_bytes != 0 && value.rollover_bytes < 1024 * 1024)
         || DictionaryPolicy::new(
             value.dictionary.dictionary_bytes,
             value.dictionary.sample_bytes,
@@ -2491,7 +3095,7 @@ mod tests {
     }
 
     #[test]
-    fn active_records_seal_at_the_configured_size() -> Result<(), Box<dyn std::error::Error>> {
+    fn configured_size_arms_sealing_after_commit() -> Result<(), Box<dyn std::error::Error>> {
         const PAGE_SIZE: usize = 4096;
         const PAGE_COUNT: usize = 256;
 
@@ -2519,6 +3123,9 @@ mod tests {
         store.publish(true)?;
 
         assert_eq!(store.head.txid, 1);
+        assert!(store.view.is_none(), "commit must not compress pages");
+        assert!(store.next_maintenance().is_some());
+        store.try_background_maintenance()?;
         assert_eq!(store.inspect()?.pack_count, 1);
         assert_eq!(store.active.header.start_txid, 2);
         assert!(store.active.active_records.is_empty());
@@ -3023,6 +3630,47 @@ mod tests {
         reopened.read_at(0, &mut actual)?;
         assert_eq!(actual, working);
         reopened.verify()?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_commits_are_durable_and_never_sealed_in_the_background()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("local.zsqlite");
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &page(1, 4096))?;
+        store.publish(true)?;
+        // Opening arms one cleanup pass. A local backend requests no seal.
+        assert!(store.next_maintenance().is_some());
+        store.try_background_maintenance()?;
+        assert_eq!(store.next_maintenance(), None);
+        assert!(store.view.is_none());
+        assert!(store.head.txid >= store.active.header.start_txid);
+        Ok(())
+    }
+
+    #[test]
+    fn reopening_keeps_the_first_unsealed_commit_time() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("first-commit.zsqlite");
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &page(1, 4096))?;
+        store.publish(true)?;
+        store.write_at(4096, &page(2, 4096))?;
+        // Stand in for a first commit made long before this one.
+        store.head.oldest_dirty_unix = 1_000;
+        store.publish(true)?;
+        let latest = store.head.last_dirty_unix;
+        drop(store);
+        let mut reopened = Store::open_existing(&path)?;
+        assert_eq!(reopened.head.oldest_dirty_unix, 1_000);
+        assert_eq!(reopened.head.last_dirty_unix, latest);
+        // A seal starts a new unsealed span.
+        reopened.flush_sidecars()?;
+        assert_eq!(reopened.head.oldest_dirty_unix, 0);
+        drop(reopened);
+        assert_eq!(Store::open_existing(&path)?.head.oldest_dirty_unix, 0);
         Ok(())
     }
 

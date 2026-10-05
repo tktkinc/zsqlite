@@ -6,6 +6,7 @@ pub(crate) enum Point {
     BootstrapDataSynced,
     BootstrapClaimed,
     BootstrapInstalled,
+    SourceRenamed,
     ObjectDataSynced,
     ObjectLinked,
     ObjectDirectorySynced,

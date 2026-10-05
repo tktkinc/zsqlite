@@ -253,11 +253,11 @@ pub(super) fn get_store_with(
     let mut registered = entry.store.lock().map_err(|_| crate::StoreError::Range)?;
     if let Some(store) = registered.upgrade() {
         let mut opened = store.lock().map_err(|_| crate::StoreError::Range)?;
-        let start_worker = writable && opened.upgrade_writable()?;
+        let schedule = writable && opened.upgrade_writable()?;
         drop(opened);
         drop(registered);
-        if start_worker {
-            spawn_maintenance_worker(Arc::downgrade(&store));
+        if schedule {
+            super::scheduler::register(&store)?;
         }
         return Ok((store, false));
     }
@@ -266,7 +266,7 @@ pub(super) fn get_store_with(
     *registered = Arc::downgrade(&store);
     drop(registered);
     if writable {
-        spawn_maintenance_worker(Arc::downgrade(&store));
+        super::scheduler::register(&store)?;
     }
     Ok((store, true))
 }
@@ -293,20 +293,6 @@ pub(super) fn delete_registered_store_with<T>(
         *registered = Weak::new();
     }
     Ok(output)
-}
-
-fn spawn_maintenance_worker(store: Weak<Mutex<Store>>) {
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            let Some(store) = store.upgrade() else {
-                break;
-            };
-            if let Ok(mut opened) = store.try_lock() {
-                let _ = opened.try_background_maintenance();
-            }
-        }
-    });
 }
 
 fn path_to_c_string(path: &Path) -> Result<CString, ()> {

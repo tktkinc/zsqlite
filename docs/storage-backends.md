@@ -72,6 +72,19 @@ are:
 - A small conditional root record: create-if-absent or compare with an opaque,
   never-reused revision token, returning applied, stale, or uncertain outcomes.
 - Deletion consuming a namespace-bound, single-use core GC permit.
+- An optional `seal_schedule()`. Commits are durable in the local active file,
+  so the default requests nothing. A backend that replicates sealed snapshots
+  returns a `SealSchedule`: seal once writes have been quiet for `settle`, and
+  never leave a commit unsealed for longer than `max_age`. The active state
+  records the first unsealed commit, so the maximum age survives reopening.
+
+One process-wide thread runs background work for every database open through
+the VFS. Each commit, seal, or reload reports that database's next deadline;
+nothing wakes while nothing is due. Besides scheduled seals, a bounded collection
+and repack pass follows an open, a seal, a compaction, a released retention root,
+or a pass that used its whole budget. Deadlines are kept only while some process
+has the database open: one closed with unsealed commits seals when next opened
+after its deadline. `Database` handles do not run background work.
 
 `ObjectKey` distinguishes blobs, manifests, dictionaries, and index objects.
 Paths and future S3 keys are adapter details. Stat and inventory never authenticate

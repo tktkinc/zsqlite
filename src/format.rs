@@ -45,8 +45,6 @@ pub struct DictionaryPolicyRecord {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoragePolicyRecord {
-    pub settle_seconds: u32,
-    pub max_stale_seconds: u32,
     /// Seal the active file at the next committed boundary once it reaches
     /// this many bytes. Zero disables the byte trigger.
     pub rollover_bytes: u64,
@@ -67,6 +65,9 @@ pub struct ActiveHeader {
     pub base_logical_size: u64,
     pub policy: StoragePolicyRecord,
     pub layout: crate::layout::LayoutPolicy,
+    /// Immutable native `SQLite` base, present until background adoption finishes.
+    pub source_bytes: u64,
+    pub source_header_digest: Digest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +79,9 @@ pub struct ActiveState {
     pub page_size: u32,
     pub history: Digest,
     pub commit_unix: u64,
+    /// The first commit not yet sealed, or zero when unknown. Seal deadlines
+    /// measure maximum unsealed age from it across process restarts.
+    pub first_commit_unix: u64,
     pub record_count: u64,
     /// Lowest logical page count reached by this active file.
     pub truncate_pages: Option<u32>,
@@ -101,6 +105,7 @@ impl ActiveState {
             output[128] = 1;
             put_u32(&mut output, 132, truncate_pages);
         }
+        put_u64(&mut output, 136, self.first_commit_unix);
         put_sector_checksum(&mut output);
         output
     }
@@ -115,6 +120,7 @@ impl ActiveState {
             page_size: get_u32(input, 72),
             history: input[80..112].try_into().expect("fixed digest"),
             commit_unix: get_u64(input, 112),
+            first_commit_unix: get_u64(input, 136),
             record_count: get_u64(input, 120),
             truncate_pages: match input[128] {
                 0 if get_u32(input, 132) == 0 => None,
@@ -136,7 +142,7 @@ impl ActiveState {
                     || u64::from(pages) > output.logical_size / u64::from(output.page_size)
             })
             || input[129..132] != [0; 3]
-            || input[136..ACTIVE_STATE_SIZE - 4]
+            || input[144..ACTIVE_STATE_SIZE - 4]
                 .iter()
                 .any(|byte| *byte != 0)
         {
@@ -161,6 +167,8 @@ impl ActiveHeader {
         put_policy(&mut output[208..256], self.policy);
         output[256..384].copy_from_slice(&self.layout.encode());
         output[384..416].copy_from_slice(&self.attachment_id);
+        put_u64(&mut output, 416, self.source_bytes);
+        output[424..456].copy_from_slice(&self.source_header_digest);
         put_sector_checksum(&mut output);
         output
     }
@@ -180,6 +188,8 @@ impl ActiveHeader {
                 input[256..384].try_into().expect("fixed layout policy"),
             )
             .map_err(|_| FormatError::Invalid("invalid frame layout policy"))?,
+            source_bytes: get_u64(input, 416),
+            source_header_digest: input[424..456].try_into().expect("fixed source digest"),
         };
         if output.start_txid == 0
             || input[10..16] != [0; 6]
@@ -196,7 +206,14 @@ impl ActiveHeader {
             || (output.start_txid == 1) != (output.parent_physical_digest == [0; 32])
             || (output.start_txid == 1 && output.base_history != genesis_history())
             || input[236..256].iter().any(|byte| *byte != 0)
-            || input[416..ACTIVE_HEADER_SIZE - 4]
+            || (output.source_bytes == 0) != (output.source_header_digest == [0; 32])
+            || (output.source_bytes != 0
+                && (output.page_size == 0
+                    || !output
+                        .source_bytes
+                        .is_multiple_of(u64::from(output.page_size))
+                    || output.start_txid != 1))
+            || input[456..ACTIVE_HEADER_SIZE - 4]
                 .iter()
                 .any(|byte| *byte != 0)
         {
@@ -323,9 +340,7 @@ fn nibble(value: u8) -> Result<u8, FormatError> {
 }
 
 fn valid_policy(value: StoragePolicyRecord) -> bool {
-    value.settle_seconds > 0
-        && value.max_stale_seconds >= value.settle_seconds
-        && (value.rollover_bytes == 0 || value.rollover_bytes >= 1024 * 1024)
+    (value.rollover_bytes == 0 || value.rollover_bytes >= 1024 * 1024)
         && crate::DictionaryPolicy::new(
             value.dictionary.dictionary_bytes,
             value.dictionary.sample_bytes,
@@ -333,9 +348,9 @@ fn valid_policy(value: StoragePolicyRecord) -> bool {
         .is_ok()
 }
 
+// Bytes 0..8 held retired settle and maximum-staleness timers. Seal timing now
+// belongs to the storage backend: write zeros and ignore older values.
 fn put_policy(output: &mut [u8], value: StoragePolicyRecord) {
-    put_u32(output, 0, value.settle_seconds);
-    put_u32(output, 4, value.max_stale_seconds);
     put_u64(output, 8, value.rollover_bytes);
     put_u32(output, 16, value.dictionary.dictionary_bytes);
     put_u64(output, 20, value.dictionary.sample_bytes);
@@ -343,8 +358,6 @@ fn put_policy(output: &mut [u8], value: StoragePolicyRecord) {
 
 fn get_policy(input: &[u8]) -> StoragePolicyRecord {
     StoragePolicyRecord {
-        settle_seconds: get_u32(input, 0),
-        max_stale_seconds: get_u32(input, 4),
         rollover_bytes: get_u64(input, 8),
         dictionary: DictionaryPolicyRecord {
             dictionary_bytes: get_u32(input, 16),
@@ -408,8 +421,6 @@ mod tests {
 
     fn policy() -> StoragePolicyRecord {
         StoragePolicyRecord {
-            settle_seconds: 300,
-            max_stale_seconds: 3600,
             rollover_bytes: 64 * 1024 * 1024,
             dictionary: DictionaryPolicyRecord {
                 dictionary_bytes: 65_536,
@@ -421,6 +432,8 @@ mod tests {
     #[test]
     fn active_header_rejects_nonzero_reserved_bytes() {
         let header = ActiveHeader {
+            source_bytes: 0,
+            source_header_digest: [0; 32],
             attachment_id: [1; 32],
             layout: crate::layout::LayoutPolicy::default(),
             database_id: [1; 32],
@@ -440,5 +453,57 @@ mod tests {
                 Err(FormatError::Invalid("invalid active header"))
             ));
         }
+    }
+
+    #[test]
+    fn retired_policy_timers_are_ignored_and_rewritten_as_zero() -> Result<(), FormatError> {
+        let header = ActiveHeader {
+            source_bytes: 0,
+            source_header_digest: [0; 32],
+            attachment_id: [1; 32],
+            layout: crate::layout::LayoutPolicy::default(),
+            database_id: [1; 32],
+            page_size: 4096,
+            start_txid: 1,
+            base_history: genesis_history(),
+            parent_physical_digest: [0; 32],
+            base_logical_size: 0,
+            policy: policy(),
+        };
+        let mut legacy = header.encode();
+        assert_eq!(legacy[208..216], [0; 8]);
+        // Files written before seal timing moved to the backend carry 300/3600.
+        put_u32(&mut legacy, 208, 300);
+        put_u32(&mut legacy, 212, 3600);
+        put_sector_checksum(&mut legacy);
+        let decoded = ActiveHeader::decode(&legacy)?;
+        assert_eq!(decoded, header);
+        assert_eq!(decoded.encode(), header.encode());
+        Ok(())
+    }
+
+    #[test]
+    fn active_state_keeps_the_first_unsealed_commit() -> Result<(), FormatError> {
+        let state = ActiveState {
+            database_id: [1; 32],
+            sequence: 2,
+            txid: 3,
+            logical_size: 4096,
+            page_size: 4096,
+            history: [2; 32],
+            commit_unix: 1_700_000_100,
+            first_commit_unix: 1_700_000_000,
+            record_count: 1,
+            truncate_pages: None,
+        };
+        assert_eq!(ActiveState::decode(&state.encode())?, state);
+        let mut reserved = state.encode();
+        reserved[144] = 1;
+        put_sector_checksum(&mut reserved);
+        assert!(matches!(
+            ActiveState::decode(&reserved),
+            Err(FormatError::Invalid("invalid active state"))
+        ));
+        Ok(())
     }
 }

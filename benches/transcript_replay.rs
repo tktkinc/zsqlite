@@ -29,7 +29,7 @@ mod replay {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     use zsqlite::domain::{CacheBytes, DecodedBytes};
     use zsqlite::layout::LayoutPolicy;
 
@@ -201,7 +201,6 @@ mod replay {
         };
         Ok(zsqlite::StoragePolicy::default()
             .with_layout(layout)
-            .with_timing(Duration::from_hours(24), Duration::from_hours(24))?
             .with_rollover(None)?)
     }
     fn connect(path: &Path, profile: &str, source: &Path, vfs: &str) -> Result<Connection> {

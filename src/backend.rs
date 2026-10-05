@@ -7,12 +7,14 @@ use std::path::{Path, PathBuf};
 pub(crate) struct LocalCoordination {
     root: PathBuf,
     locks: PathBuf,
+    seal_schedule: Option<crate::storage::SealSchedule>,
 }
 impl LocalCoordination {
     pub(crate) fn open(root: PathBuf, create: bool) -> Result<Self, StoreError> {
         let storage = crate::storage::Storage::for_sidecar(&root, create)?;
         let output = Self {
             locks: storage.coordination_directory().join("locks"),
+            seal_schedule: storage.backend().seal_schedule(),
             root,
         };
         if create {
@@ -30,6 +32,10 @@ impl LocalCoordination {
     }
     pub(crate) fn lock_dir(&self) -> &Path {
         &self.locks
+    }
+    /// The backend's seal deadline policy, resolved with the namespace.
+    pub(crate) fn seal_schedule(&self) -> Option<crate::storage::SealSchedule> {
+        self.seal_schedule
     }
 }
 pub(crate) fn sidecar_dir(path: &Path) -> PathBuf {

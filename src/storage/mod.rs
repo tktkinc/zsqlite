@@ -18,9 +18,12 @@ mod handle;
 mod maintenance_read;
 mod pack;
 mod placement;
+mod prepared;
 #[cfg(test)]
 mod tier_protocol_tests;
-pub use adapter::{BackendError, FaultBackend, FilesystemBackend, MemoryBackend, StorageBackend};
+pub use adapter::{
+    BackendError, FaultBackend, FilesystemBackend, MemoryBackend, SealSchedule, StorageBackend,
+};
 pub use handle::{Database, Storage};
 pub use placement::{
     BlobExtent, BlobIndex, LocatedRange, PackRange, PlacementPin, RelocationReport,
@@ -38,10 +41,13 @@ mod segment;
 mod view;
 pub(crate) mod wire;
 pub(crate) use cache::PageCache;
+pub(crate) use prepared::{PreparedSeal, SealInput};
 pub use repack::PackOccupancy;
-pub(crate) use repack::{eligible_packs, repack};
+pub(crate) use repack::{RepackPlan, eligible_packs};
 pub use retention::{DurablePin, GcReport, MaintenanceReport, RetentionName};
-pub(crate) use seal::{ManifestMode, SealEndpoint, seal};
+pub(crate) use seal::SealEndpoint;
+#[cfg(test)]
+pub(crate) use seal::{ManifestMode, seal};
 pub(crate) use view::DurableView;
 pub(crate) use view::checkpoint_manifest;
 pub use view::{FrameDistribution, ManifestStatistics, PinnedView, ResolvedPage};
