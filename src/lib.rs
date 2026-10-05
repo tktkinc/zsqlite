@@ -145,8 +145,9 @@ pub fn configure(path: impl AsRef<Path>, policy: StoragePolicy) -> Result<Inspec
 /// Candidates are scored on the related sample reservoirs, excluding pages only
 /// their holders contributed, and charged their own size against the related
 /// databases' median logical size. The seed takes the fallback slot that later
-/// trained dictionaries never evict. Unreadable related paths are skipped.
-/// Each related catalog is locked briefly; cost grows with their dictionaries.
+/// trained dictionaries never evict. Unreadable related paths are skipped; the
+/// new database's own path is ignored. Each related catalog is locked briefly;
+/// cost grows with their dictionaries.
 pub fn create_with_dictionary_from<P: AsRef<Path>>(
     path: impl AsRef<Path>,
     related: impl IntoIterator<Item = P>,
@@ -157,16 +158,16 @@ pub fn create_with_dictionary_from<P: AsRef<Path>>(
         return Err(StoreError::DestinationExists(logical));
     }
     ensure_bundle_absent(&path)?;
-    let related = related
-        .into_iter()
-        .map(|related| Ok(facade::storage_path(&absolute_path(related.as_ref())?)))
-        .collect::<Result<Vec<_>, StoreError>>()?;
-    let (seed, report) = storage::seed::choose(&related, layout::LayoutPolicy::default().level());
+    let related = related_storage_paths(related, &[&path])?;
+    let (seed, report) = storage::seed::choose(
+        &related,
+        layout::LayoutPolicy::default().level(),
+        storage::seed::SeedTarget::RelatedMedian,
+    );
     let store = store::Store::open(&path, true)?;
     facade::ensure_notice(&path)?;
     if let Some((_, bytes)) = seed {
-        let catalog = storage::Catalog::open(&backend::sidecar_dir(&path), false)?;
-        storage::seed::record(&catalog.lock()?, &bytes)?;
+        record_dictionary_seed(&path, &bytes)?;
     }
     drop(store);
     Ok(report)
@@ -189,55 +190,151 @@ pub fn convert_to_zsqlite_with_policy(
     destination: impl AsRef<Path>,
     policy: StoragePolicy,
 ) -> Result<Inspect, StoreError> {
-    let source = absolute_path(source.as_ref())?;
-    let logical_destination = absolute_path(destination.as_ref())?;
-    let destination = facade::storage_path(&logical_destination);
-    store::reject_auxiliary_files(&source)?;
-    if destination != logical_destination && logical_destination.exists() {
-        return Err(StoreError::DestinationExists(logical_destination));
-    }
-    ensure_bundle_absent(&destination)?;
+    Conversion::prepare(source.as_ref(), destination.as_ref())?.run(policy, None)
+}
 
-    let input = File::open(&source)?;
-    let length = input.metadata()?.len();
-    let mut sqlite_header = [0; 100];
-    read_exact_at(&input, 0, &mut sqlite_header)
-        .map_err(|_| StoreError::InvalidStandardDatabase)?;
-    let page_size = sqlite_page_size(&sqlite_header).ok_or(StoreError::InvalidStandardDatabase)?;
-    if length == 0 || !length.is_multiple_of(u64::from(page_size)) {
-        return Err(StoreError::InvalidStandardDatabase);
+/// Converts like [`convert_to_zsqlite_with_policy`], but the conversion's first
+/// seal adopts the best preferred dictionary among related zsqlite databases,
+/// chosen as by [`create_with_dictionary_from`] except that each candidate's
+/// size is charged against the source file's length: a small source never pays
+/// for a dictionary larger than it saves. A large source may still train its own
+/// dictionary, which must beat the seed by 5%. Convert the largest databases of
+/// a family first so the smaller ones can be seeded from them. The source and
+/// destination are excluded from `related`; unreadable or unsealed related paths
+/// are skipped and counted in the report.
+pub fn convert_to_zsqlite_with_dictionary_from<P: AsRef<Path>>(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    policy: StoragePolicy,
+    related: impl IntoIterator<Item = P>,
+) -> Result<(Inspect, DictionarySeed), StoreError> {
+    let conversion = Conversion::prepare(source.as_ref(), destination.as_ref())?;
+    let related = related_storage_paths(
+        related,
+        &[
+            &conversion.source,
+            &facade::storage_path(&conversion.source),
+            &conversion.destination,
+        ],
+    )?;
+    // Choosing reads related reservoirs and locks their catalogs; finish it
+    // before any staging bundle exists.
+    let (seed, report) = storage::seed::choose(
+        &related,
+        policy.layout().level(),
+        storage::seed::SeedTarget::Logical(conversion.length),
+    );
+    let info = conversion.run(policy, seed.as_ref().map(|(_, bytes)| bytes.as_slice()))?;
+    Ok((info, report))
+}
+
+/// Maps related logical `.db` names to active-file paths, dropping `excluded`.
+fn related_storage_paths<P: AsRef<Path>>(
+    related: impl IntoIterator<Item = P>,
+    excluded: &[&Path],
+) -> Result<Vec<PathBuf>, StoreError> {
+    let mut paths = Vec::new();
+    for path in related {
+        let path = facade::storage_path(&absolute_path(path.as_ref())?);
+        if !excluded.contains(&path.as_path()) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+/// Record the dictionary an unsealed database's first seal adopts.
+fn record_dictionary_seed(path: &Path, dictionary: &[u8]) -> Result<(), StoreError> {
+    let catalog = storage::Catalog::open(&backend::sidecar_dir(path), false)?;
+    storage::seed::record(&catalog.lock()?, dictionary)
+}
+
+/// A closed ordinary `SQLite` source and a fresh destination, both validated.
+struct Conversion {
+    source: PathBuf,
+    destination: PathBuf,
+    input: File,
+    length: u64,
+    page_size: u32,
+    sqlite_header: [u8; 100],
+}
+
+impl Conversion {
+    fn prepare(source: &Path, destination: &Path) -> Result<Self, StoreError> {
+        let source = absolute_path(source)?;
+        let logical_destination = absolute_path(destination)?;
+        let destination = facade::storage_path(&logical_destination);
+        store::reject_auxiliary_files(&source)?;
+        if destination != logical_destination && logical_destination.exists() {
+            return Err(StoreError::DestinationExists(logical_destination));
+        }
+        ensure_bundle_absent(&destination)?;
+
+        let input = File::open(&source)?;
+        let length = input.metadata()?.len();
+        let mut sqlite_header = [0; 100];
+        read_exact_at(&input, 0, &mut sqlite_header)
+            .map_err(|_| StoreError::InvalidStandardDatabase)?;
+        let page_size =
+            sqlite_page_size(&sqlite_header).ok_or(StoreError::InvalidStandardDatabase)?;
+        if length == 0 || !length.is_multiple_of(u64::from(page_size)) {
+            return Err(StoreError::InvalidStandardDatabase);
+        }
+        Ok(Self {
+            source,
+            destination,
+            input,
+            length,
+            page_size,
+            sqlite_header,
+        })
     }
 
-    let staging = unused_staging_path(&destination, "convert")?;
-    let mut cleanup = CleanupPaths::new(bundle_paths(&staging).to_vec());
-    let mut converted = store::Store::open(&staging, true)?;
-    converted.set_storage_policy(policy)?;
-    let mut page = vec![0; page_size as usize];
-    let mut offset = 0_u64;
-    while offset < length {
-        read_exact_at(&input, offset, &mut page)?;
-        converted.write_at(offset, &page)?;
-        offset = offset
-            .checked_add(u64::from(page_size))
-            .ok_or(StoreError::Range)?;
-    }
-    converted.publish(true)?;
-    converted.flush_sidecars()?;
-    converted.verify()?;
-    drop(converted);
+    /// Stage, seal once, verify, and install. A seed is recorded in the staging
+    /// catalog before any page is written, so the first seal adopts it.
+    fn run(self, policy: StoragePolicy, seed: Option<&[u8]>) -> Result<Inspect, StoreError> {
+        let Self {
+            source,
+            destination,
+            input,
+            length,
+            page_size,
+            sqlite_header,
+        } = self;
+        let staging = unused_staging_path(&destination, "convert")?;
+        let mut cleanup = CleanupPaths::new(bundle_paths(&staging).to_vec());
+        let mut converted = store::Store::open(&staging, true)?;
+        converted.set_storage_policy(policy)?;
+        if let Some(seed) = seed {
+            record_dictionary_seed(&staging, seed)?;
+        }
+        let mut page = vec![0; page_size as usize];
+        let mut offset = 0_u64;
+        while offset < length {
+            read_exact_at(&input, offset, &mut page)?;
+            converted.write_at(offset, &page)?;
+            offset = offset
+                .checked_add(u64::from(page_size))
+                .ok_or(StoreError::Range)?;
+        }
+        converted.publish(true)?;
+        converted.flush_sidecars()?;
+        converted.verify()?;
+        drop(converted);
 
-    let mut final_header = [0; 100];
-    read_exact_at(&input, 0, &mut final_header)?;
-    if final_header != sqlite_header || input.metadata()?.len() != length {
-        return Err(StoreError::Busy);
+        let mut final_header = [0; 100];
+        read_exact_at(&input, 0, &mut final_header)?;
+        if final_header != sqlite_header || input.metadata()?.len() != length {
+            return Err(StoreError::Busy);
+        }
+        store::reject_auxiliary_files(&source)?;
+        install_staged_bundle(&staging, &destination)?;
+        cleanup.disarm();
+        facade::ensure_notice(&destination)?;
+        let mut installed = store::Store::open_existing(&destination)?;
+        installed.verify()?;
+        installed.inspect()
     }
-    store::reject_auxiliary_files(&source)?;
-    install_staged_bundle(&staging, &destination)?;
-    cleanup.disarm();
-    facade::ensure_notice(&destination)?;
-    let mut installed = store::Store::open_existing(&destination)?;
-    installed.verify()?;
-    installed.inspect()
 }
 
 /// Exports a zsqlite database as an ordinary `SQLite` file.

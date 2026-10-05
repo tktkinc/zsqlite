@@ -192,14 +192,27 @@ union form one bounded 8 MiB sample; each file is read only up to that cutoff
 and that prefix is structurally validated, not hash-verified. Each candidate is
 scored on pages some non-holder contributed, because its holder may have trained
 it on the rest. Every candidate is screened on a 1 MiB digest prefix; four
-finalists are scored on the whole sample. The estimate scales payload to the
-median related logical size and charges the dictionary once; adoption requires
-the same 5% improvement over plain Zstandard. The chosen bytes are recorded as an
-advisory `dictionary.seed`. A first seal installs them only if they still decode
-and encode; later seals delete the record. Later trained candidates must beat
-the seed and never evict it. Each related head is pinned briefly under its
-catalog lock. Dictionaries contain verbatim sample bytes, so only relate
-databases within one trust boundary.
+finalists are scored on the whole sample. The estimate scales payload to a
+target logical size and charges the dictionary once; adoption requires the same
+5% improvement over plain Zstandard. A new empty database targets the median
+related logical size. A 768 KiB dictionary that removes 70% of the payload
+therefore pays for itself only once the target's plain Zstandard size exceeds
+about 1.2 MiB. The chosen
+bytes are recorded as an advisory `dictionary.seed`. A first seal installs them
+only if they still decode and encode; later seals delete the record. Later
+trained candidates must beat the seed and never evict it. Each related head is
+pinned briefly under its catalog lock. Dictionaries contain verbatim sample
+bytes, so only relate databases within one trust boundary.
+
+`convert_to_zsqlite_with_dictionary_from(source, destination, policy, related)`
+has the preconditions and staging, verification and install sequence of
+`convert_to_zsqlite_with_policy`. Before staging exists it chooses a seed with
+the source file's length as the target, then records it in the staging catalog
+before the first seal. A large source still trains on its own samples, and that
+candidate must beat the seed by 5%. The source and destination are excluded from
+`related`; missing, ordinary, unsealed or unreadable paths are skipped and
+counted. To convert a family, convert the largest databases first so they train
+their own dictionaries, then seed the smaller conversions from them.
 Immutable dictionary objects up to 768 KiB are accepted by both readers and GC;
 new dictionaries never reinterpret old frames. Compression contexts are reused
 within each seal without making frames depend on one another. Pinned views keep
