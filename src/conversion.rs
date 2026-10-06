@@ -271,8 +271,15 @@ pub fn adopt_to_zsqlite_with_policy(
 pub fn conversion_status(path: impl AsRef<Path>) -> Result<Option<ConversionStatus>, StoreError> {
     let physical = crate::database_storage_path(path.as_ref())?;
     let store = crate::store::Store::open_existing_read_only(&physical)?;
-    let catalog = Catalog::open(&crate::backend::sidecar_dir(&physical), false)?;
-    status(&catalog.lock()?, &store.header())
+    status_for_store(&physical, &store)
+}
+
+fn status_for_store(
+    physical: &Path,
+    store: &crate::store::Store,
+) -> Result<Option<ConversionStatus>, StoreError> {
+    let catalog = Catalog::open(&crate::backend::sidecar_dir(physical), false)?;
+    store.conversion_status(&catalog.lock()?)
 }
 
 /// Pause durably at a chunk publication boundary. Reads and writes continue.
@@ -435,6 +442,40 @@ mod tests {
         store.initialize_source(&info)?;
         crate::facade::ensure_notice(&physical)?;
         Ok((store, bytes))
+    }
+
+    #[test]
+    fn conversion_status_is_coherent_if_import_finishes_after_open() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("status.db");
+        let (mut worker, original) = pending(&path, 4096)?;
+        let physical = crate::facade::storage_path(&path);
+        let first = conversion_step(&path)?;
+        assert_eq!(first.converted_bytes, CHUNK_BYTES);
+        assert!(!first.complete);
+
+        // The status reader opens its Store before the background worker installs the
+        // final source base and retires its progress root. Preserve that exact interleaving
+        // without sleeps, test hooks, retries, or depending on scheduler timing.
+        let reader = crate::store::Store::open_existing_read_only(&physical)?;
+        assert_eq!(reader.header().source_bytes, original.len() as u64);
+        let work = worker.prepare_source_work()?.unwrap();
+        worker.finish_work(work.prepare()?)?;
+
+        let finished = status_for_store(&physical, &reader)?.unwrap();
+        assert!(finished.converted_bytes >= first.converted_bytes);
+        assert_eq!(finished.total_bytes, original.len() as u64);
+        assert_eq!(finished.converted_bytes, finished.total_bytes);
+        assert!(finished.complete);
+        assert!(!finished.paused);
+        // Public inspect opens a Store and then derives this same public progress field.
+        // A reader opened before completion must report the completed import as well.
+        assert_eq!(reader.inspect()?.conversion, Some(finished.clone()));
+        assert_eq!(crate::inspect(&path)?.conversion, Some(finished));
+        let mut bytes = vec![0; original.len()];
+        worker.read_at(0, &mut bytes)?;
+        assert_eq!(bytes, original);
+        Ok(())
     }
 
     #[test]

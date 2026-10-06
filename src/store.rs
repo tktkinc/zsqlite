@@ -436,6 +436,20 @@ impl Store {
     pub(crate) fn header(&self) -> ActiveHeader {
         self.active.header
     }
+    pub(crate) fn conversion_status(
+        &self,
+        guard: &crate::storage::CatalogGuard,
+    ) -> Result<Option<crate::conversion::ConversionStatus>, StoreError> {
+        // Source completion replaces the active header and retires its progress root under
+        // this same catalog lock. This Store can still own the old inode; select the current
+        // header here so completion and progress always describe one coherent snapshot.
+        let header = read_active_header(&File::open(&self.path)?)?;
+        if header.database_id != self.header().database_id {
+            return Err(StoreError::IdentityMismatch);
+        }
+        guard.validate_attachment(&header)?;
+        crate::conversion::status(guard, &header)
+    }
     pub(crate) fn source_needs_initialization(&self) -> bool {
         self.head.txid == 0 && self.head.logical_size == 0 && self.source.is_none()
     }
@@ -2298,7 +2312,7 @@ impl Store {
                 .as_ref()
                 .map_or(0, crate::storage::PinnedView::dictionary_bytes),
             policy: StoragePolicy::decode(self.active.header.policy, self.layout),
-            conversion: crate::conversion::status(&guard, &self.active.header)?,
+            conversion: self.conversion_status(&guard)?,
         })
     }
 
