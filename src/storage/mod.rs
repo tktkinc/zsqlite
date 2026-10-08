@@ -17,6 +17,7 @@ mod gc_remote_tests;
 mod handle;
 mod maintenance_read;
 mod pack;
+mod parallel;
 mod placement;
 mod prepared;
 #[cfg(test)]

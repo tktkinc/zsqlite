@@ -3,6 +3,10 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 mod backend;
+mod compression;
+pub use compression::{
+    CompressionOptions, CompressionPriority, compression_options, set_compression_options,
+};
 mod conversion;
 pub use conversion::{
     ConversionStatus, adopt_to_zsqlite, adopt_to_zsqlite_with_policy, conversion_status,

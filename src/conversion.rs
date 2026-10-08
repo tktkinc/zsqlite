@@ -482,6 +482,41 @@ mod tests {
     }
 
     #[test]
+    fn successful_background_chunks_continue_without_the_busy_retry_delay() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("paced.db");
+        let (mut store, _) = pending(&path, (CHUNK_BYTES / 4096) as usize + 16)?;
+        let work = store.prepare_background_work()?.unwrap();
+        store.complete_background_work(Ok(Some(work.prepare()?)))?;
+        let status = conversion_status(&path)?.unwrap();
+        assert_eq!(status.converted_bytes, CHUNK_BYTES);
+        assert!(!status.complete);
+        let deadline = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed = deadline.clone();
+        store.set_maintenance_notifier(Box::new(move |due| {
+            *observed.lock().unwrap() = due;
+        }));
+        // A successful chunk is immediately eligible for another pass.
+        assert!(
+            deadline
+                .lock()
+                .unwrap()
+                .is_some_and(|due| due <= std::time::Instant::now())
+        );
+        pause_conversion(&path)?;
+        assert!(store.prepare_background_work()?.is_none());
+        store.complete_background_work(Ok(None))?;
+        // A paused source still waits rather than repeatedly polling its marker.
+        assert!(deadline.lock().unwrap().is_some_and(|due| {
+            due.saturating_duration_since(std::time::Instant::now())
+                >= std::time::Duration::from_millis(900)
+        }));
+        resume_conversion(&path)?;
+        assert!(conversion_step(&path)?.complete);
+        Ok(())
+    }
+
+    #[test]
     fn source_attachment_preserves_truncation_regrowth_and_zero_overrides() -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("truncate.db");

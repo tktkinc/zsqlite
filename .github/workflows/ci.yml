@@ -8,6 +8,26 @@ permissions:
   contents: read
 
 jobs:
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Android NDK
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install 'ndk;27.2.12479018'
+      - name: Check and link Android API 21 library and tests
+        run: |
+          android_toolchain="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$android_toolchain/aarch64-linux-android21-clang"
+          export AR_aarch64_linux_android="$android_toolchain/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+          cargo clippy --target aarch64-linux-android --all-targets --no-default-features --features static -- -D warnings
+          cargo test --target aarch64-linux-android --no-default-features --features static --lib --test compression_controls --no-run
   browser:
     runs-on: ubuntu-latest
     env:

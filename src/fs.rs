@@ -469,12 +469,7 @@ pub(crate) fn rename_noclobber(source: &Path, destination: &Path) -> std::io::Re
     #[cfg(target_os = "macos")]
     let result =
         unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
-    // `RENAME_NOREPLACE` is typed `i32` in Android's libc but `u32` in glibc; cast so the
-    // `renameat2` flags argument matches on both.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[allow(clippy::unnecessary_cast)]
-    let flags = libc::RENAME_NOREPLACE as u32;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     // SAFETY: Both CStrings own terminated path bytes through the syscall;
     // renameat2 borrows them synchronously and retains no Rust pointers.
     let result = unsafe {
@@ -483,7 +478,22 @@ pub(crate) fn rename_noclobber(source: &Path, destination: &Path) -> std::io::Re
             source.as_ptr(),
             libc::AT_FDCWD,
             destination.as_ptr(),
-            flags,
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    // Bionic exports renameat2 only from API 30. Use the identical kernel
+    // operation directly so older Android API targets can link the library.
+    #[cfg(target_os = "android")]
+    // SAFETY: valid, owned CStrings; syscall borrows the paths synchronously.
+    // Both directory descriptors and the no-replace flag are valid arguments.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
         )
     };
     if result != 0 {

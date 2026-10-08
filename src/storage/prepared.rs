@@ -1,6 +1,7 @@
 //! Page payloads and dictionary training prepared without database locks.
-use super::frame::{EncodedFrame, FrameEncoder, FrameMetadata, PageVersion, install_dictionary};
+use super::frame::{EncodedFrame, FrameMetadata, PageVersion, install_dictionary};
 use super::objects::CatalogGuard;
+use super::parallel::{BATCH_BYTES, FramePages, encode_batch};
 use super::samples::Samples;
 use super::seal::{PackWriter, SealEndpoint};
 use super::view::{ManifestBuilder, PinnedView, ViewMetadata};
@@ -9,6 +10,7 @@ use crate::fs::{read_exact_at, write_all_at};
 use crate::{StoreError, layout::LayoutPolicy};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::path::PathBuf;
 
 /// The source view owns reader leases; the page file is immutable private
 /// scratch or the adopted source. No publication/catalogue guard escapes here.
@@ -23,6 +25,7 @@ pub(crate) struct SealInput {
     samples: Samples,
     source_prefix: bool,
     repack: Option<BTreeSet<PackId>>,
+    control_root: PathBuf,
 }
 
 pub(crate) struct PreparedSeal {
@@ -81,6 +84,7 @@ impl SealInput {
             },
             source_prefix: false,
             repack: None,
+            control_root: guard.root().to_owned(),
         })
     }
     pub(crate) fn source_prefix(mut self) -> Self {
@@ -180,11 +184,14 @@ impl SealInput {
         Ok(bytes)
     }
 
-    pub(crate) fn prepare(mut self) -> Result<PreparedSeal, StoreError> {
-        let payloads = tempfile::tempfile()?;
-        let mut frames = Vec::new();
-        let mut offset = 0;
-        let report = self.read_repack(&payloads, &mut frames, &mut offset)?;
+    fn check_paused(&self) -> Result<(), StoreError> {
+        if self.source_prefix && crate::conversion::paused(&self.control_root) {
+            return Err(StoreError::Busy);
+        }
+        Ok(())
+    }
+
+    fn train_dictionary(&mut self) -> Result<(), StoreError> {
         if let crate::dictionary::DictionaryTraining::UpTo(_) = self.endpoint.dictionary.training()
         {
             for (page, _) in &self.pages {
@@ -210,16 +217,51 @@ impl SealInput {
         }
         self.dictionaries
             .retain(|id, _| self.preferred.contains(id));
-        let mut encoder = FrameEncoder::new(self.layout.level(), &self.dictionaries)?;
+        Ok(())
+    }
+
+    pub(crate) fn prepare(mut self) -> Result<PreparedSeal, StoreError> {
+        self.check_paused()?;
+        let payloads = tempfile::tempfile()?;
+        let mut frames = Vec::new();
+        let mut offset = 0;
+        let report = self.read_repack(&payloads, &mut frames, &mut offset)?;
+        crate::compression::run(|| self.train_dictionary())?;
+        self.check_paused()?;
         let mut zeros = Vec::new();
         let mut group = Vec::new();
         let size = self.endpoint.size.page_size();
         let capacity = self.layout.frame_bytes(size);
-        let mut spill = |pages| -> Result<(), StoreError> {
-            let (metadata, bytes) = encoder.build(size, pages)?.into_parts();
-            write_all_at(&payloads, offset, &bytes)?;
-            frames.push((metadata, offset));
-            offset += bytes.len() as u64;
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0;
+        let mut encode = |batch| -> Result<(), StoreError> {
+            self.check_paused()?;
+            let encoded = encode_batch(
+                batch,
+                size,
+                self.layout.level(),
+                &self.dictionaries,
+                crate::compression_options(),
+            )?;
+            self.check_paused()?;
+            for frame in encoded {
+                let (metadata, bytes) = frame.into_parts();
+                write_all_at(&payloads, offset, &bytes)?;
+                frames.push((metadata, offset));
+                offset += bytes.len() as u64;
+            }
+            Ok(())
+        };
+        let mut spill = |pages: FramePages| -> Result<(), StoreError> {
+            // Flush before adding another frame so even 8 MiB frames obey the
+            // batch bound. Keep zero-page elision and frame grouping unchanged.
+            let bytes = size.as_usize() * pages.len();
+            if batch_bytes + bytes > BATCH_BYTES {
+                encode(std::mem::take(&mut batch))?;
+                batch_bytes = 0;
+            }
+            batch.push(pages);
+            batch_bytes += bytes;
             Ok(())
         };
         for (page, txid) in &self.pages {
@@ -236,12 +278,16 @@ impl SealInput {
         if !group.is_empty() {
             spill(group)?;
         }
+        if !batch.is_empty() {
+            encode(batch)?;
+        }
+        let samples = crate::compression::run(|| self.samples.encode())?;
         Ok(PreparedSeal {
             endpoint: self.endpoint,
             source: self.source,
             dictionaries: self.dictionaries,
             preferred: self.preferred,
-            samples: self.samples.encode()?,
+            samples,
             zeros,
             frames,
             payloads,

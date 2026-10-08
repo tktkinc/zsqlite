@@ -283,6 +283,45 @@ ceiling, and a 96 MiB sample budget. Older bundles' stored settle and staleness
 timers are ignored. The reservoir is advisory and stored compressed; training and
 serialization use additional transient memory beyond the sample budget.
 
+Conversion, background sealing, and repack compression encode independent frames
+in parallel using the available CPUs. Each worker owns its codec contexts; frame
+order and the storage format are unchanged. At most 8 MiB of decoded frame input
+is queued per batch, plus a frame being assembled and worker codec memory.
+Dictionary training and metadata publication remain serial. Successful background
+conversion chunks continue immediately; busy, failed, and paused work retries
+after one second.
+
+A Rust host can change execution settings while compression runs:
+
+```rust
+use zsqlite::{CompressionOptions, CompressionPriority, set_compression_options};
+
+let previous = set_compression_options(CompressionOptions {
+    workers: None, // available CPUs; Some(NonZeroUsize) caps the worker count
+    priority: CompressionPriority::Background,
+})?;
+// Later, restore the host's previous settings:
+set_compression_options(previous)?;
+# Ok::<(), zsqlite::StoreError>(())
+```
+
+`compression_options()` reads the current settings. These controls apply to all
+databases in this process and are not persisted. Changes apply to the next bounded
+frame batch or dictionary-training operation; existing work finishes with its
+current settings. Priority changes affect private workers, leaving the host's
+foreground threads unchanged. Background priority uses
+[macOS background QoS](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/PrioritizeWorkAtTheTaskLevel.html)
+or [Linux/Android thread niceness](https://man7.org/linux/man-pages/man2/setpriority.2.html)
+of at least 10, preserving any inherited lower priority. Other platforms reject
+background priority. The browser build continues to run serially without pthreads.
+OS priority is a scheduling hint rather than a CPU or I/O bandwidth cap.
+
+`pause_conversion(path)` and `resume_conversion(path)` remain durable per-database
+controls that also work across processes. Pausing prevents source-chunk publication
+and is checked around each compression batch; normal reads and writes continue.
+These calls control source conversion, while the process-local execution settings
+also cover ordinary sealing and repacking.
+
 ## CLI
 
 ```text

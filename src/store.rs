@@ -2476,6 +2476,9 @@ impl Store {
         let result = (|| {
             if let Some(work) = self.prepare_background_work()? {
                 self.finish_work(work.prepare()?)?;
+                if self.source.is_some() {
+                    return Ok(());
+                }
             }
             self.background_pass()
         })();
@@ -2523,6 +2526,11 @@ impl Store {
         let result = (|| {
             if let Some(work) = work? {
                 self.finish_work(work)?;
+                // Successful source chunks can continue immediately. The
+                // retry delay is for contention, errors, and paused work.
+                if self.source.is_some() {
+                    return Ok(());
+                }
             }
             self.background_pass()
         })();
