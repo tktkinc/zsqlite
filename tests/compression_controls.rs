@@ -17,7 +17,7 @@ fn host_controls_apply_to_conversion_and_preserve_database_bytes()
     let directory = tempfile::tempdir()?;
     let source = directory.path().join("source.sqlite");
     let mut bytes = vec![0; 145 * 65536];
-    for (index, page) in bytes.chunks_exact_mut(65536).enumerate() {
+    for (index, page) in bytes.as_chunks_mut::<65536>().0.iter_mut().enumerate() {
         if index % 17 != 0 {
             page.fill(u8::try_from(index % 251 + 1)?);
             page[..8].copy_from_slice(&(index as u64).to_le_bytes());
