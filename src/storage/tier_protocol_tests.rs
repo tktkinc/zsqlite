@@ -865,6 +865,15 @@ fn dictionary_encoded_snapshot_requires_uploaded_dictionary_for_restore() -> Tes
     local.expected = pages.concat();
     local.store.write_at(0, &local.expected)?;
     local.store.publish(true)?;
+    // This upload fixture needs dictionary-encoded payloads. Prepare it as a
+    // background seal; a foreground flush now only collects training samples.
+    let work = local
+        .store
+        .prepare_flush_work()?
+        .ok_or("missing dictionary seal")?;
+    local
+        .store
+        .finish_work(work.with_dictionary_training().prepare()?)?;
     local.store.flush_sidecars()?;
     let overwritten = (0..240).flat_map(|_| page(150)).collect::<Vec<_>>();
     local.store.write_at(0, &overwritten)?;
