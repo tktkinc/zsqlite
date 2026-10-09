@@ -523,6 +523,8 @@ fn tiny_seals_reuse_shared_dictionaries_and_pins_retain_decoding_dependencies() 
     store.write_at(0, &pages.concat())?;
     store.publish(true)?;
     let name = RetentionName::new("dictionary-fork")?;
+    let work = store.prepare_flush_work()?.ok_or("missing seal work")?;
+    store.finish_work(work.with_dictionary_training().prepare()?)?;
     let pin = store.retain_view(name.clone(), false)?;
     let first = store.inspect()?;
     assert!(first.dictionary_bytes > 0);
@@ -688,11 +690,123 @@ fn seal_sampling_reaches_distinct_pages_after_a_repetitive_prefix() -> TestResul
     store.write_at(0, &image)?;
     store.publish(true)?;
     store.flush_sidecars()?;
+    store.try_background_maintenance()?;
     assert_eq!(store.inspect()?.dictionary_bytes, 8192);
     drop(store);
     let mut reopened = Store::open_existing(&path)?;
     let mut actual = vec![0; image.len()];
     reopened.read_at(0, &mut actual)?;
     assert_eq!(actual, image);
+    Ok(())
+}
+
+fn dictionary_family_image(generation: u32, page_count: u32) -> Vec<u8> {
+    let common: Vec<_> = (0..96_u32)
+        .flat_map(|part| *blake3::hash(&(generation * 96 + part).to_le_bytes()).as_bytes())
+        .collect();
+    let mut image = Vec::new();
+    for page in 0..page_count {
+        image.extend(&common);
+        for part in 0..32_u32 {
+            let word = 10_000 + generation * 100_000 + page * 32 + part;
+            image.extend(blake3::hash(&word.to_le_bytes()).as_bytes());
+        }
+    }
+    image[..16].copy_from_slice(b"SQLite format 3\0");
+    image[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+    image
+}
+
+#[test]
+fn rust_database_maintenance_evaluates_samples_after_a_foreground_flush() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("rust-dictionary.zsqlite");
+    let image = dictionary_family_image(0, 320);
+    let mut store = Store::open(&path, true)?;
+    store.write_at(0, &image)?;
+    store.publish(true)?;
+    store.flush_sidecars()?;
+    assert_eq!(store.inspect()?.preferred_dictionaries, 0);
+    drop(store);
+
+    let storage = super::Storage::for_sidecar(&crate::backend::sidecar_dir(&path), false)?;
+    let database = storage.open(&path)?;
+    assert_eq!(database.maintain()?.repacked_packs, 0);
+    assert_eq!(database.inspect()?.preferred_dictionaries, 1);
+    let mut output = vec![0; image.len()];
+    database.read_at(0, &mut output)?;
+    assert_eq!(output, image);
+    database.verify()?;
+    Ok(())
+}
+
+#[test]
+fn background_dictionary_promotion_preserves_payloads_and_old_decoders()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("dictionary-switch.zsqlite");
+    let original = dictionary_family_image(0, 640);
+    let mut store = Store::open(&path, true)?;
+    store.write_at(0, &original)?;
+    store.publish(true)?;
+    let work = store.prepare_flush_work()?.ok_or("missing initial seal")?;
+    store.finish_work(work.with_dictionary_training().prepare()?)?;
+    let storage = super::Storage::for_sidecar(&crate::backend::sidecar_dir(&path), false)?;
+    let old = storage.open_sealed()?.metadata.preferred[0];
+    let name = crate::RetentionName::new("before-dictionary-switch")?;
+    let pin = store.retain_view(name.clone(), false)?;
+
+    let replacement = dictionary_family_image(1, 320);
+    store.write_at(0, &replacement)?;
+    store.publish(true)?;
+    store.flush_sidecars()?;
+    let view = storage.open_sealed()?;
+    assert_eq!(view.metadata.preferred, [old]);
+    let frames = view.metadata.frames.clone();
+    let endpoint = view.endpoint();
+    store.try_background_maintenance()?;
+    let view = storage.open_sealed()?;
+    assert_eq!(view.metadata.preferred.len(), 1);
+    assert_ne!(view.metadata.preferred, [old]);
+    assert!(view.dictionaries().contains_key(&old));
+    assert_eq!(view.metadata.frames, frames);
+    assert_eq!(view.endpoint(), endpoint);
+
+    let reader = crate::open_retained(&path, &name)?;
+    assert_eq!(
+        reader.resolve(crate::domain::PageNumber::new(2)?)?.read()?,
+        &original[4096..8192]
+    );
+    drop(reader);
+    crate::release_retention(&path, pin)?;
+    store.verify()?;
+    Ok(())
+}
+
+#[test]
+fn stale_background_dictionary_promotion_cannot_replace_a_newer_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("stale-dictionary.zsqlite");
+    let mut store = Store::open(&path, true)?;
+    store.write_at(0, &dictionary_family_image(0, 320))?;
+    store.publish(true)?;
+    store.flush_sidecars()?;
+    let work = store
+        .prepare_background_work()?
+        .ok_or("missing dictionary work")?
+        .prepare()?;
+    let changed = page(42);
+    store.write_at(4096, &changed)?;
+    store.publish(true)?;
+    assert!(matches!(
+        store.finish_work(work),
+        Err(crate::StoreError::Busy)
+    ));
+    let mut output = vec![0; 4096];
+    store.read_at(4096, &mut output)?;
+    assert_eq!(output, changed);
+    assert_eq!(store.inspect()?.preferred_dictionaries, 0);
+    store.verify()?;
     Ok(())
 }

@@ -169,11 +169,18 @@ pub(super) fn seal_with_copies<'g>(
     }
     let mut dictionaries = BTreeMap::new();
     if let Some(source) = source {
-        for id in &source.metadata.preferred {
-            if let Some(bytes) = source.dictionaries().get(id) {
-                dictionaries.insert(*id, bytes.bytes().to_vec());
-            }
+        if let Some(id) = source.metadata.preferred.last()
+            && let Some(bytes) = source.dictionaries().get(id)
+        {
+            dictionaries.insert(*id, bytes.bytes().to_vec());
         }
+        metadata.preferred = source
+            .metadata
+            .preferred
+            .last()
+            .copied()
+            .into_iter()
+            .collect();
     }
     let mut dictionary_receipts = Vec::<Durable<'g, Dictionary>>::new();
     if source.is_some() {
@@ -181,7 +188,7 @@ pub(super) fn seal_with_copies<'g>(
     } else if let Some(seed) = super::seed::load(guard, policy.level())
         && let Ok(receipt) = install_dictionary(guard, &seed)
     {
-        // A related database's dictionary becomes the retained general fallback.
+        // A related database's dictionary becomes the initial active dictionary.
         metadata.preferred.push(receipt.id());
         dictionaries.insert(receipt.id(), seed);
         dictionary_receipts.push(receipt);
@@ -205,14 +212,9 @@ pub(super) fn seal_with_copies<'g>(
             && let Ok(receipt) = install_dictionary(guard, &candidate)
         {
             let id = receipt.id();
+            dictionaries.clear();
             dictionaries.insert(id, candidate);
-            if !metadata.preferred.contains(&id) {
-                // Preserve the general fallback; evict the oldest specialist.
-                if metadata.preferred.len() == 4 {
-                    metadata.preferred.remove(1);
-                }
-                metadata.preferred.push(id);
-            }
+            metadata.preferred = vec![id];
             dictionary_receipts.push(receipt);
         }
         let _advisory_result = reservoir.persist(guard);
@@ -235,7 +237,11 @@ pub(super) fn seal_with_copies<'g>(
         }
     }
     if !versions.is_empty() {
-        let mut encoder = FrameEncoder::new(policy.level(), &dictionaries)?;
+        let dictionary = metadata
+            .preferred
+            .last()
+            .and_then(|id| dictionaries.get(id).map(|bytes| (*id, bytes.as_slice())));
+        let mut encoder = FrameEncoder::new(policy.level(), dictionary)?;
         let mut frame_pages = Vec::new();
         let frame_cap = policy.frame_bytes(endpoint.size.page_size());
         for (page, txid) in versions {

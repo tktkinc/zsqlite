@@ -359,6 +359,7 @@ pub(crate) type MaintenanceNotifier = Box<dyn Fn(Option<Instant>) + Send>;
 #[derive(Default)]
 struct Background {
     follow_up: bool,
+    dictionary_due: bool,
     retry_after: Option<SystemTime>,
     notifier: Option<MaintenanceNotifier>,
 }
@@ -390,6 +391,10 @@ pub(crate) struct PreparedWork {
     source_view: Option<crate::storage::PinnedView>,
 }
 impl SealWork {
+    pub(crate) fn with_dictionary_training(mut self) -> Self {
+        self.input = self.input.with_dictionary_training();
+        self
+    }
     pub(crate) fn prepare(self) -> Result<PreparedWork, StoreError> {
         let seal = self.input.prepare()?;
         let source_view = if let SealKind::Source {
@@ -901,6 +906,7 @@ impl Store {
             // A newly opened writer sweeps for objects orphaned by a crash.
             background: Background {
                 follow_up: writable,
+                dictionary_due: writable,
                 ..Background::default()
             },
         }
@@ -2155,6 +2161,7 @@ impl Store {
             let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
             let guard = catalog.lock()?;
             let repack = work.seal.report().is_some();
+            let dictionary_due = work.seal.dictionary_due();
             let durable = work.seal.install(&guard)?;
             let publication = self.prepare_view_publication(&guard, durable)?;
             let mut guard = self.finish_view_publication(guard, publication)?;
@@ -2163,6 +2170,7 @@ impl Store {
             // bounded background collection and repack pass.
             self.background.follow_up = true;
             if !repack {
+                self.background.dictionary_due = dictionary_due;
                 let _report = guard.collect(self.layout.deletion_budget())?;
             }
             drop(guard);
@@ -2314,6 +2322,8 @@ impl Store {
         self.page_cache.set_budget(self.layout.cache())?;
         self.install_active(policy.encode()?)?;
         self.release_publication();
+        self.background.dictionary_due = true;
+        self.rearm();
         Ok(())
     }
 
@@ -2447,7 +2457,11 @@ impl Store {
         if !self.writable {
             return None;
         }
-        let follow_up = self.background.follow_up.then(SystemTime::now);
+        let dictionary_due = self.background.dictionary_due
+            && self.source.is_none()
+            && self.view.is_some()
+            && self.head.txid < self.active.header.start_txid;
+        let follow_up = (self.background.follow_up || dictionary_due).then(SystemTime::now);
         let due = self.seal_deadline().into_iter().chain(follow_up).min()?;
         let due = self
             .background
@@ -2497,7 +2511,18 @@ impl Store {
             .seal_deadline()
             .is_some_and(|due| due <= SystemTime::now())
         {
-            return self.prepare_active_work();
+            return self
+                .prepare_active_work()
+                .map(|work| work.map(SealWork::with_dictionary_training));
+        }
+        if self.background.dictionary_due
+            && self.head.txid < self.active.header.start_txid
+            && self.view.is_some()
+        {
+            if let Some(work) = self.prepare_dictionary_work()? {
+                return Ok(Some(work));
+            }
+            self.background.dictionary_due = false;
         }
         if self.background.follow_up {
             return self.prepare_repack_work();
@@ -2573,6 +2598,9 @@ impl Store {
     }
 
     pub(crate) fn repack_once(&mut self) -> Result<crate::storage::MaintenanceReport, StoreError> {
+        if let Some(work) = self.prepare_dictionary_work()? {
+            self.finish_work(work.prepare()?)?;
+        }
         let Some(work) = self.prepare_repack_work()? else {
             return Ok(crate::storage::MaintenanceReport::default());
         };
@@ -2629,6 +2657,53 @@ impl Store {
         );
         Ok(Some(SealWork {
             input,
+            kind: SealKind::Active {
+                header: self.active.header,
+                head: self.head,
+                restore: self.publication_owner.phase(),
+            },
+        }))
+    }
+
+    /// Adopt a better active dictionary without recompressing existing frames
+    /// or changing the logical endpoint. Training runs outside Store exclusion.
+    pub(crate) fn prepare_dictionary_work(&self) -> Result<Option<SealWork>, StoreError> {
+        let policy = self.dictionary_policy();
+        if self.has_pending()
+            || self.head.txid >= self.active.header.start_txid
+            || self.view.is_none()
+            || matches!(
+                policy.training(),
+                crate::dictionary::DictionaryTraining::Disabled
+            )
+        {
+            return Ok(None);
+        }
+        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
+        let guard = catalog.lock()?;
+        let view = self.view.as_ref().ok_or(StoreError::Corrupt(0))?;
+        let endpoint = crate::storage::SealEndpoint {
+            database: view.endpoint().0,
+            lineage: crate::domain::LineageId::from_bytes(self.database_id()),
+            dictionary: policy,
+            size: view.logical_size(),
+            txid: view.endpoint().1,
+            history: view.endpoint().2,
+            truncate: None,
+        };
+        let input = crate::storage::SealInput::new(
+            &guard,
+            Some(view),
+            endpoint,
+            Vec::new(),
+            tempfile::tempfile()?,
+            self.layout,
+        )?;
+        if !input.needs_dictionary_update() {
+            return Ok(None);
+        }
+        Ok(Some(SealWork {
+            input: input.dictionary_update(),
             kind: SealKind::Active {
                 header: self.active.header,
                 head: self.head,
@@ -3022,6 +3097,23 @@ mod tests {
         image
     }
 
+    fn dictionary_family_image(generation: u32, page_count: u32) -> Vec<u8> {
+        let common: Vec<_> = (0..96_u32)
+            .flat_map(|part| *blake3::hash(&(generation * 96 + part).to_le_bytes()).as_bytes())
+            .collect();
+        let mut image = Vec::new();
+        for page in 0..page_count {
+            image.extend(&common);
+            for part in 0..32_u32 {
+                let word = 10_000 + generation * 100_000 + page * 32 + part;
+                image.extend(blake3::hash(&word.to_le_bytes()).as_bytes());
+            }
+        }
+        image[..16].copy_from_slice(SQLITE_MAGIC);
+        image[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        image
+    }
+
     #[test]
     fn active_file_is_initialized_with_a_valid_header() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -3077,12 +3169,15 @@ mod tests {
     fn small_run_retains_shared_dictionary_objects() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("dictionary.zsqlite");
-        let image = dictionary_training_image(257);
+        let image = dictionary_family_image(0, 320);
         let mut store = Store::open(&path, true)?;
         store.write_at(0, &image)?;
         store.publish(true)?;
         store.flush_sidecars()?;
+        assert_eq!(store.inspect()?.dictionary_bytes, 0);
+        store.try_background_maintenance()?;
         let dictionaries = store.inspect()?.dictionary_bytes;
+        assert!(dictionaries > 0);
         store.write_at(4096, &image[8192..12288])?;
         store.publish(true)?;
         store.flush_sidecars()?;

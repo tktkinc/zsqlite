@@ -1478,7 +1478,7 @@ mod tests {
             txid,
             checksum: checksum(number, txid, &bytes),
         };
-        let frame = FrameEncoder::new(3, &BTreeMap::new())
+        let frame = FrameEncoder::new(3, None)
             .unwrap()
             .build(size, vec![(version, bytes)])
             .unwrap();

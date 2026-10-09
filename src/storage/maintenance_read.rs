@@ -265,7 +265,6 @@ mod tests {
         use crate::domain::{PackOffset, PageNumber, PageSize, TransactionId};
         use crate::storage::frame::{FrameEncoder, PageVersion};
         use crate::storage::placement::PackRange;
-        use std::collections::BTreeMap;
 
         let bytes = vec![7; 512];
         let version = PageVersion::verified(
@@ -273,7 +272,7 @@ mod tests {
             TransactionId::new(1).unwrap(),
             &bytes,
         );
-        let (metadata, _) = FrameEncoder::new(1, &BTreeMap::new())
+        let (metadata, _) = FrameEncoder::new(1, None)
             .unwrap()
             .build(PageSize::new(512).unwrap(), vec![(version, bytes)])
             .unwrap()

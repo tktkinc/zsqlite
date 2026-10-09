@@ -23,6 +23,8 @@ pub(crate) struct SealInput {
     dictionaries: BTreeMap<DictionaryId, Vec<u8>>,
     preferred: Vec<DictionaryId>,
     samples: Samples,
+    dictionary_training: bool,
+    dictionary_update: bool,
     source_prefix: bool,
     repack: Option<BTreeSet<PackId>>,
     control_root: PathBuf,
@@ -34,10 +36,12 @@ pub(crate) struct PreparedSeal {
     dictionaries: BTreeMap<DictionaryId, Vec<u8>>,
     preferred: Vec<DictionaryId>,
     samples: Option<Vec<u8>>,
+    dictionary_due: bool,
     zeros: Vec<PageNumber>,
     frames: Vec<(FrameMetadata, u64)>,
     payloads: File,
     layout: LayoutPolicy,
+    dictionary_update: bool,
     source_prefix: bool,
     report: Option<super::MaintenanceReport>,
 }
@@ -55,11 +59,14 @@ impl SealInput {
         let mut dictionaries = BTreeMap::new();
         let mut preferred = Vec::new();
         if let Some(source) = &source {
-            for id in &source.metadata.preferred {
-                if let Some(dictionary) = source.dictionaries().get(id) {
-                    preferred.push(*id);
-                    dictionaries.insert(*id, dictionary.bytes().to_vec());
-                }
+            // Older views can have several preferred dictionaries. The last
+            // one was the most recently promoted; keep it as the sole active
+            // dictionary. Frame dependencies still retain all older decoders.
+            if let Some(id) = source.metadata.preferred.last()
+                && let Some(dictionary) = source.dictionaries().get(id)
+            {
+                preferred.push(*id);
+                dictionaries.insert(*id, dictionary.bytes().to_vec());
             }
         } else if let Some(seed) = super::seed::load(guard, layout.level()) {
             let id = DictionaryId::from_bytes(*blake3::hash(&seed).as_bytes());
@@ -82,6 +89,8 @@ impl SealInput {
             } else {
                 Samples::load(guard, endpoint.dictionary.sample_budget())
             },
+            dictionary_training: false,
+            dictionary_update: false,
             source_prefix: false,
             repack: None,
             control_root: guard.root().to_owned(),
@@ -89,7 +98,23 @@ impl SealInput {
     }
     pub(crate) fn source_prefix(mut self) -> Self {
         self.source_prefix = true;
+        self.dictionary_training = true;
         self
+    }
+    pub(crate) fn with_dictionary_training(mut self) -> Self {
+        self.dictionary_training = true;
+        self
+    }
+    pub(crate) fn dictionary_update(mut self) -> Self {
+        self.dictionary_training = true;
+        self.dictionary_update = true;
+        self
+    }
+    pub(crate) fn needs_dictionary_update(&self) -> bool {
+        matches!(
+            self.endpoint.dictionary.training(),
+            crate::dictionary::DictionaryTraining::UpTo(_)
+        ) && self.samples.ready()
     }
     pub(crate) fn repack(mut self, packs: BTreeSet<PackId>) -> Self {
         self.repack = Some(packs);
@@ -197,7 +222,8 @@ impl SealInput {
             for (page, _) in &self.pages {
                 self.samples.insert(self.read(*page)?);
             }
-            if let Some(evaluation) = self.samples.evaluation()
+            if self.dictionary_training
+                && let Some(evaluation) = self.samples.evaluation()
                 && let Some(bytes) = evaluation.select(
                     self.endpoint.dictionary,
                     self.layout.level(),
@@ -206,12 +232,8 @@ impl SealInput {
                 )
             {
                 let id = DictionaryId::from_bytes(*blake3::hash(&bytes).as_bytes());
-                if !self.preferred.contains(&id) {
-                    if self.preferred.len() == 4 {
-                        self.preferred.remove(1);
-                    }
-                    self.preferred.push(id);
-                }
+                self.preferred = vec![id];
+                self.dictionaries.clear();
                 self.dictionaries.insert(id, bytes);
             }
         }
@@ -240,7 +262,11 @@ impl SealInput {
                 batch,
                 size,
                 self.layout.level(),
-                &self.dictionaries,
+                self.preferred.last().and_then(|id| {
+                    self.dictionaries
+                        .get(id)
+                        .map(|bytes| (*id, bytes.as_slice()))
+                }),
                 crate::compression_options(),
             )?;
             self.check_paused()?;
@@ -282,16 +308,19 @@ impl SealInput {
             encode(batch)?;
         }
         let samples = crate::compression::run(|| self.samples.encode())?;
+        let dictionary_due = self.needs_dictionary_update();
         Ok(PreparedSeal {
             endpoint: self.endpoint,
             source: self.source,
             dictionaries: self.dictionaries,
             preferred: self.preferred,
             samples,
+            dictionary_due,
             zeros,
             frames,
             payloads,
             layout: self.layout,
+            dictionary_update: self.dictionary_update,
             source_prefix: self.source_prefix,
             report,
         })
@@ -299,6 +328,9 @@ impl SealInput {
 }
 
 impl PreparedSeal {
+    pub(crate) fn dictionary_due(&self) -> bool {
+        self.dictionary_due
+    }
     pub(crate) fn report(&self) -> Option<super::MaintenanceReport> {
         self.report.clone()
     }
@@ -368,7 +400,7 @@ impl PreparedSeal {
             metadata.sealed_lineage(self.source.as_ref());
         }
         let mut builder = ManifestBuilder::new(guard, metadata, self.source.as_ref())?;
-        if self.source_prefix || self.report.is_some() {
+        if self.source_prefix || self.dictionary_update || self.report.is_some() {
             builder = builder.checkpoint();
         }
         for receipt in &packs {

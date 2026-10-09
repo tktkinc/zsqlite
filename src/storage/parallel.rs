@@ -2,7 +2,6 @@
 use super::frame::{EncodedFrame, FrameEncoder, PageVersion};
 use crate::domain::{DictionaryId, PageSize};
 use crate::{CompressionOptions, StoreError};
-use std::collections::BTreeMap;
 
 pub(super) const BATCH_BYTES: usize = 8 * 1024 * 1024;
 pub(super) type FramePages = Vec<(PageVersion, Vec<u8>)>;
@@ -13,7 +12,7 @@ pub(super) fn encode_batch(
     mut groups: Vec<FramePages>,
     size: PageSize,
     level: i32,
-    dictionaries: &BTreeMap<DictionaryId, Vec<u8>>,
+    dictionary: Option<(DictionaryId, &[u8])>,
     options: CompressionOptions,
 ) -> Result<Vec<EncodedFrame>, StoreError> {
     if groups.is_empty() {
@@ -22,7 +21,7 @@ pub(super) fn encode_batch(
     let workers = options.worker_count(groups.len());
     let encode = |groups: &mut [FramePages]| -> Result<Vec<EncodedFrame>, StoreError> {
         options.priority.apply()?;
-        let mut encoder = FrameEncoder::new(level, dictionaries)?;
+        let mut encoder = FrameEncoder::new(level, dictionary)?;
         groups
             .iter_mut()
             .map(|pages| encoder.build(size, std::mem::take(pages)))
@@ -74,6 +73,7 @@ mod tests {
     use super::super::frame::DecodingDictionary;
     use super::*;
     use crate::domain::{CompressionDictionary, PageNumber, PayloadEncoding, TransactionId};
+    use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -84,7 +84,6 @@ mod tests {
             .flat_map(|index| blake3::hash(&index.to_le_bytes()).as_bytes().to_vec())
             .collect();
         let id = DictionaryId::from_bytes(*blake3::hash(&dictionary).as_bytes());
-        let dictionaries = BTreeMap::from([(id, dictionary.clone())]);
         let decoding = BTreeMap::from([(id, DecodingDictionary::new(dictionary.clone())?)]);
         let mut page = 1;
         let mut groups = Vec::new();
@@ -101,7 +100,7 @@ mod tests {
             }
             groups.push(group);
         }
-        let mut serial = FrameEncoder::new(3, &dictionaries)?;
+        let mut serial = FrameEncoder::new(3, Some((id, &dictionary)))?;
         let expected = groups
             .iter()
             .map(|group| {
@@ -114,7 +113,7 @@ mod tests {
             groups.clone(),
             size,
             3,
-            &dictionaries,
+            Some((id, &dictionary)),
             CompressionOptions {
                 workers: NonZeroUsize::new(4),
                 ..CompressionOptions::default()
@@ -152,13 +151,7 @@ mod tests {
             .collect::<Result<Vec<_>, StoreError>>()?;
         groups[8][0].1[0] ^= 1;
         assert!(matches!(
-            encode_batch(
-                groups,
-                size,
-                3,
-                &BTreeMap::new(),
-                CompressionOptions::default()
-            ),
+            encode_batch(groups, size, 3, None, CompressionOptions::default()),
             Err(StoreError::PageChecksum(9))
         ));
         Ok(())

@@ -86,7 +86,7 @@ pub fn collect(path: impl AsRef<Path>, deletion_budget: usize) -> Result<GcRepor
     store::Store::open_existing(database_storage_path(path.as_ref())?)?.gc_report(deletion_budget)
 }
 
-/// Repack a batch of low-occupancy packs with one metadata checkpoint. The
+/// Evaluate refreshed dictionary samples, then repack a batch of low-occupancy packs. The
 /// combined decoded size of surviving frames is bounded by the maintenance
 /// budget; intact frames are copied without decoding or recompression.
 /// Pending/active writes are left untouched. The report describes this call.
@@ -164,8 +164,9 @@ pub fn set_page_cache_directory(directory: Option<&Path>) -> Result<(), StoreErr
 /// dictionary among related databases, such as others with the same schema.
 /// Candidates are scored on the related sample reservoirs, excluding pages only
 /// their holders contributed, and charged their own size against the related
-/// databases' median logical size. The seed takes the fallback slot that later
-/// trained dictionaries never evict. Unreadable related paths are skipped; the
+/// databases' median logical size. The seed becomes the initial active dictionary.
+/// Background evaluation can replace it; existing frames retain its decoder.
+/// Unreadable related paths are skipped; the
 /// new database's own path is ignored. Each related catalog is locked briefly;
 /// cost grows with their dictionaries.
 pub fn create_with_dictionary_from<P: AsRef<Path>>(
@@ -338,6 +339,11 @@ impl Conversion {
                 .ok_or(StoreError::Range)?;
         }
         converted.publish(true)?;
+        // Offline import can train its initial dictionary before encoding. Live
+        // foreground seals leave evaluation to background maintenance instead.
+        if let Some(work) = converted.prepare_flush_work()? {
+            converted.finish_work(work.with_dictionary_training().prepare()?)?;
+        }
         converted.flush_sidecars()?;
         converted.verify()?;
         drop(converted);

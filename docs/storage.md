@@ -181,15 +181,30 @@ at least 100 **training** bytes per dictionary byte (8, 16, 32, 64, 128, 256,
 compares 512 and 768 KiB, rather than forcing the larger one. The held-out score
 scales payload savings to the current logical database size, accounts for raw
 fallback/reference overhead and charges the new dictionary once. Promotion
-requires at least 5% improvement over the best retained dictionary or no dictionary.
+requires at least 5% improvement over the active dictionary and plain Zstandard.
 This is a page-compression estimate, not a measurement of every configured frame
 layout. Failed training/scoring/persistence does not prevent sealing.
 
-The preferred pool retains up to four dictionaries, including a general fallback.
-Old frames and fork pins retain additional required dictionaries independently.
+Evaluation runs in background maintenance and initial conversion setup;
+foreground seals collect samples without training or comparing dictionaries.
+The VFS scheduler performs evaluation automatically; Rust hosts using `Database`
+directly can call `maintain()` from a background worker.
+New frames use one active dictionary until background evaluation promotes a
+replacement. A metadata checkpoint can adopt the replacement at the same logical
+endpoint without rewriting payloads. Older views with several preferred
+dictionaries use their most recently promoted one. Old frames and fork pins
+retain required decoding dictionaries independently.
+
+Encoding uses only the active dictionary, or plain Zstandard when none exists.
+Frames of at least 4 KiB first probe four evenly spread regions, including both
+ends, with that codec. The probe covers at most 4 KiB and a quarter of the frame;
+if it does not shrink, the frame is stored raw without compressing the rest.
+This heuristic can miss compressible frames. Smaller frames are compressed
+directly. Full compressed output is used only when it saves bytes, including a
+shared dictionary reference. There is no per-frame dictionary competition.
 
 `create_with_dictionary_from(path, related)` creates an empty database whose
-first seal adopts one related database's preferred dictionary as that fallback.
+first seal adopts one related database's preferred dictionary as its active dictionary.
 Related reservoirs are stored in digest order, so the lowest digests of their
 union form one bounded 8 MiB sample; each file is read only up to that cutoff
 and that prefix is structurally validated, not hash-verified. Each candidate is
@@ -203,7 +218,8 @@ therefore pays for itself only once the target's plain Zstandard size exceeds
 about 1.2 MiB. The chosen
 bytes are recorded as an advisory `dictionary.seed`. A first seal installs them
 only if they still decode and encode; later seals delete the record. Later
-trained candidates must beat the seed and never evict it. Each related head is
+trained candidates must beat the seed; frames that used it retain its decoder.
+Each related head is
 pinned briefly under its catalog lock. Dictionaries contain verbatim sample
 bytes, so only relate databases within one trust boundary.
 

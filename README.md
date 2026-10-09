@@ -120,11 +120,24 @@ as enough distinct training pages become available. The full pool supports
 comparison of 512 KiB and 768 KiB candidates, with about 100 training bytes per
 dictionary byte plus separate held-out pages. After 1 MiB of new distinct samples,
 candidates are evaluated on held-out pages, including the new dictionary's
-storage cost, and promoted only for at least 5% improvement over existing choices.
-Up to four preferred dictionaries are carried
-forward, including a fallback; live frames retain any additional dictionaries
-they require. Tiny seals can reuse dictionaries without copying them into
-each pack. Training failure is advisory. Compression competes with raw storage.
+storage cost, and promoted only for at least 5% improvement over the active
+dictionary and plain Zstandard. Evaluation runs in background maintenance or
+initial conversion setup. Foreground seals only collect samples. One active
+dictionary is used until a better candidate is promoted; existing frames and
+reader pins retain every older dictionary they need. Background promotion can
+update the active dictionary without rewriting any payloads. Tiny seals reuse
+the active dictionary without copying it into each pack. Training failure is
+advisory. Rust hosts using `Database` directly can call `maintain()` from their
+background worker to evaluate samples as well as repack sparse storage.
+
+Frames use the active dictionary, or plain Zstandard before one is available;
+they never try competing dictionaries during encoding. A bounded probe samples
+four regions including both ends, using that same codec, before compressing
+frames of at least 4 KiB. It processes at most 4 KiB and a quarter of the frame.
+If the sample does not shrink, the frame is stored raw without full compression.
+The probe is a heuristic and can skip some compressible frames. Smaller frames
+go straight to compression. After full compression, raw storage still wins when
+the encoded payload plus its dictionary reference would be larger.
 `create_with_dictionary_from(path, related)` starts a database with the related
 databases' best dictionary, scored on their samples excluding each candidate's
 own pages; see [storage](docs/storage.md).

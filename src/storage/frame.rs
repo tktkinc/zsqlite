@@ -292,31 +292,52 @@ impl EncodedFrame {
     }
 }
 
-/// Owns one prepared compression context per preferred dictionary for a seal.
+/// Owns one prepared compression context for the active dictionary of a seal.
 /// Reuse does not link frames: every compress call remains independently decodable.
 pub(super) struct FrameEncoder {
-    compressors: Vec<(CompressionDictionary, zstd::bulk::Compressor<'static>)>,
+    dictionary: CompressionDictionary,
+    compressor: zstd::bulk::Compressor<'static>,
+    sample: Vec<u8>,
+    probe_output: Vec<u8>,
 }
 impl FrameEncoder {
     pub(super) fn new(
         level: i32,
-        dictionaries: &BTreeMap<DictionaryId, Vec<u8>>,
+        dictionary: Option<(DictionaryId, &[u8])>,
     ) -> Result<Self, StoreError> {
-        let compressors = std::iter::once((CompressionDictionary::None, &[][..]))
-            .chain(
-                dictionaries
-                    .iter()
-                    .map(|(id, bytes)| (CompressionDictionary::Shared(*id), bytes.as_slice())),
-            )
-            .map(|(id, bytes)| {
-                // with_dictionary copies the bytes into an owned context; no
-                // borrowed dictionary is extended to a fabricated lifetime.
-                zstd::bulk::Compressor::with_dictionary(level, bytes)
-                    .map(|compressor| (id, compressor))
-                    .map_err(|error| StoreError::Zstd(error.to_string()))
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Self { compressors })
+        let (dictionary, bytes) = dictionary
+            .map_or((CompressionDictionary::None, &[][..]), |(id, bytes)| {
+                (CompressionDictionary::Shared(id), bytes)
+            });
+        // with_dictionary copies the bytes into an owned context.
+        let compressor = zstd::bulk::Compressor::with_dictionary(level, bytes)
+            .map_err(|error| StoreError::Zstd(error.to_string()))?;
+        Ok(Self {
+            dictionary,
+            compressor,
+            sample: Vec::with_capacity(4096),
+            probe_output: Vec::with_capacity(zstd::zstd_safe::compress_bound(4096)),
+        })
+    }
+
+    /// Sample four regions, including both ends, using the active dictionary.
+    /// Never spend more than 4 KiB or a quarter of the frame on this heuristic.
+    /// Small frames go straight to compression; a failed probe stores raw bytes.
+    fn worth_compressing(&mut self, raw: &[u8]) -> Result<bool, StoreError> {
+        if raw.len() < 4096 {
+            return Ok(true);
+        }
+        let window = (raw.len() / 16).min(1024);
+        self.sample.clear();
+        for index in 0..4 {
+            let start = (raw.len() - window) * index / 3;
+            self.sample.extend_from_slice(&raw[start..start + window]);
+        }
+        let compressed = self
+            .compressor
+            .compress_to_buffer(&self.sample, &mut self.probe_output)
+            .map_err(|error| StoreError::Zstd(error.to_string()))?;
+        Ok(compressed < self.sample.len())
     }
     pub(super) fn build(
         &mut self,
@@ -339,21 +360,20 @@ impl FrameEncoder {
             raw.extend(bytes);
         }
         let mut encoding = PayloadEncoding::Raw;
-        let mut payload = raw.clone();
-        let mut best_cost = payload.len();
-        for (dictionary, compressor) in &mut self.compressors {
-            let compressed = compressor
-                .compress(&raw)
+        let mut payload = raw;
+        if self.worth_compressing(&payload)? {
+            let compressed = self
+                .compressor
+                .compress(&payload)
                 .map_err(|error| StoreError::Zstd(error.to_string()))?;
-            let overhead = if matches!(dictionary, CompressionDictionary::Shared(_)) {
+            let overhead = if matches!(self.dictionary, CompressionDictionary::Shared(_)) {
                 32
             } else {
                 0
             };
             let cost = compressed.len().saturating_add(overhead);
-            if cost < best_cost {
-                best_cost = cost;
-                encoding = PayloadEncoding::Zstandard(*dictionary);
+            if cost < payload.len() {
+                encoding = PayloadEncoding::Zstandard(self.dictionary);
                 payload = compressed;
             }
         }
@@ -387,6 +407,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn probe_skips_noise_but_keeps_frames_with_compressible_later_regions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut raw: Vec<_> = (0..2048_u32)
+            .flat_map(|index| *blake3::hash(&index.to_le_bytes()).as_bytes())
+            .collect();
+        let mut encoder = FrameEncoder::new(3, None)?;
+        assert!(!encoder.worth_compressing(&raw)?);
+        let size = PageSize::new(65_536)?;
+        let version = PageVersion::verified(PageNumber::new(1)?, TransactionId::new(1)?, &raw);
+        let (metadata, payload) = encoder
+            .build(size, vec![(version, raw.clone())])?
+            .into_parts();
+        assert_eq!(metadata.encoding(), PayloadEncoding::Raw);
+        let (_, decoded) = EncodedFrame::verified(metadata, payload, &BTreeMap::new())?;
+        assert_eq!(decoded.bytes(), raw);
+
+        raw[48 * 1024..].fill(7);
+        assert!(encoder.worth_compressing(&raw)?);
+        let version = PageVersion::verified(PageNumber::new(1)?, TransactionId::new(1)?, &raw);
+        let (metadata, payload) = encoder
+            .build(size, vec![(version, raw.clone())])?
+            .into_parts();
+        assert_eq!(
+            metadata.encoding(),
+            PayloadEncoding::Zstandard(CompressionDictionary::None)
+        );
+        let (_, decoded) = EncodedFrame::verified(metadata, payload, &BTreeMap::new())?;
+        assert_eq!(decoded.bytes(), raw);
+        Ok(())
+    }
+
+    #[test]
     fn authenticated_copy_preserves_dictionary_frames_without_decoding()
     -> Result<(), Box<dyn std::error::Error>> {
         let size = PageSize::new(4096)?;
@@ -400,7 +452,7 @@ mod tests {
             })
             .collect();
         let dictionary = DictionaryId::from_bytes(*blake3::hash(&raw).as_bytes());
-        let mut encoder = FrameEncoder::new(3, &BTreeMap::from([(dictionary, raw.clone())]))?;
+        let mut encoder = FrameEncoder::new(3, Some((dictionary, &raw)))?;
         let frame = encoder.build(
             size,
             vec![(

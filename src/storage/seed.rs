@@ -352,6 +352,7 @@ mod tests {
         store.write_at(0, &image)?;
         store.publish(true)?;
         store.flush_sidecars()?;
+        store.try_background_maintenance()?;
         Ok(())
     }
 
@@ -419,8 +420,8 @@ mod tests {
                 .any(|path| preferred(path).is_ok_and(|ids| ids.contains(&id)))
         );
 
-        // A small first seal cannot train, but it adopts the seed as the general
-        // fallback; later trained specialists never evict that slot.
+        // A small first seal cannot train, but adopts the seed as its active
+        // dictionary until a background candidate improves on it.
         database(&path, &family(&common, &mut state, 8))?;
         assert_eq!(preferred(&path)?, [id]);
         let inspect = crate::inspect(&path)?;

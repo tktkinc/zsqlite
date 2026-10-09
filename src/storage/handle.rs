@@ -474,9 +474,14 @@ impl Database {
     pub fn collect(&self, budget: usize) -> Result<super::GcReport, StoreError> {
         self.store()?.gc_report(budget)
     }
-    /// Repack a bounded batch with one metadata checkpoint, then collect
+    /// Evaluate refreshed dictionary samples, then repack a bounded batch and collect
     /// unreachable objects within the configured deletion budget.
     pub fn maintain(&self) -> Result<super::MaintenanceReport, StoreError> {
+        let dictionary_work = self.store()?.prepare_dictionary_work()?;
+        if let Some(work) = dictionary_work {
+            let prepared = work.prepare()?;
+            self.store()?.finish_work(prepared)?;
+        }
         let Some(work) = self.store()?.prepare_repack_work()? else {
             return Ok(super::MaintenanceReport::default());
         };

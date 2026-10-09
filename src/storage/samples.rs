@@ -104,8 +104,11 @@ impl Samples {
             }
         }
     }
+    pub(super) fn ready(&self) -> bool {
+        self.fresh >= 1024 * 1024 && self.pages.len() >= 32
+    }
     pub(super) fn evaluation(&mut self) -> Option<Evaluation<'_>> {
-        if self.fresh < 1024 * 1024 || self.pages.len() < 32 {
+        if !self.ready() {
             return None;
         }
         self.fresh = 0;
