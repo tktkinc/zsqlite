@@ -1398,6 +1398,7 @@ impl<'g, 'source> ManifestBuilder<'g, 'source> {
             return Err(StoreError::Range);
         }
         let footer = envelope(b"ZFOOT001", &raw)?;
+        drop(raw);
         let header = super::segment::Header::new(
             crate::domain::SegmentCoverage::new(
                 span,
@@ -1417,6 +1418,9 @@ impl<'g, 'source> ManifestBuilder<'g, 'source> {
         builder.append(&(super::segment::HEADER_SIZE as u64).to_le_bytes())?;
         builder.append(b"ZEND0001")?;
         let object = builder.finalize()?.install()?;
+        // The complete draft has been durably encoded and its dependencies
+        // checked. Drop its maps before authenticating the installed receipt.
+        drop(self.metadata);
         let metadata = load_metadata(self.guard, object.id())?;
         let durable = DurableView { object, metadata };
         #[cfg(test)]

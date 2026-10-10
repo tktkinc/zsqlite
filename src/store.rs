@@ -396,7 +396,7 @@ impl SealWork {
         self
     }
     pub(crate) fn prepare(self) -> Result<PreparedWork, StoreError> {
-        let seal = self.input.prepare()?;
+        let mut seal = self.input.prepare()?;
         let source_view = if let SealKind::Source {
             before, sidecar, ..
         } = &self.kind
@@ -410,12 +410,20 @@ impl SealWork {
             }
             let catalog = crate::storage::Catalog::open(sidecar, false)?;
             let guard = catalog.lock()?;
-            let prefix = crate::conversion::prefix(&guard)?;
-            if prefix.as_ref().map_or(0, |view| view.logical_size().get()) != *before {
+            let published_prefix = crate::conversion::prefix(&guard)?
+                .as_ref()
+                .map_or(0, |view| view.logical_size().get());
+            if published_prefix != *before {
                 return Err(StoreError::Busy);
             }
             let durable = seal.install(&guard)?;
-            let view = guard.pin(durable.id())?;
+            let id = durable.id();
+            // Catalogue exclusion protects the durable replacement until its
+            // progress root is published. Do not retain its decoded receipt or
+            // the old prefix while opening another full snapshot of the new one.
+            drop(durable);
+            seal.release_source();
+            let view = guard.pin(id)?;
             let _pin = guard.retain(crate::conversion::root_name()?, &view, true)?;
             Some(view)
         } else {
@@ -570,9 +578,9 @@ impl Store {
             .as_ref()
             .ok_or(StoreError::Corrupt(0))?
             .try_clone()?;
-        let input = crate::storage::SealInput::new(
+        let input = crate::storage::SealInput::new_owned(
             &guard,
-            prefix.as_ref(),
+            prefix,
             endpoint,
             pages,
             file,

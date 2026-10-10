@@ -56,6 +56,25 @@ impl SealInput {
         layout: LayoutPolicy,
     ) -> Result<Self, StoreError> {
         let source = source.map(|view| guard.pin(view.id())).transpose()?;
+        Self::new_owned(guard, source, endpoint, pages, file, layout)
+    }
+
+    /// Transfer a freshly pinned source rather than hydrating a second copy of
+    /// the growing import prefix. The owning catalogue lock establishes identity.
+    pub(crate) fn new_owned(
+        guard: &CatalogGuard,
+        source: Option<PinnedView>,
+        endpoint: SealEndpoint,
+        pages: Vec<(PageNumber, TransactionId)>,
+        file: File,
+        layout: LayoutPolicy,
+    ) -> Result<Self, StoreError> {
+        if source
+            .as_ref()
+            .is_some_and(|view| !view.same_catalog(guard))
+        {
+            return Err(StoreError::IdentityMismatch);
+        }
         let mut dictionaries = BTreeMap::new();
         let mut preferred = Vec::new();
         if let Some(source) = &source {
@@ -328,6 +347,11 @@ impl SealInput {
 }
 
 impl PreparedSeal {
+    /// Once a source chunk is durable, its receipt owns the new dependencies.
+    /// Release the prior full prefix before opening and retaining the new one.
+    pub(crate) fn release_source(&mut self) {
+        self.source = None;
+    }
     pub(crate) fn dictionary_due(&self) -> bool {
         self.dictionary_due
     }

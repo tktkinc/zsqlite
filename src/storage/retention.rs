@@ -225,7 +225,22 @@ impl CatalogGuard {
         };
         // Validate what logical lookup will actually select before replacing a
         // predecessor. Matching a filename is not proof of a usable root.
-        let _replacement = self.pin_retained(&pin)?;
+        let selected = super::segment::resolve_parent(
+            self,
+            super::segment::ParentRef {
+                hash: pin.hash,
+                txid: pin.txid,
+            },
+            &BTreeSet::new(),
+        )?;
+        let already_validated = selected == validated.id();
+        // `validated` has freshly authenticated this physical endpoint. Reuse that
+        // proof when logical lookup selects it; otherwise release its full page
+        // maps before validating the wider representation selected by lookup.
+        drop(validated);
+        if !already_validated {
+            drop(self.pin_retained(&pin)?);
+        }
         self.write_root(&pin)?;
         Ok(pin)
     }
