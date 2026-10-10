@@ -208,3 +208,58 @@ fn invalid_root_records_stop_collection_without_mutation() -> TestResult {
     guard.release(pin)?;
     Ok(())
 }
+
+#[test]
+fn retaining_an_endpoint_reads_its_resolved_metadata_once() -> TestResult {
+    use crate::StoragePolicy;
+    use crate::domain::DecodedBytes;
+    use crate::layout::LayoutPolicy;
+    use crate::storage::{FaultBackend, MemoryBackend, Storage};
+    use std::sync::Arc;
+
+    for pages in [64_usize, 4096] {
+        let directory = tempfile::tempdir()?;
+        let backend = Arc::new(FaultBackend::new(Arc::new(MemoryBackend::new()?)));
+        let storage = Storage::new(backend.clone(), directory.path().join("coord"))?;
+        let path = storage.bind(&directory.path().join("retention.zsqlite"))?;
+        let mut store = Store::open(&path, true)?;
+        store.set_storage_policy(
+            StoragePolicy::default()
+                .with_layout(LayoutPolicy::default().fixed(DecodedBytes::new(4096))?)
+                .with_dictionary(crate::DictionaryPolicy::new(0, 1024 * 1024)?),
+        )?;
+        let bytes = (0..pages)
+            .flat_map(|index| page(u8::try_from(index % 251 + 1).unwrap()))
+            .collect::<Vec<_>>();
+        store.write_at(0, &bytes)?;
+        store.publish(true)?;
+        store.flush_sidecars()?;
+        let id = store.inspect()?.manifest.unwrap().id();
+        let catalog = Catalog::open(&crate::backend::sidecar_dir(&path), false)?;
+        let guard = catalog.lock()?;
+        backend.reset_statistics();
+        let view = guard.pin(id)?;
+        let hydration = backend.statistics();
+        backend.reset_statistics();
+        let pin = guard.retain(RetentionName::new("backup")?, &view, false)?;
+        let retention = backend.statistics();
+        eprintln!(
+            "pages={pages} hydrated={} retained={}",
+            hydration.read_bytes, retention.read_bytes
+        );
+        assert_eq!(
+            retention.blob_read_bytes, 0,
+            "retention must not hydrate page payloads"
+        );
+        assert!(
+            retention.read_bytes <= hydration.read_bytes + 16 * 1024,
+            "root publication must not decode the full endpoint twice: {retention:?}; one hydration: {hydration:?}"
+        );
+        assert_eq!(
+            guard.pin_retained(&pin)?.logical_size().get(),
+            bytes.len() as u64
+        );
+        guard.release(pin)?;
+    }
+    Ok(())
+}

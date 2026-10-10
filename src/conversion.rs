@@ -438,6 +438,47 @@ mod tests {
     }
 
     #[test]
+    fn a_prepared_source_chunk_releases_its_previous_prefix_reader() -> TestResult {
+        use std::fmt::Write as _;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("prefix-reader.db");
+        let (mut store, original) = pending(&path, (2 * CHUNK_BYTES / 4096) as usize + 16)?;
+        assert_eq!(conversion_step(&path)?.converted_bytes, CHUNK_BYTES);
+        let sidecar = crate::backend::sidecar_dir(&crate::facade::storage_path(&path));
+        let catalog = Catalog::open(&sidecar, false)?;
+        let old = prefix(&catalog.lock()?)?.unwrap().id();
+        let mut old_reader_name = String::with_capacity(64);
+        for byte in old.as_bytes() {
+            write!(&mut old_reader_name, "{byte:02x}")?;
+        }
+        let old_reader = sidecar.join("readers").join(old_reader_name);
+        let prepared = store.prepare_source_work()?.unwrap().prepare()?;
+        assert!(
+            crate::fs::ExclusiveLock::acquire(&old_reader, true).is_ok(),
+            "published chunk must release the previous full prefix snapshot before returning prepared work"
+        );
+        let status = conversion_status(&path)?.unwrap();
+        assert_eq!(status.converted_bytes, 2 * CHUNK_BYTES);
+        assert!(!status.complete);
+        pause_conversion(&path)?;
+        store.finish_work(prepared)?;
+        assert!(store.prepare_source_work()?.is_none());
+        let paused = conversion_status(&path)?.unwrap();
+        assert!(paused.paused);
+        assert_eq!(paused.converted_bytes, 2 * CHUNK_BYTES);
+        let mut actual = vec![0; original.len()];
+        store.read_at(0, &mut actual)?;
+        assert_eq!(actual, original);
+        resume_conversion(&path)?;
+        assert!(conversion_step(&path)?.complete);
+        let mut actual = vec![0; original.len()];
+        store.read_at(0, &mut actual)?;
+        assert_eq!(actual, original);
+        Ok(())
+    }
+
+    #[test]
     fn pause_after_chunk_publication_prevents_source_attachment() -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("pause.db");
