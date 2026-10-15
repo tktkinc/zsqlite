@@ -118,6 +118,13 @@ impl<'g> ValidatedRoots<'g> {
     }
 }
 
+struct LogicalTrace {
+    live: BTreeSet<ObjectKey>,
+    current: BTreeSet<ObjectKey>,
+    named: BTreeSet<ObjectKey>,
+    current_obsolete_bytes: u64,
+}
+
 impl CatalogGuard {
     pub(super) fn retained_packs_except(
         &self,
@@ -358,8 +365,9 @@ impl CatalogGuard {
             .collect()
     }
     pub(super) fn reachable_packs(&self) -> Result<BTreeSet<PackId>, StoreError> {
-        let (live, _, _) = self.trace_logical()?;
-        Ok(live
+        Ok(self
+            .trace_logical(false)?
+            .live
             .into_iter()
             .filter_map(|key| {
                 if let ObjectKey::Pack(pack) = key {
@@ -370,20 +378,23 @@ impl CatalogGuard {
             })
             .collect())
     }
-    #[allow(clippy::type_complexity)] // live, active, and retained logical dependency sets
-    fn trace_logical(
-        &self,
-    ) -> Result<
-        (
-            BTreeSet<ObjectKey>,
-            BTreeSet<ObjectKey>,
-            BTreeSet<ObjectKey>,
-        ),
-        StoreError,
-    > {
+    #[allow(clippy::too_many_lines)] // Root selection and authentication share one catalog authority.
+    fn trace_logical(&self, estimate_current: bool) -> Result<LogicalTrace, StoreError> {
+        #[derive(Default)]
+        struct Root {
+            current: bool,
+            named: bool,
+            headers: Vec<crate::format::ActiveHeader>,
+            retentions: Vec<DurablePin>,
+        }
+        // Select and deduplicate durable roots before hydrating their metadata. All roots
+        // remain authoritative; aliases share only this traversal's authenticated resolution.
+        // Keep summaries here, not full views for every root, so peak hydration is one view.
+        let mut roots = BTreeMap::<ManifestId, Root>::new();
         let mut live = BTreeSet::new();
         let mut current = BTreeSet::new();
         let mut named = BTreeSet::new();
+        let mut current_obsolete_bytes = 0;
         let mut headers = Vec::new();
         if self.active_path().exists() {
             let active = std::fs::File::open(self.active_path())?;
@@ -392,9 +403,11 @@ impl CatalogGuard {
             let header = crate::format::ActiveHeader::decode(&bytes)?;
             self.validate_attachment(&header)?;
             if header.parent_physical_digest != [0; 32] {
-                let view = self.pin(ManifestId::from_bytes(header.parent_physical_digest))?;
-                self.validate_descriptor(&header, &view)?;
-                current.extend(view.metadata.dependencies(view.id()));
+                let root = roots
+                    .entry(ManifestId::from_bytes(header.parent_physical_digest))
+                    .or_default();
+                root.current = true;
+                root.headers.push(header);
             }
         }
         let heads = self.state().all_heads()?;
@@ -402,25 +415,30 @@ impl CatalogGuard {
             headers.extend(head.sealed);
             headers.extend(head.pending);
         }
-        live.extend(current.iter().copied());
         for header in headers {
-            let view = self.pin(ManifestId::from_bytes(header.parent_physical_digest))?;
-            self.validate_descriptor(&header, &view)?;
-            let dependencies = view.metadata.dependencies(view.id());
+            let root = roots
+                .entry(ManifestId::from_bytes(header.parent_physical_digest))
+                .or_default();
+            root.headers.push(header);
             if self.state().sealed.is_none_or(|current| {
                 current.parent_physical_digest != header.parent_physical_digest
             }) && self.state().pending.is_none_or(|current| {
                 current.parent_physical_digest != header.parent_physical_digest
             }) {
-                named.extend(dependencies.iter().copied());
+                root.named = true;
             }
-            live.extend(dependencies);
         }
         for name in self.root_names()? {
-            let view = self.pin_retained(&self.read_root(&name)?)?;
-            named.extend(view.metadata.dependencies(view.id()));
+            let pin = self.read_root(&name)?;
+            let endpoint = super::segment::ParentRef {
+                hash: pin.hash,
+                txid: pin.txid,
+            };
+            let id = super::segment::resolve_parent(self, endpoint, &BTreeSet::new())?;
+            let root = roots.entry(id).or_default();
+            root.named = true;
+            root.retentions.push(pin);
         }
-        live.extend(named.iter().copied());
         for entry in std::fs::read_dir(self.root().join("readers"))? {
             let entry = entry?;
             let id = ManifestId::from_bytes(parse_hex(
@@ -429,8 +447,7 @@ impl CatalogGuard {
             match ExclusiveLock::acquire(&entry.path(), true) {
                 Ok(_unused) => {}
                 Err(StoreError::Busy) => {
-                    let view = self.pin(id)?;
-                    live.extend(view.metadata.dependencies(view.id()));
+                    roots.entry(id).or_default();
                 }
                 Err(error) => return Err(error),
             }
@@ -447,7 +464,40 @@ impl CatalogGuard {
                 Err(error) => return Err(error),
             }
         }
-        Ok((live, current, named))
+        for (id, root) in roots {
+            let view = self.pin(id)?;
+            for header in root.headers {
+                self.validate_descriptor(&header, &view)?;
+            }
+            let logical_hash = (!root.retentions.is_empty()).then(|| view.metadata.logical_hash());
+            for pin in root.retentions {
+                if view.metadata.database != pin.database
+                    || view.metadata.txid != pin.txid
+                    || logical_hash != Some(pin.hash)
+                {
+                    return Err(StoreError::IdentityMismatch);
+                }
+            }
+            let dependencies = view.metadata.dependencies(id);
+            if root.current {
+                current.extend(dependencies.iter().copied());
+                // Reuse this exact active descriptor's authenticated view for reporting,
+                // rather than hydrating it again after the complete root traversal.
+                if estimate_current {
+                    current_obsolete_bytes = super::repack::estimated_obsolete_bytes(&view)?;
+                }
+            }
+            if root.named {
+                named.extend(dependencies.iter().copied());
+            }
+            live.extend(dependencies);
+        }
+        Ok(LogicalTrace {
+            live,
+            current,
+            named,
+            current_obsolete_bytes,
+        })
     }
     #[allow(clippy::too_many_lines)]
     pub(crate) fn collect(&mut self, budget: usize) -> Result<GcReport, StoreError> {
@@ -461,7 +511,12 @@ impl CatalogGuard {
             return Err(BackendError::Stale.into());
         }
         *self.state_mut() = reloaded;
-        let (logical, current, named) = self.trace_logical()?;
+        let LogicalTrace {
+            live: logical,
+            current,
+            named,
+            current_obsolete_bytes,
+        } = self.trace_logical(true)?;
         let uncertain_heads = self.state().has_pending()?;
         let inventory = self.inventory()?;
         // Immutable lengths remain stable under catalog exclusion. Reuse each
@@ -609,24 +664,7 @@ impl CatalogGuard {
                 }
             }
         }
-        report.partially_obsolete_bytes = report.dead_extent_bytes;
-        if let Some(ObjectKey::Manifest(id)) = current
-            .iter()
-            .find(|key| matches!(key, ObjectKey::Manifest(_)))
-        {
-            // The active descriptor selects the exact current manifest, not a
-            // sorted ancestor ID.
-            let mut encoded = [0; crate::format::ACTIVE_HEADER_SIZE];
-            crate::fs::read_exact_at(&std::fs::File::open(self.active_path())?, 0, &mut encoded)?;
-            let header = crate::format::ActiveHeader::decode(&encoded)?;
-            let id = if header.parent_physical_digest == [0; 32] {
-                *id
-            } else {
-                ManifestId::from_bytes(header.parent_physical_digest)
-            };
-            let view = self.pin(id)?;
-            report.partially_obsolete_bytes += super::repack::estimated_obsolete_bytes(&view)?;
-        }
+        report.partially_obsolete_bytes = report.dead_extent_bytes + current_obsolete_bytes;
         if deletable.is_empty() {
             return Ok(report);
         }

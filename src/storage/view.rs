@@ -17,6 +17,36 @@ const VIEW_LIMIT: usize = 512 * 1024 * 1024;
 const MAX_RUN_DEPTH: usize = 64;
 const RUN_PREFIX: usize = 92;
 
+#[cfg(test)]
+thread_local! {
+    static METADATA_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static METADATA_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn take_metadata_loads() -> usize {
+    METADATA_LOADS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+pub(super) fn observe_metadata_loads<T>(
+    observer: impl FnMut() + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            METADATA_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    METADATA_OBSERVER.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(observer));
+    });
+    let _reset = Reset;
+    run()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FrameLocation {
     pub pack: PackId,
@@ -1192,6 +1222,15 @@ pub(super) fn load_metadata(
     guard: &CatalogGuard,
     id: ManifestId,
 ) -> Result<ValidatedMetadata, StoreError> {
+    #[cfg(test)]
+    {
+        METADATA_LOADS.with(|count| count.set(count.get() + 1));
+        METADATA_OBSERVER.with(|slot| {
+            if let Some(observer) = slot.borrow_mut().as_mut() {
+                observer();
+            }
+        });
+    }
     let mut next = id;
     let mut seen = BTreeSet::new();
     let mut runs = Vec::new();

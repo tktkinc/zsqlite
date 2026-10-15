@@ -81,6 +81,88 @@ fn idle_maintenance_does_not_contend_with_a_writer() -> TestResult {
 }
 
 #[test]
+fn background_collection_resolves_each_manifest_once_across_root_aliases() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("root-aliases.zsqlite");
+    let mut store = Store::open(&path, true)?;
+    let bytes = (1..=64).map(page).collect::<Vec<_>>().concat();
+    store.write_at(0, &bytes)?;
+    store.publish(true)?;
+    store.flush_sidecars()?;
+    let mut pins = Vec::new();
+    for index in 0..16 {
+        pins.push(store.retain_view(RetentionName::new(format!("backup-{index}"))?, false)?);
+    }
+    // Leave a mutable commit so this pass collects without repacking or training. The same
+    // sealed manifest is an active base, sealed head, live reader and sixteen durable roots.
+    store.write_at(0, &page(99))?;
+    store.publish(true)?;
+    drop(store);
+    let store = Store::open_existing(&path)?;
+    let mut manifests = BTreeSet::new();
+    manifests.insert(store.inspect()?.manifest.unwrap().id());
+    for pin in &pins {
+        manifests.insert(store.retained_view(pin.name())?.id());
+    }
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let (events, observed) = std::sync::mpsc::channel();
+    let (resume, proceed) = std::sync::mpsc::channel();
+    let maintenance = std::sync::Arc::clone(&shared);
+    let worker = std::thread::spawn(move || {
+        let started = events.clone();
+        super::view::observe_metadata_loads(
+            move || {
+                started.send(None).unwrap();
+                proceed.recv().unwrap();
+            },
+            || {
+                super::view::take_metadata_loads();
+                maintenance
+                    .lock()
+                    .unwrap()
+                    .try_background_maintenance()
+                    .unwrap();
+                events
+                    .send(Some(super::view::take_metadata_loads()))
+                    .unwrap();
+            },
+        );
+    });
+    let loads = loop {
+        if let Some(loads) = observed.recv_timeout(std::time::Duration::from_secs(5))? {
+            break loads;
+        }
+        // Deterministically pause inside reconstruction: this is the same mutex
+        // the VFS first read needs, so duplicate loads directly extend its wait.
+        assert!(matches!(
+            shared.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        resume.send(())?;
+    };
+    worker.join().unwrap();
+    eprintln!(
+        "background root metadata loads: {loads}; distinct manifests: {}",
+        manifests.len()
+    );
+    assert_eq!(
+        loads,
+        manifests.len(),
+        "root aliases must not multiply full authenticated metadata reconstruction"
+    );
+    let mut store = shared.lock().unwrap();
+    let mut actual = vec![0; bytes.len()];
+    store.read_at(0, &mut actual)?;
+    assert_eq!(&actual[..4096], page(99));
+    assert_eq!(&actual[4096..], &bytes[4096..]);
+    for pin in pins {
+        let retained = store.retained_view(pin.name())?;
+        assert_eq!(retained.resolve(PageNumber::new(1)?)?.read()?, page(1));
+    }
+    Ok(())
+}
+
+#[test]
 fn offline_fork_and_manifest_lease_each_retain_their_own_view() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("fork.zsqlite");
