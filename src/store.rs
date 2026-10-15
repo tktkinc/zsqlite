@@ -3606,7 +3606,7 @@ mod tests {
         write_all_at(
             &store.active.file,
             ACTIVE_STATE_A_OFFSET,
-            &before[ACTIVE_HEADER_SIZE..ACTIVE_METADATA_END as usize],
+            &before[ACTIVE_HEADER_SIZE..ACTIVE_METADATA_SIZE],
         )?;
         store.active.file.sync_all()?;
         assert!(matches!(
@@ -3618,7 +3618,7 @@ mod tests {
         write_all_at(
             &store.active.file,
             ACTIVE_STATE_A_OFFSET,
-            &current[ACTIVE_HEADER_SIZE..ACTIVE_METADATA_END as usize],
+            &current[ACTIVE_HEADER_SIZE..ACTIVE_METADATA_SIZE],
         )?;
         store.active.file.sync_all()?;
         store.begin_checkpoint_publication()?;
