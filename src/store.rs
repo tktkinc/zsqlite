@@ -1104,13 +1104,26 @@ impl Store {
     }
 
     /// Publication exclusion is held before checking durable state. Reuse the already
-    /// authenticated immutable view only while its active inode/sequence/tail are unchanged;
+    /// authenticated immutable view only while its active inode/sequence/length are unchanged;
     /// external publication still goes through reload. Header/attachment validation and
     /// interrupted-seal recovery remain required even when no full view needs reconstruction.
     fn refresh_publication(&mut self) -> Result<(), StoreError> {
-        self.refresh()?;
+        if self.current_inode_changed()? {
+            return self.reload();
+        }
         let header = read_active_header(&self.active.file)?;
         if header != self.active.header {
+            return self.reload();
+        }
+        let state = read_active_state(&self.active.file, header.database_id)?;
+        // Publication sequences only advance under this inode's exclusive publication lock.
+        // Rollover may restart the sequence, but replaces the inode and is handled above.
+        if state.sequence < self.active.state_sequence {
+            return Err(StoreError::Corrupt(active_state_offset(state.sequence)));
+        }
+        if state.sequence != self.active.state_sequence
+            || self.active.file.metadata()?.len() != self.head.active_commit_end
+        {
             return self.reload();
         }
         let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
@@ -3534,6 +3547,87 @@ mod tests {
         let mut output = vec![0; 4096];
         stale_reader.read_at(0, &mut output)?;
         assert_eq!(output, first, "the prior pinned snapshot was not restored");
+        Ok(())
+    }
+
+    #[test]
+    fn publication_refresh_rejects_a_short_committed_tail_before_writing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("short-committed-tail.zsqlite");
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &[page(1, 4096), page(2, 4096)].concat())?;
+        store.publish(true)?;
+        store.flush_sidecars()?;
+        store.write_at(4096, &page(3, 4096))?;
+        store.publish(true)?;
+        let committed = std::fs::read(&path)?;
+        store.active.file.set_len(committed.len() as u64 - 1)?;
+        store.active.file.sync_all()?;
+        assert!(matches!(
+            store.write_at(0, &page(4, 4096)),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(!store.publication_owner.is_locked());
+        assert!(!store.has_pending());
+        assert_eq!(
+            store.active.file.metadata()?.len(),
+            committed.len() as u64 - 1
+        );
+        write_all_at(
+            &store.active.file,
+            committed.len() as u64 - 1,
+            &committed[committed.len() - 1..],
+        )?;
+        store.active.file.sync_all()?;
+        store.write_at(0, &page(4, 4096))?;
+        store.publish(true)?;
+        let mut actual = vec![0; 8192];
+        store.read_at(0, &mut actual)?;
+        assert_eq!(actual, [page(4, 4096), page(3, 4096)].concat());
+        Ok(())
+    }
+
+    #[test]
+    fn publication_refresh_rejects_regressed_valid_state_on_the_same_inode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("regressed-state.zsqlite");
+        let mut store = Store::open(&path, true)?;
+        store.write_at(0, &[page(1, 4096), page(2, 4096)].concat())?;
+        store.publish(true)?;
+        let before = std::fs::read(&path)?;
+        store.write_at(0, &page(3, 4096))?;
+        store.publish(true)?;
+        let current = std::fs::read(&path)?;
+        assert_eq!(before.len(), current.len());
+        // Both older sectors remain checksum-valid. A live inode cannot legally move its
+        // publication sequence backward; rollover replaces the inode and is tested separately.
+        write_all_at(
+            &store.active.file,
+            ACTIVE_STATE_A_OFFSET,
+            &before[ACTIVE_HEADER_SIZE..ACTIVE_METADATA_END as usize],
+        )?;
+        store.active.file.sync_all()?;
+        assert!(matches!(
+            store.begin_checkpoint_publication(),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(!store.publication_owner.is_locked());
+        assert!(!store.has_pending());
+        write_all_at(
+            &store.active.file,
+            ACTIVE_STATE_A_OFFSET,
+            &current[ACTIVE_HEADER_SIZE..ACTIVE_METADATA_END as usize],
+        )?;
+        store.active.file.sync_all()?;
+        store.begin_checkpoint_publication()?;
+        store.write_at(4096, &page(4, 4096))?;
+        store.publish_checkpoint(true)?;
+        store.finish_checkpoint_publication();
+        let mut actual = vec![0; 8192];
+        store.read_at(0, &mut actual)?;
+        assert_eq!(actual, [page(3, 4096), page(4, 4096)].concat());
         Ok(())
     }
 
