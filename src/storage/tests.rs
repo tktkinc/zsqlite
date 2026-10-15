@@ -81,6 +81,169 @@ fn idle_maintenance_does_not_contend_with_a_writer() -> TestResult {
 }
 
 #[test]
+fn publication_checkpoints_reuse_the_current_durable_metadata_view() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("checkpoint-refresh.zsqlite");
+    let mut store = Store::open(&path, true)?;
+    let bytes = (1..=64).map(page).collect::<Vec<_>>().concat();
+    store.write_at(0, &bytes)?;
+    store.publish(true)?;
+    store.flush_sidecars()?;
+    super::view::take_metadata_loads();
+    for value in 100..108 {
+        store.begin_checkpoint_publication()?;
+        store.write_at(4096, &page(value))?;
+        store.publish_checkpoint(true)?;
+        store.finish_checkpoint_publication();
+    }
+    assert_eq!(
+        super::view::take_metadata_loads(),
+        0,
+        "own checkpoints must not reconstruct unchanged sealed metadata"
+    );
+    let mut actual = vec![0; bytes.len()];
+    store.read_at(0, &mut actual)?;
+    assert_eq!(&actual[..4096], &bytes[..4096]);
+    assert_eq!(&actual[4096..8192], page(107));
+    assert_eq!(&actual[8192..], &bytes[8192..]);
+    drop(store);
+    let mut reopened = Store::open_existing(&path)?;
+    let mut durable = vec![0; bytes.len()];
+    reopened.read_at(0, &mut durable)?;
+    assert_eq!(durable, actual);
+    reopened.verify()?;
+    Ok(())
+}
+
+#[test]
+fn publication_refresh_adopts_external_commits_rollover_and_retained_roots() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("external-refresh.zsqlite");
+    let mut first = Store::open(&path, true)?;
+    first.write_at(0, &[page(1), page(2), page(3)].concat())?;
+    first.publish(true)?;
+    first.flush_sidecars()?;
+    let mut second = Store::open_existing(&path)?;
+    let retained = second.retain_view(RetentionName::new("before-writes")?, false)?;
+    first.write_at(4096, &page(99))?;
+    first.publish(true)?;
+    super::view::take_metadata_loads();
+    second.write_at(8192, &page(100))?;
+    second.publish(true)?;
+    assert_eq!(
+        super::view::take_metadata_loads(),
+        1,
+        "an external durable sequence advance must reload before writing"
+    );
+    second.flush_sidecars()?;
+    super::view::take_metadata_loads();
+    first.begin_checkpoint_publication()?;
+    first.write_at(12288, &page(101))?;
+    first.publish_checkpoint(true)?;
+    first.finish_checkpoint_publication();
+    assert_eq!(
+        super::view::take_metadata_loads(),
+        1,
+        "external active-inode rollover must reload before checkpoint publication"
+    );
+    let mut actual = vec![0; 16384];
+    first.read_at(0, &mut actual)?;
+    assert_eq!(actual, [page(1), page(99), page(100), page(101)].concat());
+    first.gc_report(100)?;
+    let old = first.retained_view(retained.name())?;
+    assert_eq!(old.resolve(PageNumber::new(2)?)?.read()?, page(2));
+    assert_eq!(old.resolve(PageNumber::new(3)?)?.read()?, page(3));
+    first.verify()?;
+    Ok(())
+}
+
+#[test]
+fn publication_refresh_discards_only_an_uncommitted_tail() -> TestResult {
+    use std::io::Write;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("tail-refresh.zsqlite");
+    let mut store = Store::open(&path, true)?;
+    store.write_at(0, &[page(1), page(2)].concat())?;
+    store.publish(true)?;
+    store.flush_sidecars()?;
+    store.write_at(4096, &page(3))?;
+    store.publish(true)?;
+    let committed = path.metadata()?.len();
+    let mut active = std::fs::OpenOptions::new().append(true).open(&path)?;
+    active.write_all(&[0xa5; 17])?;
+    active.sync_all()?;
+    super::view::take_metadata_loads();
+    store.write_at(4096, &page(4))?;
+    store.publish(true)?;
+    assert_eq!(
+        super::view::take_metadata_loads(),
+        1,
+        "uncommitted tail must trigger validated reload before truncation"
+    );
+    assert_eq!(path.metadata()?.len(), committed);
+    drop(store);
+    let mut reopened = Store::open_existing(&path)?;
+    let mut actual = vec![0; 8192];
+    reopened.read_at(0, &mut actual)?;
+    assert_eq!(actual, [page(1), page(4)].concat());
+    reopened.verify()?;
+    Ok(())
+}
+
+#[test]
+fn publication_refresh_revalidates_header_and_catalogue_authority() -> TestResult {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("authority-refresh.zsqlite");
+    let mut store = Store::open(&path, true)?;
+    store.write_at(0, &[page(1), page(2)].concat())?;
+    store.publish(true)?;
+    store.flush_sidecars()?;
+    let mut active = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    let mut header = vec![0; crate::format::ACTIVE_HEADER_SIZE];
+    active.read_exact(&mut header)?;
+    let mut corrupt = header.clone();
+    corrupt[24] ^= 0x80;
+    active.seek(SeekFrom::Start(0))?;
+    active.write_all(&corrupt)?;
+    active.sync_all()?;
+    assert!(store.begin_checkpoint_publication().is_err());
+    active.seek(SeekFrom::Start(0))?;
+    active.write_all(&header)?;
+    active.sync_all()?;
+    let catalog = super::Catalog::open(&crate::backend::sidecar_dir(&path), false)?;
+    let attachment = {
+        let guard = catalog.lock()?;
+        let attachment = guard.state().attachment;
+        guard.state_mut().attachment = Some(crate::domain::AttachmentId::from_bytes([0x7f; 32]));
+        guard.publish_catalog()?;
+        attachment
+    };
+    assert!(matches!(
+        store.write_at(4096, &page(3)),
+        Err(crate::StoreError::StaleAttachment)
+    ));
+    {
+        let guard = catalog.lock()?;
+        guard.state_mut().attachment = attachment;
+        guard.publish_catalog()?;
+    }
+    // Both failures must release publication without changing acknowledged page contents.
+    store.begin_checkpoint_publication()?;
+    store.write_at(4096, &page(4))?;
+    store.publish_checkpoint(true)?;
+    store.finish_checkpoint_publication();
+    let mut actual = vec![0; 8192];
+    store.read_at(0, &mut actual)?;
+    assert_eq!(actual, [page(1), page(4)].concat());
+    store.verify()?;
+    Ok(())
+}
+
+#[test]
 fn background_collection_resolves_each_manifest_once_across_root_aliases() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("root-aliases.zsqlite");

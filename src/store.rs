@@ -1090,7 +1090,7 @@ impl Store {
             self.publication_owner = PublicationOwner::Transaction(
                 crate::fs::ExclusiveLock::on_file(&self.publication, true)?,
             );
-            if let Err(error) = self.reload().and_then(|()| {
+            if let Err(error) = self.refresh_publication().and_then(|()| {
                 if self.active.file.metadata()?.len() > self.head.active_commit_end {
                     self.active.file.set_len(self.head.active_commit_end)?;
                 }
@@ -1100,6 +1100,21 @@ impl Store {
                 return Err(error);
             }
         }
+        Ok(())
+    }
+
+    /// Publication exclusion is held before checking durable state. Reuse the already
+    /// authenticated immutable view only while its active inode/sequence/tail are unchanged;
+    /// external publication still goes through reload. Header/attachment validation and
+    /// interrupted-seal recovery remain required even when no full view needs reconstruction.
+    fn refresh_publication(&mut self) -> Result<(), StoreError> {
+        self.refresh()?;
+        let header = read_active_header(&self.active.file)?;
+        if header != self.active.header {
+            return self.reload();
+        }
+        let catalog = crate::storage::Catalog::open(&self.sidecar_path, false)?;
+        catalog.lock()?.recover_seal(&header)?;
         Ok(())
     }
 
@@ -3488,6 +3503,7 @@ mod tests {
         writer.write_at(0, &first)?;
         writer.publish(true)?;
         let mut stale_reader = Store::open_existing_read_only(&path)?;
+        let mut stale_writer = Store::open_existing(&path)?;
         let selected_before_refresh = stale_reader.head;
 
         writer.write_at(4096, &second)?;
@@ -3504,6 +3520,12 @@ mod tests {
             stale_reader.refresh(),
             Err(StoreError::Corrupt(_))
         ));
+        assert!(matches!(
+            stale_writer.write_at(0, &second),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(!stale_writer.publication_owner.is_locked());
+        assert!(!stale_writer.has_pending());
         assert!(matches!(
             stale_reader.refresh(),
             Err(StoreError::Corrupt(_))
